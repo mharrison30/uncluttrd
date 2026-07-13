@@ -683,8 +683,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const handleCompanionUpgradeRequest = () => {
     logEvent(getAnalytics(), "companion_upgrade_clicked", { analysisId: analysisIdRef.current });
-    // Paywall integration lands in Milestone 7 — this is a placeholder hook point.
-    console.log("Companion upgrade requested");
+    // Reuses the existing paywall screen entirely unchanged — same screen every
+    // other "Upgrade to Pro" entry point already opens. Only the source tag is new.
+    setPaywallSource("companion");
+    setShowPaywall(true);
   };
 
   const submitCompanionProgressPhoto = async (progressUri, progressBase64) => {
@@ -827,6 +829,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
   const [showPaywall, setShowPaywall] = useState(false);
   const [paywallPlan, setPaywallPlan] = useState("yearly");
+  // Tags which entry point opened the (single, shared) paywall screen, for the
+  // subscription_started source property. Set to "companion" only by the
+  // Companion upgrade prompt; reset back to the default whenever the paywall
+  // is dismissed without purchasing, so a later unrelated paywall open never
+  // inherits a stale "companion" tag. Every other existing entry point never
+  // touches this — it's already correct by default.
+  const [paywallSource, setPaywallSource] = useState("general_paywall");
   const [selectedRoom, setSelectedRoom] = useState(null);
   const resultsScrollRef = useRef(null);
   const [loadMsg, setLoadMsg] = useState(0);
@@ -1410,7 +1419,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (Platform.OS !== "android") return;
 
     const onBackPress = () => {
-      if (showPaywall) { setShowPaywall(false); return true; }
+      if (showPaywall) { setShowPaywall(false); setPaywallSource("general_paywall"); return true; }
       if (showMenu) { setShowMenu(false); return true; }
       if (showHistory) { setShowHistory(false); setShowMenu(true); return true; }
       if (showFaq) { setShowFaq(false); setShowMenu(true); return true; }
@@ -1619,7 +1628,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                 return;
               }
 
-              logEvent(getAnalytics(), "subscription_started", { analysisId: analysisIdRef.current, source: "general_paywall" });
+              logEvent(getAnalytics(), "subscription_started", { analysisId: analysisIdRef.current, source: paywallSource });
               const { customerInfo } = await Purchases.purchaseStoreProduct(product);
               if (customerInfo.entitlements.active["Uncluttrd Pro"]) {
                 logEvent(getAnalytics(), "subscription_completed");
@@ -1644,7 +1653,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             <Text onPress={() => Linking.openURL("https://uncluttrd.app/privacy.html")} style={{ textDecorationLine: "underline" }}>Privacy Policy</Text>
           </Text>
 
-          <TouchableOpacity style={s.paywallSkip} onPress={() => setShowPaywall(false)}>
+          <TouchableOpacity style={s.paywallSkip} onPress={() => { setShowPaywall(false); setPaywallSource("general_paywall"); }}>
             <Text style={s.paywallSkipText}>Maybe later</Text>
           </TouchableOpacity>
           <TouchableOpacity style={{ marginTop: 12, padding: 8 }} onPress={async () => {
