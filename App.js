@@ -583,6 +583,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   // ── Companion loop state ──────────────────────────────────
+  // Analytics-only correlator for the free-tier funnel, since free plans are
+  // never persisted and so never get a real Firestore planId. Minted once per
+  // analysis, never written to Firestore — see Analytics.md / DecisionLog.md
+  // 2026-07-13 (Companion Analytics: Event Catalog, Philosophy, and Commerce Reuse).
+  const analysisIdRef = useRef(null);
+  const secondsSince = (msTimestamp) => (msTimestamp ? Math.round((Date.now() - msTimestamp) / 1000) : null);
+
   const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
   const [companionActionText, setCompanionActionText] = useState(null);
   const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
@@ -615,6 +622,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setCompanionActionText(results.companionAction.text || null);
       setCompanionStage(results.companionAction.status === "started" ? "started" : "companion-active");
       setCompanionStartedAt(results.companionAction.startedAt ? new Date(results.companionAction.startedAt).getTime() : null);
+      // Only reached when reopening a saved plan (a fresh analysis never has a
+      // companionAction yet) — this is a resumed view, not a freshly generated one.
+      logEvent(getAnalytics(), "companion_action_viewed", { planId: currentPlanId, actionIndex: results.companionAction.actionIndex || 2 });
     } else if (results.firstAction) {
       const isFreshAnalysis = typeof results.firstAction === "string";
       setCompanionActionIndex(1);
@@ -633,6 +643,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     const startedAtIso = new Date().toISOString();
     setCompanionStartedAt(Date.now());
     setCompanionStage("started");
+    if (companionActionIndex === 1) {
+      logEvent(getAnalytics(), "first_action_started", { analysisId: analysisIdRef.current });
+    } else {
+      logEvent(getAnalytics(), "companion_action_started", { planId: currentPlanId, actionIndex: companionActionIndex });
+    }
     if (isPro && currentPlanId) {
       const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
@@ -646,6 +661,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     const completedAtIso = new Date().toISOString();
     setCompanionCompletedAt(completedAtIso);
     setCompanionStage("celebrating");
+    if (companionActionIndex === 1) {
+      logEvent(getAnalytics(), "first_action_completed", { analysisId: analysisIdRef.current, secondsSinceStarted: secondsSince(companionStartedAt) });
+      logEvent(getAnalytics(), "progress_photo_prompted", { analysisId: analysisIdRef.current });
+    } else {
+      logEvent(getAnalytics(), "companion_action_completed", { planId: currentPlanId, actionIndex: companionActionIndex, secondsSinceStarted: secondsSince(companionStartedAt) });
+    }
     if (isPro && currentPlanId) {
       const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
@@ -657,9 +678,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const handleCompanionFinishedForToday = () => {
     setCompanionStage("finished");
+    logEvent(getAnalytics(), "companion_session_completed", { planId: currentPlanId });
   };
 
   const handleCompanionUpgradeRequest = () => {
+    logEvent(getAnalytics(), "companion_upgrade_clicked", { analysisId: analysisIdRef.current });
     // Paywall integration lands in Milestone 7 — this is a placeholder hook point.
     console.log("Companion upgrade requested");
   };
@@ -668,6 +691,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setProgressPhoto({ uri: progressUri, base64: progressBase64 });
     if (!isPro) {
       setCompanionStage("paywall-prompt");
+      logEvent(getAnalytics(), "companion_paywall_viewed", { analysisId: analysisIdRef.current });
       return;
     }
     setCompanionStage("generating");
@@ -729,12 +753,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         }).catch(e => console.log("Save companion progress error:", e.message));
       }
 
+      logEvent(getAnalytics(), "companion_progress_photo_uploaded", { planId: currentPlanId, actionIndex: companionActionIndex });
+      logEvent(getAnalytics(), "companion_next_action_generated", { planId: currentPlanId, actionIndex: newActionIndex });
+      if (newActionIndex === 2) {
+        logEvent(getAnalytics(), "companion_session_started", { planId: currentPlanId });
+      }
+      logEvent(getAnalytics(), "companion_action_viewed", { planId: currentPlanId, actionIndex: newActionIndex });
+
       companionBasePhotoRef.current = progressUri;
       setCompanionActionText(parsed.companionAction || "");
       setCompanionActionIndex(newActionIndex);
       setCompanionStage("companion-active");
     } catch (e) {
       console.log("Companion next-action error:", e.message);
+      logEvent(getAnalytics(), "companion_action_failed", { planId: currentPlanId, actionIndex: companionActionIndex, reason: e.message });
       setCompanionStage("celebrating"); // fall back to the photo-share moment rather than strand the user
     } finally {
       stopCompanionTips();
@@ -776,6 +808,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   const handleCompanionSharePhoto = () => {
+    if (companionActionIndex === 1) {
+      logEvent(getAnalytics(), "progress_photo_started", { analysisId: analysisIdRef.current });
+    }
     Alert.alert(
       "Show me what you accomplished",
       "How would you like to share your progress?",
@@ -1043,6 +1078,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (!photo?.base64) { setErr("Please select a photo first."); return; }
     if (!isPro && (analyses || 0) >= 3) { setShowPaywall(true); return; }
     console.log("Starting analysis...");
+    analysisIdRef.current = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     setLoading(true); setErr(null); setResults(null); setCurrentPlanId(null); startLoadMessages();
     try {
       const budgetNote = budget
@@ -1102,6 +1138,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const parsed = JSON.parse(match[0]);
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
+      if (parsed.firstAction) {
+        logEvent(getAnalytics(), "first_action_viewed", { analysisId: analysisIdRef.current });
+      } else {
+        logEvent(getAnalytics(), "first_action_failed", { analysisId: analysisIdRef.current, reason: "missing_first_action" });
+      }
       savePlanToHistory(parsed);
       setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
       if (!isPro) {
@@ -1349,14 +1390,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const resumablePlan = isPro ? history.find(isCompanionResumable) : null;
 
   const resumeCompanionSession = (item) => {
+    logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
     setResults(item);
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
     restorePhotoFromPlan(item);
   };
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -1577,6 +1619,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                 return;
               }
 
+              logEvent(getAnalytics(), "subscription_started", { analysisId: analysisIdRef.current, source: "general_paywall" });
               const { customerInfo } = await Purchases.purchaseStoreProduct(product);
               if (customerInfo.entitlements.active["Uncluttrd Pro"]) {
                 logEvent(getAnalytics(), "subscription_completed");
@@ -1705,7 +1748,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(item.spaceType, "What would you like to do?", [
-                  { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
+                  { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
                   { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } },
                   { text: "Cancel", style: "cancel" },
                 ]);
