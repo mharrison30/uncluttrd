@@ -592,6 +592,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
   const [companionActionText, setCompanionActionText] = useState(null);
+  // TEMP DEBUG — remove once the "Let's Start Here" no-show bug is found.
+  // Fires whenever this state actually settles (not when the setter is called),
+  // since setState is async — this is the true post-update value.
+  useEffect(() => {
+    console.log("[COMPANION DEBUG 4] companionActionText settled to:", JSON.stringify(companionActionText));
+  }, [companionActionText]);
   const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
   const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp — feeds a future secondsSinceStarted analytics property (Milestone 6)
   const [companionCompletedAt, setCompanionCompletedAt] = useState(null); // ISO string, used when archiving into companionActionHistory
@@ -1128,6 +1134,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       try {
         const result = await analyzePhotoFn({ imageBase64, prompt });
         raw = result.data?.text || "";
+        console.log("[COMPANION DEBUG 1] raw analyzePhotoFn response:", raw);
       } catch (fnErr) {
         console.log("Function error:", fnErr.code, fnErr.message);
         logEvent(getAnalytics(), "plan_failed", { reason: fnErr.code });
@@ -1139,12 +1146,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         return;
       }
       const match = raw.match(/\{[\s\S]*\}/);
+      console.log("[COMPANION DEBUG 2] regex match found:", !!match, "| extracted length:", match ? match[0].length : 0);
       if (!match) {
         logEvent(getAnalytics(), "plan_failed", { reason: "unparseable_response" });
         setErr("We had trouble reading your space. Try a clearer, well-lit photo.");
         return;
       }
       const parsed = JSON.parse(match[0]);
+      console.log("[COMPANION DEBUG 3] parsed.firstAction:", JSON.stringify(parsed.firstAction), "| typeof:", typeof parsed.firstAction);
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
       if (parsed.firstAction) {
@@ -1965,6 +1974,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   // RESULTS SCREEN
   if (results) {
+    console.log("[COMPANION DEBUG 5] render gate — companionActionText:", JSON.stringify(companionActionText), "| would render CompanionCard:", !!companionActionText);
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
