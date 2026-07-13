@@ -472,6 +472,78 @@ function AuthScreen() {
 }
 
 // ── MAIN APP ─────────────────────────────────────────────────
+// ── COMPANION CARD ───────────────────────────────────────────
+// Renders the single-action Companion loop, one decision at a time,
+// per CompanionDesignPrinciples.md. Purely prop-driven — placement on
+// the results screen is a separate change (Milestone 4).
+function CompanionCard({ stage, actionText, tipIndex, onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade }) {
+  if (stage === "finished") return null;
+
+  const GENERATING_TIPS = [
+    "Looking at what's changed...",
+    "Noticing your progress...",
+    "Almost got it...",
+  ];
+
+  if (stage === "generating") {
+    return (
+      <View style={s.companionCard}>
+        <View style={{ alignItems: "center", paddingVertical: 8 }}>
+          <ActivityIndicator color={BRAND.green} />
+          <Text style={s.companionTipText}>{GENERATING_TIPS[tipIndex % GENERATING_TIPS.length]}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  if (stage === "paywall-prompt") {
+    return (
+      <View style={s.companionCard}>
+        <Text style={s.companionTitle}>Ready to keep going?</Text>
+        <Text style={s.companionBody}>Upgrading keeps this going — new steps, saved as you go.</Text>
+        <TouchableOpacity style={s.companionBtn} onPress={onUpgrade}>
+          <Text style={s.companionBtnText}>Upgrade</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (stage === "celebrating") {
+    return (
+      <View style={s.companionCard}>
+        <Text style={s.companionTitle}>Nice work</Text>
+        <Text style={s.companionBody}>Great progress.</Text>
+        <TouchableOpacity style={s.companionBtn} onPress={onSharePhoto}>
+          <Text style={s.companionBtnText}>Show me what you accomplished</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // suggested | started | companion-active share one layout
+  const title = stage === "companion-active" ? "Ready to keep going?" : "Let's Start Here";
+  return (
+    <View style={s.companionCard}>
+      <Text style={s.companionTitle}>{title}</Text>
+      <Text style={s.companionBody}>{actionText}</Text>
+      {stage === "started" ? (
+        <TouchableOpacity style={s.companionBtn} onPress={onComplete}>
+          <Text style={s.companionBtnText}>I'm Done</Text>
+        </TouchableOpacity>
+      ) : (
+        <TouchableOpacity style={s.companionBtn} onPress={onStart}>
+          <Text style={s.companionBtnText}>I'm Ready</Text>
+        </TouchableOpacity>
+      )}
+      {stage === "companion-active" && (
+        <TouchableOpacity style={s.companionSecondaryBtn} onPress={onFinishedForToday}>
+          <Text style={s.companionSecondaryBtnText}>Finished for today</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
 function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) {
   const [photo, setPhoto] = useState(null);
   const [photoSize, setPhotoSize] = useState({ width: 1, height: 1 });
@@ -509,6 +581,134 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const stopVizTips = () => {
     if (vizTipTimer.current) clearInterval(vizTipTimer.current);
   };
+
+  // ── Companion loop state ──────────────────────────────────
+  const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
+  const [companionActionText, setCompanionActionText] = useState(null);
+  const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
+  const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp — feeds a future secondsSinceStarted analytics property (Milestone 6)
+  const [progressPhoto, setProgressPhoto] = useState(null);
+  const [companionTipIndex, setCompanionTipIndex] = useState(0);
+  const companionTipTimer = useRef(null);
+  const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
+
+  const startCompanionTips = () => {
+    setCompanionTipIndex(0);
+    companionTipTimer.current = setInterval(() => {
+      setCompanionTipIndex(prev => prev + 1);
+    }, 3000);
+  };
+  const stopCompanionTips = () => {
+    if (companionTipTimer.current) clearInterval(companionTipTimer.current);
+  };
+
+  // Resets the Companion loop whenever a new plan's results arrive.
+  useEffect(() => {
+    if (results?.firstAction) {
+      setCompanionActionText(results.firstAction);
+      setCompanionActionIndex(1);
+      setCompanionStage("suggested");
+      setCompanionStartedAt(null);
+      setProgressPhoto(null);
+      companionBasePhotoRef.current = photo?.uri || null;
+    }
+  }, [results]);
+
+  const handleCompanionStart = () => {
+    setCompanionStartedAt(Date.now());
+    setCompanionStage("started");
+  };
+
+  const handleCompanionComplete = () => {
+    setCompanionStage("celebrating");
+  };
+
+  const handleCompanionFinishedForToday = () => {
+    setCompanionStage("finished");
+  };
+
+  const handleCompanionUpgradeRequest = () => {
+    // Paywall integration lands in Milestone 7 — this is a placeholder hook point.
+    console.log("Companion upgrade requested");
+  };
+
+  const submitCompanionProgressPhoto = async (progressUri, progressBase64) => {
+    setProgressPhoto({ uri: progressUri, base64: progressBase64 });
+    if (!isPro) {
+      setCompanionStage("paywall-prompt");
+      return;
+    }
+    setCompanionStage("generating");
+    startCompanionTips();
+    try {
+      const beforeSource = companionBasePhotoRef.current;
+      if (!beforeSource) throw new Error("Missing before photo for comparison");
+      const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
+      const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
+      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}". In one warm sentence, acknowledge what's improved. Then suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way — one or two warm sentences, no time estimate stated, no list-like phrasing.\n\nReturn ONLY valid JSON, nothing else — no markdown, no backticks.\n\n{"progressNote":"one warm sentence acknowledging the improvement","companionAction":"one or two warm sentences describing the next step"}`;
+      const generateNextActionFn = httpsCallable(functions, "generateNextAction");
+      const result = await generateNextActionFn({ beforeImageBase64: compressedBefore.base64, afterImageBase64: compressedAfter.base64, prompt: nextPrompt });
+      const raw = result.data?.text || "";
+      const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      companionBasePhotoRef.current = progressUri;
+      setCompanionActionText(parsed.companionAction || "");
+      setCompanionActionIndex(prev => prev + 1);
+      setCompanionStage("companion-active");
+    } catch (e) {
+      console.log("Companion next-action error:", e.message);
+      setCompanionStage("celebrating"); // fall back to the photo-share moment rather than strand the user
+    } finally {
+      stopCompanionTips();
+    }
+  };
+
+  const captureCompanionPhoto = async () => {
+    try {
+      const { status } = await ImagePicker.requestCameraPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Camera Permission Required", "Please allow camera access in Settings → Uncluttrd → Camera.");
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ allowsEditing: true, quality: 0.2, base64: true });
+      if (!result.canceled && result.assets?.[0]) {
+        const a = result.assets[0];
+        submitCompanionProgressPhoto(a.uri, a.base64);
+      }
+    } catch (e) {
+      Alert.alert("Could not open camera", "Please try again.");
+    }
+  };
+
+  const pickCompanionPhoto = async () => {
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Photos Permission Required", "Uncluttrd needs access to your photos to see your progress. Please go to Settings → Uncluttrd → Photos and allow access.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], allowsEditing: true, quality: 0.2, base64: true });
+      if (!result.canceled && result.assets?.[0]) {
+        const a = result.assets[0];
+        submitCompanionProgressPhoto(a.uri, a.base64);
+      }
+    } catch (e) {
+      Alert.alert("We couldn't open your photos", "Please try again.");
+    }
+  };
+
+  const handleCompanionSharePhoto = () => {
+    Alert.alert(
+      "Show me what you accomplished",
+      "How would you like to share your progress?",
+      [
+        { text: "Take Photo", onPress: captureCompanionPhoto },
+        { text: "Choose from Camera Roll", onPress: pickCompanionPhoto },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  };
+
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
@@ -1045,8 +1245,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     return "premium";
   };
   const meta = (id) => TIERS.find(t => t.id === id) || TIERS[1];
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2128,6 +2328,14 @@ const s = StyleSheet.create({
   tipHead: { fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8, color: BRAND.green, marginBottom: 4 },
   tipBody: { fontSize: 14, fontFamily: "Inter_400Regular", color: "#166E38", lineHeight: 20 },
   startOverBtn: { backgroundColor: BRAND.white, borderWidth: 2, borderColor: BRAND.green, borderRadius: 14, padding: 16, alignItems: "center", marginTop: 20, marginBottom: 10 },
+  companionCard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderColor: BRAND.greenMid, borderRadius: 16, padding: 18, marginBottom: 16 },
+  companionTitle: { fontSize: 18, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8 },
+  companionBody: { fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 22, marginBottom: 16 },
+  companionBtn: { backgroundColor: BRAND.green, borderRadius: 12, padding: 15, alignItems: "center", justifyContent: "center" },
+  companionBtnText: { color: "white", fontSize: 15, fontFamily: "Inter_600SemiBold" },
+  companionSecondaryBtn: { marginTop: 12, padding: 8, alignItems: "center" },
+  companionSecondaryBtnText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textDecorationLine: "underline" },
+  companionTipText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginTop: 10 },
   shareBtn: { padding: 12, minWidth: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
   vizBtn: { borderWidth: 1.5, borderRadius: 8, padding: 13, alignItems: "center", justifyContent: "center", marginTop: 12 },
   vizModalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.95)", justifyContent: "center", alignItems: "center" },
