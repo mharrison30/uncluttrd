@@ -20,7 +20,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, Eye, EyeOff } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
-import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, getDocs, query, orderBy, limit, serverTimestamp } from "firebase/firestore";
+import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, getDocs, query, orderBy, limit, serverTimestamp, arrayUnion } from "firebase/firestore";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import Purchases from "react-native-purchases";
@@ -587,6 +587,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [companionActionText, setCompanionActionText] = useState(null);
   const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
   const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp — feeds a future secondsSinceStarted analytics property (Milestone 6)
+  const [companionCompletedAt, setCompanionCompletedAt] = useState(null); // ISO string, used when archiving into companionActionHistory
   const [progressPhoto, setProgressPhoto] = useState(null);
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
@@ -602,25 +603,56 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (companionTipTimer.current) clearInterval(companionTipTimer.current);
   };
 
-  // Resets the Companion loop whenever a new plan's results arrive.
+  // Initializes or resumes the Companion loop whenever a new plan's results arrive.
+  // A fresh analysis returns firstAction as a plain string (see the analyzePhoto
+  // prompt); a reopened saved plan returns the persisted object shape
+  // { text, status, suggestedAt, startedAt, completedAt } — both are handled here
+  // so resuming a saved plan picks up exactly where it was left, not from scratch.
   useEffect(() => {
-    if (results?.firstAction) {
-      setCompanionActionText(results.firstAction);
+    if (!results) return;
+    if (results.companionAction) {
+      setCompanionActionIndex(results.companionAction.actionIndex || 2);
+      setCompanionActionText(results.companionAction.text || null);
+      setCompanionStage(results.companionAction.status === "started" ? "started" : "companion-active");
+      setCompanionStartedAt(results.companionAction.startedAt ? new Date(results.companionAction.startedAt).getTime() : null);
+    } else if (results.firstAction) {
+      const isFreshAnalysis = typeof results.firstAction === "string";
       setCompanionActionIndex(1);
-      setCompanionStage("suggested");
-      setCompanionStartedAt(null);
-      setProgressPhoto(null);
-      companionBasePhotoRef.current = photo?.uri || null;
+      setCompanionActionText(isFreshAnalysis ? results.firstAction : (results.firstAction.text || null));
+      setCompanionStage(isFreshAnalysis || results.firstAction.status !== "started" ? "suggested" : "started");
+      setCompanionStartedAt(!isFreshAnalysis && results.firstAction.startedAt ? new Date(results.firstAction.startedAt).getTime() : null);
+    } else {
+      setCompanionActionText(null);
     }
+    setCompanionCompletedAt(null);
+    setProgressPhoto(null);
+    companionBasePhotoRef.current = photo?.uri || null;
   }, [results]);
 
   const handleCompanionStart = () => {
+    const startedAtIso = new Date().toISOString();
     setCompanionStartedAt(Date.now());
     setCompanionStage("started");
+    if (isPro && currentPlanId) {
+      const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
+      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        [`${field}.status`]: "started",
+        [`${field}.startedAt`]: startedAtIso,
+      }).catch(e => console.log("Save companion start error:", e.message));
+    }
   };
 
   const handleCompanionComplete = () => {
+    const completedAtIso = new Date().toISOString();
+    setCompanionCompletedAt(completedAtIso);
     setCompanionStage("celebrating");
+    if (isPro && currentPlanId) {
+      const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
+      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        [`${field}.status`]: "completed",
+        [`${field}.completedAt`]: completedAtIso,
+      }).catch(e => console.log("Save companion complete error:", e.message));
+    }
   };
 
   const handleCompanionFinishedForToday = () => {
@@ -651,9 +683,55 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const raw = result.data?.text || "";
       const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
       const parsed = JSON.parse(cleaned);
+
+      // Upload the progress photo to Storage (same pattern as the original analysis
+      // photo) so it can be persisted on the plan doc, not just held in memory.
+      let progressPhotoUrl = null;
+      if (currentPlanId) {
+        try {
+          const uploadCompressed = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.75, format: SaveFormat.JPEG });
+          const blob = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.onload = () => resolve(xhr.response);
+            xhr.onerror = () => reject(new Error("Failed to read progress photo file"));
+            xhr.responseType = "blob";
+            xhr.open("GET", uploadCompressed.uri, true);
+            xhr.send(null);
+          });
+          const path = `plans/${user.uid}/${currentPlanId}/progress/${Date.now()}.jpg`;
+          const fileRef = storageRef(storage, path);
+          await uploadBytes(fileRef, blob, { contentType: "image/jpeg" });
+          progressPhotoUrl = await getDownloadURL(fileRef);
+        } catch (uploadErr) {
+          console.log("Progress photo upload error:", uploadErr.message);
+        }
+      }
+
+      const newActionIndex = companionActionIndex + 1;
+      if (currentPlanId) {
+        const archivedAction = {
+          actionIndex: companionActionIndex,
+          text: companionActionText,
+          startedAt: companionStartedAt ? new Date(companionStartedAt).toISOString() : null,
+          completedAt: companionCompletedAt || new Date().toISOString(),
+        };
+        updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+          companionActionHistory: arrayUnion(archivedAction),
+          ...(progressPhotoUrl ? { progressPhotos: arrayUnion({ actionIndex: companionActionIndex, url: progressPhotoUrl, uploadedAt: new Date().toISOString() }) } : {}),
+          companionAction: {
+            actionIndex: newActionIndex,
+            text: parsed.companionAction || "",
+            status: "suggested",
+            suggestedAt: new Date().toISOString(),
+            startedAt: null,
+            completedAt: null,
+          },
+        }).catch(e => console.log("Save companion progress error:", e.message));
+      }
+
       companionBasePhotoRef.current = progressUri;
       setCompanionActionText(parsed.companionAction || "");
-      setCompanionActionIndex(prev => prev + 1);
+      setCompanionActionIndex(newActionIndex);
       setCompanionStage("companion-active");
     } catch (e) {
       console.log("Companion next-action error:", e.message);
@@ -801,6 +879,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     try {
       console.log("Saving plan for user:", user.uid);
       const entry = {
+        schemaVersion: 1,
         createdAt: new Date().toISOString(),
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
         spaceType: plan.spaceType,
@@ -809,6 +888,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         tiers: plan.tiers,
         proTip: plan.proTip,
         vizImages: {},
+        firstAction: plan.firstAction ? {
+          text: plan.firstAction,
+          status: "suggested",
+          suggestedAt: new Date().toISOString(),
+          startedAt: null,
+          completedAt: null,
+        } : null,
+        companionAction: null,
+        companionActionHistory: [],
+        progressPhotos: [],
       };
       const docRef = await addDoc(collection(db, "users", user.uid, "plans"), entry);
       console.log("Plan saved successfully:", docRef.id);
@@ -1245,8 +1334,29 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     return "premium";
   };
   const meta = (id) => TIERS.find(t => t.id === id) || TIERS[1];
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
+
+  // A plan counts as an active Companion session worth surfacing on Home if the
+  // user has engaged with it beyond just seeing the suggestion — either they're
+  // mid-loop (a companionAction exists) or they started/finished their first
+  // action. Plans where firstAction was never even started don't count; there's
+  // nothing to "continue" yet. Free-tier sessions are never persisted, so this
+  // only ever applies to Pro plans (history is already Pro-only, see loadHistory).
+  const isCompanionResumable = (plan) => {
+    if (plan?.companionAction) return true;
+    if (plan?.firstAction && typeof plan.firstAction === "object" && plan.firstAction.status && plan.firstAction.status !== "suggested") return true;
+    return false;
+  };
+  const resumablePlan = isPro ? history.find(isCompanionResumable) : null;
+
+  const resumeCompanionSession = (item) => {
+    setResults(item);
+    setVizImage(item.vizImages || {});
+    setVizLoading({});
+    setCurrentPlanId(item.id);
+    restorePhotoFromPlan(item);
+  };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2017,6 +2127,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         <Text style={s.heroH1}>Turn Clutter{"\n"}Into Calm</Text>
         <Text style={s.heroP}>Take a photo of any space and get personalized recommendations for every budget.{"\n"}Results in seconds.</Text>
 
+        {resumablePlan && (
+          <TouchableOpacity style={s.companionResumeBanner} onPress={() => resumeCompanionSession(resumablePlan)}>
+            <Sparkles size={18} color={BRAND.green} strokeWidth={2.25} />
+            <View style={{ flex: 1, marginLeft: 10 }}>
+              <Text style={s.companionResumeTitle}>Continue Your Session</Text>
+              <Text style={s.companionResumeSub} numberOfLines={1}>{resumablePlan.spaceType}</Text>
+            </View>
+            <ChevronRight size={18} color={BRAND.green} strokeWidth={2.25} />
+          </TouchableOpacity>
+        )}
+
         <TouchableOpacity
           style={photo ? s.uploadBoxFilled : s.uploadBox}
           onPress={showPhotoOptions}>
@@ -2348,6 +2469,9 @@ const s = StyleSheet.create({
   companionSecondaryBtn: { marginTop: 12, padding: 8, alignItems: "center" },
   companionSecondaryBtnText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textDecorationLine: "underline" },
   companionTipText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginTop: 10 },
+  companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
+  companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
+  companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
   shareBtn: { padding: 12, minWidth: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
   vizBtn: { borderWidth: 1.5, borderRadius: 8, padding: 13, alignItems: "center", justifyContent: "center", marginTop: 12 },
   vizModalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.95)", justifyContent: "center", alignItems: "center" },
