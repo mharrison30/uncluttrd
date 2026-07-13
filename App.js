@@ -1850,6 +1850,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               <Text style={s.budgetBannerText}>💰 Based on your ${budget} budget. Best Match highlighted below.</Text>
             </View>
           ) : null}
+          {companionActionText && (
+            <CompanionCard
+              stage={companionStage}
+              actionText={companionActionText}
+              tipIndex={companionTipIndex}
+              onStart={handleCompanionStart}
+              onComplete={handleCompanionComplete}
+              onSharePhoto={handleCompanionSharePhoto}
+              onFinishedForToday={handleCompanionFinishedForToday}
+              onUpgrade={handleCompanionUpgradeRequest}
+            />
+          )}
           {results.tiers?.map(t => {
             const m = meta(t.id);
             const isSelectedTier = t.id === tier;
