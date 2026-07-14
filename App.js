@@ -41,14 +41,14 @@ let auth;
 try {
   auth = initializeAuth(firebaseApp, { persistence: getReactNativePersistence(AsyncStorage) });
 } catch (e) {
-  // Already initialized (common after a Fast Refresh hot reload) — reuse the existing instance.
+  // Already initialized (common after a Fast Refresh hot reload). Reuse the existing instance.
   auth = getAuth(firebaseApp);
 }
 const db = getFirestore(firebaseApp);
 const storage = getStorage(firebaseApp);
 const functions = getFunctions(firebaseApp, "us-central1");
 
-// Known test/dev accounts — update this list as more are added.
+// Known test/dev accounts. Update this list as more are added.
 const KNOWN_TEST_EMAILS = [
   "hello@uncluttrd.app",
   "michael@earthwiseenergy.net",
@@ -56,7 +56,7 @@ const KNOWN_TEST_EMAILS = [
   "cgignac28@yahoo.com",
 ];
 
-// Creates the users/{uid} profile document if it doesn't exist yet — covers both
+// Creates the users/{uid} profile document if it doesn't exist yet. Covers both
 // brand-new signups and pre-existing users who signed up before this doc existed.
 const ensureUserDocument = async (u, extra = {}) => {
   const userRef = doc(db, "users", u.uid);
@@ -78,7 +78,7 @@ const ensureUserDocument = async (u, extra = {}) => {
 
 
 
-// Uncluttrd drawer icon — transparent background, two versions
+// Uncluttrd drawer icon (transparent background, two versions)
 function DrawerIcon({ size = 38, dark = false }) {
   return (
     <Svg width={size} height={size * (150 / 116)} viewBox="70 50 116 150">
@@ -201,7 +201,7 @@ function OnboardingScreen({ onDone }) {
         )}
       </View>
 
-      {/* Slide content — swipeable */}
+      {/* Slide content (swipeable) */}
       <ScrollView
         ref={scrollRef}
         horizontal
@@ -225,7 +225,7 @@ function OnboardingScreen({ onDone }) {
         ))}
       </ScrollView>
 
-      {/* Dots — tappable too, to match swipe navigation */}
+      {/* Dots (tappable too, to match swipe navigation) */}
       <View style={s.dotsRow}>
         {SLIDES.map((_, i) => (
           <TouchableOpacity key={i} onPress={() => goToSlide(i)}>
@@ -304,7 +304,7 @@ function AuthScreen() {
       Alert.alert("Check your email", "If an account exists for that email, we've sent a link to reset your password.");
     } catch (e) {
       if (e.code === "auth/user-not-found") {
-        // Same message as success — don't reveal whether an account exists for this email.
+        // Same message as success. Don't reveal whether an account exists for this email.
         Alert.alert("Check your email", "If an account exists for that email, we've sent a link to reset your password.");
       } else if (e.code === "auth/invalid-email") {
         setErr("Please enter a valid email address.");
@@ -474,9 +474,9 @@ function AuthScreen() {
 // ── MAIN APP ─────────────────────────────────────────────────
 // ── COMPANION CARD ───────────────────────────────────────────
 // Renders the single-action Companion loop, one decision at a time,
-// per CompanionDesignPrinciples.md. Purely prop-driven — placement on
+// per CompanionDesignPrinciples.md. Purely prop-driven. Placement on
 // the results screen is a separate change (Milestone 4).
-// Simple visual progress indicator — grows with actionIndex, never reaches
+// Simple visual progress indicator. Grows with actionIndex, never reaches
 // 100% (the loop is open-ended, there is no fixed "done"). Exists purely to
 // reinforce "visibly closer to the room you wanted," not to track a total.
 function CompanionProgressBar({ actionIndex }) {
@@ -492,7 +492,7 @@ function CompanionProgressBar({ actionIndex }) {
 }
 
 // Drag-to-compare before/after slider. Plain PanResponder + useState (no new
-// dependency, no Animated) — width/clip can't use the native driver anyway,
+// dependency, no Animated). Width/clip can't use the native driver anyway,
 // and a single drag gesture with no competing animation doesn't need one.
 function BeforeAfterSlider({ beforeUri, afterUri }) {
   const [width, setWidth] = useState(0);
@@ -584,7 +584,7 @@ function CompanionCard({
     return (
       <View style={s.companionCard}>
         <Text style={s.companionTitle}>Ready to keep going?</Text>
-        <Text style={s.companionBody}>Upgrading keeps this going — new steps, saved as you go.</Text>
+        <Text style={s.companionBody}>Upgrading keeps this going. New steps, saved as you go.</Text>
         <TouchableOpacity style={s.companionBtn} onPress={onUpgrade}>
           <Text style={s.companionBtnText}>Upgrade</Text>
         </TouchableOpacity>
@@ -678,8 +678,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // Companion upgrade prompt; reset back to the default whenever the paywall
   // is dismissed without purchasing, so a later unrelated paywall open never
   // inherits a stale "companion" tag. Every other existing entry point never
-  // touches this — it's already correct by default.
+  // touches this. It's already correct by default.
   const [paywallSource, setPaywallSource] = useState("general_paywall");
+  const [purchaseInProgress, setPurchaseInProgress] = useState(false); // tap-guard: a slow native Apple ID prompt shouldn't read as "nothing happened, tap again"
   const [selectedRoom, setSelectedRoom] = useState(null);
   const resultsScrollRef = useRef(null);
   const [loadMsg, setLoadMsg] = useState(0);
@@ -716,16 +717,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // ── Companion loop state ──────────────────────────────────
   // Analytics-only correlator for the free-tier funnel, since free plans are
   // never persisted and so never get a real Firestore planId. Minted once per
-  // analysis, never written to Firestore — see Analytics.md / DecisionLog.md
+  // analysis, never written to Firestore. See Analytics.md / DecisionLog.md
   // 2026-07-13 (Companion Analytics: Event Catalog, Philosophy, and Commerce Reuse).
   const analysisIdRef = useRef(null);
   const secondsSince = (msTimestamp) => (msTimestamp ? Math.round((Date.now() - msTimestamp) / 1000) : null);
 
   const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
   const [companionActionText, setCompanionActionText] = useState(null);
-  // TEMP DEBUG — remove once the "Let's Start Here" no-show bug is found.
+  // TEMP DEBUG. Remove once the "Let's Start Here" no-show bug is found.
   // In-memory buffer so these logs can be exported via the OS share sheet on a
-  // device with no attached Xcode/Mac — see debugShareLog() and its trigger.
+  // device with no attached Xcode/Mac. See debugShareLog() and its trigger.
   const debugLogRef = useRef([]);
   const dlog = (line) => {
     console.log(line);
@@ -740,18 +741,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }
   };
   // Fires whenever this state actually settles (not when the setter is called),
-  // since setState is async — this is the true post-update value.
+  // since setState is async. This is the true post-update value.
   useEffect(() => {
     dlog(`[COMPANION DEBUG 4] companionActionText settled to: ${JSON.stringify(companionActionText)}`);
   }, [companionActionText]);
   const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
-  const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp — feeds a future secondsSinceStarted analytics property (Milestone 6)
+  const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp, feeds a future secondsSinceStarted analytics property (Milestone 6)
   const [companionCompletedAt, setCompanionCompletedAt] = useState(null); // ISO string, used when archiving into companionActionHistory
   const [progressPhoto, setProgressPhoto] = useState(null);
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
   const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
-  // Before/after reveal (Milestone 8) — populated right before entering the
+  // Before/after reveal (Milestone 8). Populated right before entering the
   // "reveal" stage, cleared on reset/goHome like everything else here.
   const [companionRevealBefore, setCompanionRevealBefore] = useState(null);
   const [companionRevealAfter, setCompanionRevealAfter] = useState(null);
@@ -772,7 +773,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // Initializes or resumes the Companion loop whenever a new plan's results arrive.
   // A fresh analysis returns firstAction as a plain string (see the analyzePhoto
   // prompt); a reopened saved plan returns the persisted object shape
-  // { text, status, suggestedAt, startedAt, completedAt } — both are handled here
+  // { text, status, suggestedAt, startedAt, completedAt }. Both are handled here
   // so resuming a saved plan picks up exactly where it was left, not from scratch.
   useEffect(() => {
     if (!results) return;
@@ -782,7 +783,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setCompanionStage(results.companionAction.status === "started" ? "started" : "companion-active");
       setCompanionStartedAt(results.companionAction.startedAt ? new Date(results.companionAction.startedAt).getTime() : null);
       // Only reached when reopening a saved plan (a fresh analysis never has a
-      // companionAction yet) — this is a resumed view, not a freshly generated one.
+      // companionAction yet). This is a resumed view, not a freshly generated one.
       logEvent(getAnalytics(), "companion_action_viewed", { planId: currentPlanId, actionIndex: results.companionAction.actionIndex || 2 });
     } else if (results.firstAction) {
       const isFreshAnalysis = typeof results.firstAction === "string";
@@ -796,7 +797,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionCompletedAt(null);
     setProgressPhoto(null);
     companionBasePhotoRef.current = photo?.uri || null;
-    // Inlined rather than calling a shared helper — that helper is declared
+    // Inlined rather than calling a shared helper. That helper is declared
     // later in this function (near reset/goHome), and referencing it from an
     // effect this early would reintroduce the exact TDZ bug already fixed once.
     if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
@@ -855,13 +856,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const handleCompanionUpgradeRequest = () => {
     logEvent(getAnalytics(), "companion_upgrade_clicked", { analysisId: analysisIdRef.current });
-    // Reuses the existing paywall screen entirely unchanged — same screen every
+    // Reuses the existing paywall screen entirely unchanged. Same screen every
     // other "Upgrade to Pro" entry point already opens. Only the source tag is new.
     setPaywallSource("companion");
     setShowPaywall(true);
   };
 
-  const submitCompanionProgressPhoto = async (progressUri, progressBase64) => {
+  const submitCompanionProgressPhoto = async (progressUri, progressBase64, planIdOverride = null) => {
+    // planIdOverride lets the isPro-mid-session effect re-invoke this exact
+    // function once a plan has just been retroactively saved, before
+    // currentPlanId state has actually re-rendered with the new value.
+    const effectivePlanId = planIdOverride || currentPlanId;
     setProgressPhoto({ uri: progressUri, base64: progressBase64 });
     if (!isPro) {
       setCompanionStage("paywall-prompt");
@@ -875,7 +880,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (!beforeSource) throw new Error("Missing before photo for comparison");
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
-      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}".\n\nName the single clearest, most specific visible change between the two photos, in one short sentence. Only describe what you can confidently see — no percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way — one or two warm sentences, no time estimate stated, no list-like phrasing.\n\nReturn ONLY valid JSON, nothing else — no markdown, no backticks.\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step"}`;
+      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}".\n\nName the single clearest, most specific visible change between the two photos, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step"}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({ beforeImageBase64: compressedBefore.base64, afterImageBase64: compressedAfter.base64, prompt: nextPrompt });
       const raw = result.data?.text || "";
@@ -885,7 +890,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // Upload the progress photo to Storage (same pattern as the original analysis
       // photo) so it can be persisted on the plan doc, not just held in memory.
       let progressPhotoUrl = null;
-      if (currentPlanId) {
+      if (effectivePlanId) {
         try {
           const uploadCompressed = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.75, format: SaveFormat.JPEG });
           const blob = await new Promise((resolve, reject) => {
@@ -896,7 +901,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             xhr.open("GET", uploadCompressed.uri, true);
             xhr.send(null);
           });
-          const path = `plans/${user.uid}/${currentPlanId}/progress/${Date.now()}.jpg`;
+          const path = `plans/${user.uid}/${effectivePlanId}/progress/${Date.now()}.jpg`;
           const fileRef = storageRef(storage, path);
           await uploadBytes(fileRef, blob, { contentType: "image/jpeg" });
           progressPhotoUrl = await getDownloadURL(fileRef);
@@ -906,14 +911,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
 
       const newActionIndex = companionActionIndex + 1;
-      if (currentPlanId) {
+      if (effectivePlanId) {
         const archivedAction = {
           actionIndex: companionActionIndex,
           text: companionActionText,
           startedAt: companionStartedAt ? new Date(companionStartedAt).toISOString() : null,
           completedAt: companionCompletedAt || new Date().toISOString(),
         };
-        updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        updateDoc(doc(db, "users", user.uid, "plans", effectivePlanId), {
           companionActionHistory: arrayUnion(archivedAction),
           ...(progressPhotoUrl ? { progressPhotos: arrayUnion({ actionIndex: companionActionIndex, url: progressPhotoUrl, uploadedAt: new Date().toISOString() }) } : {}),
           companionAction: {
@@ -927,12 +932,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         }).catch(e => console.log("Save companion progress error:", e.message));
       }
 
-      logEvent(getAnalytics(), "companion_progress_photo_uploaded", { planId: currentPlanId, actionIndex: companionActionIndex });
-      logEvent(getAnalytics(), "companion_next_action_generated", { planId: currentPlanId, actionIndex: newActionIndex });
+      logEvent(getAnalytics(), "companion_progress_photo_uploaded", { planId: effectivePlanId, actionIndex: companionActionIndex });
+      logEvent(getAnalytics(), "companion_next_action_generated", { planId: effectivePlanId, actionIndex: newActionIndex });
       if (newActionIndex === 2) {
-        logEvent(getAnalytics(), "companion_session_started", { planId: currentPlanId });
+        logEvent(getAnalytics(), "companion_session_started", { planId: effectivePlanId });
       }
-      logEvent(getAnalytics(), "companion_action_viewed", { planId: currentPlanId, actionIndex: newActionIndex });
+      logEvent(getAnalytics(), "companion_action_viewed", { planId: effectivePlanId, actionIndex: newActionIndex });
 
       companionBasePhotoRef.current = progressUri;
       setCompanionActionText(parsed.companionAction || "");
@@ -951,7 +956,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       companionRevealTimer.current = setTimeout(() => setCompanionRevealReady(true), 1200);
     } catch (e) {
       console.log("Companion next-action error:", e.message);
-      logEvent(getAnalytics(), "companion_action_failed", { planId: currentPlanId, actionIndex: companionActionIndex, reason: e.message });
+      logEvent(getAnalytics(), "companion_action_failed", { planId: effectivePlanId, actionIndex: companionActionIndex, reason: e.message });
       setCompanionStage("celebrating"); // fall back to the photo-share moment rather than strand the user
     } finally {
       stopCompanionTips();
@@ -1109,10 +1114,62 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           console.log("Save original photo error:", photoErr.message);
         }
       }
+      return docRef.id;
     } catch (e) {
       console.log("Save history error:", e.message, e.code);
+      return null;
     }
   };
+
+  // Reacts to isPro transitioning false -> true mid-session (e.g. a purchase
+  // completed partway through a free-tier Companion loop). Without this, a
+  // plan analyzed while free never gets a currentPlanId, and every subsequent
+  // Companion write silently no-ops on that guard for the rest of the
+  // session. Single effect, not scattered per-guard patches - see
+  // DecisionLog.md 2026-07-14 for the investigation that found this.
+  const prevIsProRef = useRef(isPro);
+  useEffect(() => {
+    const justBecamePro = !prevIsProRef.current && isPro;
+    prevIsProRef.current = isPro;
+    if (!justBecamePro || !results || currentPlanId) return; // nothing to retroactively fix
+    (async () => {
+      const newPlanId = await savePlanToHistory(results);
+      if (!newPlanId) {
+        // Unlike savePlanToHistory's normal console.log-only failures, this
+        // one is user-facing on purpose - this whole effect exists to
+        // prevent silent data loss, so a silent failure here would defeat it.
+        Alert.alert("We couldn't save your progress", "You may need to redo your last step.");
+        return;
+      }
+      // savePlanToHistory only ever writes firstAction fresh ("suggested") -
+      // backfill it to match whatever the client already knows actually
+      // happened, using the same dotted-update pattern
+      // handleCompanionStart/handleCompanionComplete already use elsewhere.
+      const firstActionUpdates = {};
+      if (companionStartedAt) {
+        firstActionUpdates["firstAction.status"] = "started";
+        firstActionUpdates["firstAction.startedAt"] = new Date(companionStartedAt).toISOString();
+      }
+      if (companionStage === "celebrating" || companionStage === "paywall-prompt") {
+        firstActionUpdates["firstAction.status"] = "completed";
+        firstActionUpdates["firstAction.completedAt"] = companionCompletedAt || new Date().toISOString();
+      }
+      if (Object.keys(firstActionUpdates).length) {
+        try {
+          await updateDoc(doc(db, "users", user.uid, "plans", newPlanId), firstActionUpdates);
+        } catch (e) {
+          console.log("Retroactive companion backfill error:", e.message);
+        }
+      }
+      // paywall-prompt specifically means a progress photo was already
+      // submitted while free and the AI call was skipped - now that a plan
+      // exists and isPro is true, actually run the deferred generation
+      // instead of just correcting the stage cosmetically.
+      if (companionStage === "paywall-prompt" && progressPhoto) {
+        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, newPlanId);
+      }
+    })();
+  }, [isPro]);
 
   // Tracks which plan's photo is currently being restored so a late-resolving download
   // for an abandoned plan can't overwrite the photo of whichever plan is now on screen.
@@ -1231,7 +1288,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const budgetNote = budget
         ? `The user has a specific budget of $${budget}. Highlight which tier best fits their budget, but still show all three.`
         : `Show all three tiers: Budget (under $50), Mid-Range ($50-$200), and Premium ($200+).`;
-      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range — this is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify one single "first action": the single most obvious, encouraging, doable-right-now step for this space, independent of budget tier. It should be scoped to roughly 15-20 minutes of real work — small enough to start immediately, substantial enough to feel like real progress. Describe what to do, in one or two warm sentences, in the voice of a calm, encouraging professional organizer — not a task-list label, not an estimate of how long it will take.\n\nReturn ONLY valid JSON, nothing else — no markdown, no backticks.\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstAction":"one or two warm sentences describing the single best doable-right-now step","tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify one single "first action": the single most obvious, encouraging, doable-right-now step for this space, independent of budget tier. It should be scoped to roughly 15-20 minutes of real work, small enough to start immediately, substantial enough to feel like real progress. Describe what to do, in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label, not an estimate of how long it will take.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstAction":"one or two warm sentences describing the single best doable-right-now step","tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -1416,7 +1473,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const productList = tier.products?.map(p => p.name).join(", ");
       const suggestionList = tier.suggestions?.join(". ");
       const itemsFound = results.itemsFound?.join(", ") || "";
-      const prompt = `Reorganize and declutter this exact ${results.spaceType}. Keep the same room — the same walls, floor, window, door, ceiling, and architecture exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes. Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound} — organize these rather than removing them entirely unless the suggestions say to.` : ""} Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.`;
+      const prompt = `Reorganize and declutter this exact ${results.spaceType}. Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes. Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the suggestions say to.` : ""} Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.`;
 
       // Use the image EDIT endpoint (not generations) so the model anchors on the
       // user's actual photo instead of inventing an unrelated room from text alone.
@@ -1441,19 +1498,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
       // Compress the generated PNG down to a small JPEG and store it in Firebase Storage,
       // so reopening this plan later shows the real image instead of needing to
-      // re-pay for another OpenAI generation (and instead of leaking a stale one — see vizImages below).
+      // re-pay for another OpenAI generation (and instead of leaking a stale one, see vizImages below).
       let finalUrl = rawImage; // fallback: still show locally this session even if upload fails
       try {
         let sourceUri = rawImage;
         if (b64) {
-          // manipulateAsync needs a file URI, not a raw base64 string — write it to a temp file first.
+          // manipulateAsync needs a file URI, not a raw base64 string. Write it to a temp file first.
           const tempPath = FileSystem.cacheDirectory + `viz_raw_${tier.id}_${Date.now()}.png`;
           await FileSystem.writeAsStringAsync(tempPath, b64, { encoding: FileSystem.EncodingType.Base64 });
           sourceUri = tempPath;
         }
         const compressed = await manipulateAsync(sourceUri, [], { compress: 0.75, format: SaveFormat.JPEG });
         // Read the compressed file into a real Blob via XHR rather than constructing one from
-        // raw bytes in JS — modern React Native's Blob constructor only supports Blobs/strings,
+        // raw bytes in JS. Modern React Native's Blob constructor only supports Blobs/strings,
         // not ArrayBuffer/ArrayBufferView, which is what breaks uploadString/manual Blob building.
         const blob = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
@@ -1469,7 +1526,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         finalUrl = await getDownloadURL(fileRef);
       } catch (compressErr) {
         console.log("Visualization compress/upload error:", compressErr.message);
-        // finalUrl stays as the raw OpenAI image — works for this session, just won't persist cheaply.
+        // finalUrl stays as the raw OpenAI image. Works for this session, just won't persist cheaply.
       }
 
       setVizImage(prev => ({ ...prev, [tier.id]: finalUrl }));
@@ -1483,7 +1540,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           console.log("Save vizImage to plan error:", saveErr.message);
         }
       } else {
-        console.log("No currentPlanId yet — visualization shown locally but not persisted to a saved plan.");
+        console.log("No currentPlanId yet. Visualization shown locally but not persisted to a saved plan.");
       }
     } catch (e) {
       Alert.alert("Visualization failed", e.message);
@@ -1527,7 +1584,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const meta = (id) => TIERS.find(t => t.id === id) || TIERS[1];
 
   // A plan counts as an active Companion session worth surfacing on Home if the
-  // user has engaged with it beyond just seeing the suggestion — either they're
+  // user has engaged with it beyond just seeing the suggestion. Either they're
   // mid-loop (a companionAction exists) or they started/finished their first
   // action. Plans where firstAction was never even started don't count; there's
   // nothing to "continue" yet. Free-tier sessions are never persisted, so this
@@ -1560,8 +1617,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
   // (e.g. History/FAQ/Account's own back arrows return to Menu, not Home) rather than
-  // inventing a different navigation model. No-op on iOS by construction — addEventListener
-  // is a hardcoded no-op there (see react-native's BackHandler.ios.js) — but guarded
+  // inventing a different navigation model. No-op on iOS by construction (addEventListener
+  // is a hardcoded no-op there, see react-native's BackHandler.ios.js), but guarded
   // explicitly anyway so that's obvious from the code itself, not just implicit platform behavior.
   useEffect(() => {
     if (Platform.OS !== "android") return;
@@ -1662,11 +1719,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         try {
           await deleteObject(item);
         } catch (itemErr) {
-          // object/not-found is non-critical — file already gone, safe to continue
+          // object/not-found is non-critical. File already gone, safe to continue
           if (itemErr.code === "storage/object-not-found") {
             console.log("Storage item already deleted:", item.fullPath);
           } else {
-            // Any other storage error is critical — rethrow to stop deletion
+            // Any other storage error is critical. Rethrow to stop deletion
             throw itemErr;
           }
         }
@@ -1762,7 +1819,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             </TouchableOpacity>
           </View>
 
-          <TouchableOpacity style={s.paywallCta} onPress={async () => {
+          <TouchableOpacity
+            style={[s.paywallCta, purchaseInProgress && { opacity: 0.7 }]}
+            disabled={purchaseInProgress}
+            onPress={async () => {
+            if (purchaseInProgress) return; // belt-and-suspenders alongside the disabled prop
+            setPurchaseInProgress(true);
             logEvent(getAnalytics(), "pro_upgrade_clicked");
             try {
               const offerings = await Purchases.getOfferings();
@@ -1790,9 +1852,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             } catch (e) {
               if (e.userCancelled) return;
               Alert.alert("Purchase failed", "Something went wrong. Please try again or contact support at hello@uncluttrd.app.");
+            } finally {
+              setPurchaseInProgress(false);
             }
           }}>
-            <Text style={s.paywallCtaText}>{paywallPlan === "yearly" ? "Go Unlimited - $39.99/year" : "Go Unlimited - $4.99/month"}</Text>
+            {purchaseInProgress ? (
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <ActivityIndicator color="white" size="small" />
+                <Text style={s.paywallCtaText}>Processing...</Text>
+              </View>
+            ) : (
+              <Text style={s.paywallCtaText}>{paywallPlan === "yearly" ? "Go Unlimited - $39.99/year" : "Go Unlimited - $4.99/month"}</Text>
+            )}
           </TouchableOpacity>
           <Text style={s.paywallCtaSub}>Cancel anytime • Managed by {Platform.OS === "android" ? "Google Play" : "Apple"}</Text>
           <Text style={[s.paywallCtaSub, { marginTop: -8 }]}>
@@ -2113,13 +2184,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   // RESULTS SCREEN
   if (results) {
-    dlog(`[COMPANION DEBUG 5] render gate — companionActionText: ${JSON.stringify(companionActionText)} | would render CompanionCard: ${!!companionActionText}`);
+    dlog(`[COMPANION DEBUG 5] render gate, companionActionText: ${JSON.stringify(companionActionText)} | would render CompanionCard: ${!!companionActionText}`);
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
           {/* TEMP DEBUG: long-press the logo to export the [COMPANION DEBUG] log via the
-              share sheet — no Xcode/Mac needed. Remove this onLongPress with the rest of
+              share sheet (no Xcode/Mac needed). Remove this onLongPress with the rest of
               the debug instrumentation once the bug is found. */}
           <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
@@ -2486,8 +2557,8 @@ function AppRoot() {
     try {
       Purchases.configure({ apiKey: "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" }); Purchases.configure({ apiKey: Platform.OS === "android" ? "goog_zsRKzNXkxcdeXQLKducjtXXsJhP" : "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" });
 
-      // Verify entitlement live on launch rather than trusting the local cache alone —
-      // catches lapsed/refunded subscriptions and syncs Pro status on a new device.
+      // Verify entitlement live on launch rather than trusting the local cache alone.
+      // Catches lapsed/refunded subscriptions and syncs Pro status on a new device.
       Purchases.getCustomerInfo()
         .then(customerInfo => {
           const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
@@ -2536,9 +2607,9 @@ function AppRoot() {
       // Link RevenueCat's customer record to our Firebase UID so it's identifiable
       // in the RevenueCat dashboard by UID/email/name (needed for manual promo grants),
       // instead of showing up as an anonymous RevenueCat-generated ID.
-      // Fires on every auth resolution — cold launch for already-signed-in users,
-      // fresh sign-in, and post-signup (handleAuth forces a sign-out/sign-in to get
-      // here with displayName already set). logIn() is idempotent, so repeat calls
+      // Fires on every auth resolution (cold launch for already-signed-in users,
+      // fresh sign-in, and post-signup, where handleAuth forces a sign-out/sign-in
+      // to get here with displayName already set). logIn() is idempotent, so repeat calls
       // for the same user are safe and just refresh the attributes below.
       if (u) {
         ensureUserDocument(u).catch(e => console.log("Ensure user doc error:", e.message));
@@ -2569,10 +2640,10 @@ function AppRoot() {
     );
   }
 
-  // Not logged in — show auth screen
+  // Not logged in, show auth screen
   if (!user) return <AuthScreen />;
 
-  // Logged in but hasn't dismissed onboarding — show it
+  // Logged in but hasn't dismissed onboarding, show it
   if (showOnboard && !skipPref) {
     return <OnboardingScreen onDone={async (skip) => {
       if (skip) {
@@ -2583,7 +2654,7 @@ function AppRoot() {
     }} onSkip={() => setShowOnboard(false)} />;
   }
 
-  // Logged in and onboarding done — show main app
+  // Logged in and onboarding done, show main app
   return <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} />;
 }
 
