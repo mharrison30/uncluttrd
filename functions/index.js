@@ -152,38 +152,30 @@ exports.analyzePhoto = onCall(
 exports.generateNextAction = onCall(
   { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
   async (request) => {
-    const { beforeImageBase64, afterImageBase64, prompt } = request.data || {};
+    const { originalImageBase64, beforeImageBase64, afterImageBase64, prompt } = request.data || {};
 
-    if (!beforeImageBase64 || !afterImageBase64 || !prompt) {
-      throw new HttpsError("invalid-argument", "Missing before/after image or prompt.");
+    if (!originalImageBase64 || !beforeImageBase64 || !afterImageBase64 || !prompt) {
+      throw new HttpsError("invalid-argument", "Missing original/before/after image or prompt.");
     }
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
+    const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
 
     try {
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
-        max_tokens: 500,
+        // Bumped from 500: every call now also returns a completion judgment,
+        // not just occasionally.
+        max_tokens: 650,
         messages: [
           {
             role: "user",
             content: [
-              {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/jpeg",
-                  data: beforeImageBase64,
-                },
-              },
-              {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/jpeg",
-                  data: afterImageBase64,
-                },
-              },
+              // Order matches the prompt's photo 1/2/3 language - original
+              // (whole-project baseline), before (this step), after (this step).
+              image(originalImageBase64),
+              image(beforeImageBase64),
+              image(afterImageBase64),
               { type: "text", text: prompt },
             ],
           },

@@ -48,6 +48,9 @@ The voice is warm, specific, and never anxious. It sounds like someone who has h
 
 **Avoid:** "Next Action," "Task," "Project," "Complete Task," "Task Complete," "Complete Session," and productivity/project-management vocabulary generally (sprints, milestones, streaks, progress bars framed as metrics, checklists framed as backlogs). If a phrase would feel at home in a to-do app, it doesn't belong here.
 
+### 8. Completion is a user decision, not an AI decision
+"Completion is a user decision, informed by AI, not an AI decision imposed on the user." The Companion can notice progress and say so, honestly and specifically, but it never ends the loop by itself and never withholds the choice to keep going. The visualization shown earlier in the flow is inspiration, not a success metric — Companion progress is evaluated against the user's own original space, not a synthetic target image.
+
 ---
 
 ## How to apply this document

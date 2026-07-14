@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, PanResponder
+  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, PanResponder, Animated
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -476,16 +476,31 @@ function AuthScreen() {
 // Renders the single-action Companion loop, one decision at a time,
 // per CompanionDesignPrinciples.md. Purely prop-driven. Placement on
 // the results screen is a separate change (Milestone 4).
-// Simple visual progress indicator. Grows with actionIndex, never reaches
-// 100% (the loop is open-ended, there is no fixed "done"). Exists purely to
-// reinforce "visibly closer to the room you wanted," not to track a total.
-function CompanionProgressBar({ actionIndex }) {
+// Simple visual progress indicator. Grows with actionIndex, capped at 90%
+// while the loop is ongoing (open-ended, no fixed "done" from the AI's side).
+// The only way this bar ever reaches 100% is the `complete` prop, driven by
+// the user's own choice to finish - see CompanionDesignPrinciples.md
+// principle 8. That's why this is the one place in the loop that animates:
+// the fill to 100% is meant to read as a distinct, earned moment.
+function CompanionProgressBar({ actionIndex, complete }) {
   const pct = Math.min(90, 15 + (actionIndex - 1) * 20);
+  const widthAnim = useRef(new Animated.Value(pct)).current;
+
+  useEffect(() => {
+    if (complete) {
+      Animated.timing(widthAnim, { toValue: 100, duration: 700, useNativeDriver: false }).start();
+    }
+  }, [complete]);
+
   return (
     <View style={{ marginBottom: 14 }}>
-      <Text style={s.companionProgressCaption}>Getting closer</Text>
+      <Text style={s.companionProgressCaption}>{complete ? "Done" : "Getting closer"}</Text>
       <View style={s.companionProgressTrack}>
-        <View style={[s.companionProgressFill, { width: `${pct}%` }]} />
+        {complete ? (
+          <Animated.View style={[s.companionProgressFill, { width: widthAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }) }]} />
+        ) : (
+          <View style={[s.companionProgressFill, { width: `${pct}%` }]} />
+        )}
       </View>
     </View>
   );
@@ -541,16 +556,20 @@ function BeforeAfterSlider({ beforeUri, afterUri }) {
 }
 
 function CompanionCard({
-  stage, actionText, tipIndex, actionIndex,
+  stage, actionText, tipIndex, actionIndex, completionReason,
   onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade,
+  onChooseFinish, onChooseContinue, onAcknowledgeComplete,
 }) {
   // "reveal" is rendered as its own full-screen CompanionRevealModal, not
   // inline here - see the results screen render for why (not enough room in
-  // a scrolling card for a before/after slider worth dragging).
+  // a scrolling card for a before/after slider worth dragging). Once the
+  // whole project is finished, the results screen renders
+  // CompanionCompletedSummary in this card's place instead - see there.
   if (stage === "finished" || stage === "reveal") return null;
 
   const GENERATING_TIPS = [
     "Looking at what's changed...",
+    "Comparing against where you started...",
     "Noticing your progress...",
     "Almost got it...",
   ];
@@ -586,6 +605,38 @@ function CompanionCard({
         <Text style={s.companionBody}>Great progress.</Text>
         <TouchableOpacity style={s.companionBtn} onPress={onSharePhoto}>
           <Text style={s.companionBtnText}>Show me what you accomplished</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // The AI recommends finishing, but never decides it - see
+  // CompanionDesignPrinciples.md principle 8. Both buttons use the same
+  // style/size on purpose: neither is the "default" choice.
+  if (stage === "completion-choice") {
+    return (
+      <View style={s.companionCard}>
+        <CompanionProgressBar actionIndex={actionIndex} />
+        <Text style={s.companionTitle}>This is looking good</Text>
+        <Text style={s.companionBody}>{completionReason}</Text>
+        <TouchableOpacity style={s.companionBtn} onPress={onChooseFinish}>
+          <Text style={s.companionBtnText}>This feels finished</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[s.companionBtn, { marginTop: 10 }]} onPress={onChooseContinue}>
+          <Text style={s.companionBtnText}>Make one more improvement</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (stage === "project-complete") {
+    return (
+      <View style={s.companionCard}>
+        <CompanionProgressBar actionIndex={actionIndex} complete />
+        <Text style={s.companionTitle}>You did it</Text>
+        <Text style={s.companionBody}>You turned this space into something that works better for you.</Text>
+        <TouchableOpacity style={s.companionBtn} onPress={onAcknowledgeComplete}>
+          <Text style={s.companionBtnText}>See your finished plan</Text>
         </TouchableOpacity>
       </View>
     );
@@ -651,6 +702,43 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
         </View>
       </SafeAreaView>
     </Modal>
+  );
+}
+
+// Handles both a Firestore Timestamp (has .toDate()) and a plain Date/ISO
+// string - the latter is what's used for the instant right after the user
+// finishes, before the serverTimestamp() write round-trips back into results.
+function formatCompletedDate(value) {
+  if (!value) return null;
+  const d = typeof value?.toDate === "function" ? value.toDate() : new Date(value);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+// Permanent summary shown on the results screen once the whole project is
+// finished, replacing CompanionCard in its place (see the results screen
+// render). Not full-screen like CompanionRevealModal - that's a one-time
+// "come look at this" moment; this is a persistent section on an
+// already-scrolling page, so it stays compact.
+function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri }) {
+  const dateText = formatCompletedDate(completedAt);
+  return (
+    <View style={s.companionCard}>
+      <CompanionProgressBar actionIndex={1} complete />
+      <View style={s.completedBadgeRow}>
+        <View style={s.completedBadge}>
+          <Check size={12} color="white" strokeWidth={3} />
+          <Text style={s.completedBadgeText}>Completed</Text>
+        </View>
+        {dateText && <Text style={s.completedDateText}>{dateText}</Text>}
+      </View>
+      {reason ? <Text style={s.companionBody}>{reason}</Text> : null}
+      {beforeUri && currentUri && (
+        <View style={s.completedSliderArea}>
+          <BeforeAfterSlider beforeUri={beforeUri} afterUri={currentUri} />
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -753,7 +841,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const lastFailedAnalysisRef = useRef(null);
   const secondsSince = (msTimestamp) => (msTimestamp ? Math.round((Date.now() - msTimestamp) / 1000) : null);
 
-  const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
+  const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | reveal | companion-active | paywall-prompt | completion-choice | project-complete | finished
   const [companionActionText, setCompanionActionText] = useState(null);
   // TEMP DEBUG. Remove once the "Let's Start Here" no-show bug is found.
   // In-memory buffer so these logs can be exported via the OS share sheet on a
@@ -783,6 +871,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
   const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
+  // The very first "before" photo for the whole project - unlike
+  // companionBasePhotoRef, this never rolls forward. Set once when results
+  // first arrive (fresh analysis) or once a resumed plan's photo finishes
+  // downloading (see restorePhotoFromPlan) - not just the [results] effect,
+  // since that effect can fire before the resumed photo has actually loaded.
+  const companionOriginalPhotoRef = useRef(null);
+  // Cache of the compressed/base64-encoded original, keyed by the source uri
+  // it was built from. The original photo never changes mid-session, so this
+  // avoids re-compressing and re-encoding the same image on every single step.
+  const companionOriginalCompressedRef = useRef(null); // { uri, base64 }
+  // AI-recommended completion signal (see CompanionDesignPrinciples.md
+  // principle 8) - the AI can only recommend, never decide. Reset to
+  // defaults whenever a new action starts, including "one more improvement."
+  const [companionCompletionRecommended, setCompanionCompletionRecommended] = useState(false);
+  const [companionCompletionReason, setCompanionCompletionReason] = useState(null);
+  // Set locally the instant the user chooses to finish, so the completed
+  // summary can render immediately without waiting on the Firestore
+  // serverTimestamp() write to round-trip back into `results`.
+  const [companionCompletedProject, setCompanionCompletedProject] = useState(null); // { completedAt, reason }
   // Before/after reveal (Milestone 8). Populated right before entering the
   // "reveal" stage, cleared on reset/goHome like everything else here.
   const [companionRevealBefore, setCompanionRevealBefore] = useState(null);
@@ -825,9 +932,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     } else {
       setCompanionActionText(null);
     }
+    // A resumed plan that was already finished should land straight on the
+    // completed summary, not reopen mid-loop - "finished" is what makes
+    // CompanionCard render nothing, and CompanionCompletedSummary (gated on
+    // results.companionComplete / companionCompletedProject) takes its place.
+    if (results.companionComplete) {
+      setCompanionStage("finished");
+    }
     setCompanionCompletedAt(null);
+    setCompanionCompletionRecommended(false);
+    setCompanionCompletionReason(null);
+    setCompanionCompletedProject(null);
     setProgressPhoto(null);
     companionBasePhotoRef.current = photo?.uri || null;
+    // See restorePhotoFromPlan for why this is also (re)set there - this line
+    // alone is correct for a fresh analysis, where `photo` is already loaded
+    // synchronously by the time results arrives.
+    companionOriginalPhotoRef.current = photo?.uri || null;
+    companionOriginalCompressedRef.current = null;
     // Inlined rather than calling a shared helper. That helper is declared
     // later in this function (near reset/goHome), and referencing it from an
     // effect this early would reintroduce the exact TDZ bug already fixed once.
@@ -882,7 +1004,46 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const handleCompanionRevealContinue = () => {
     if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
+    // The AI can recommend finishing, never decide it - see
+    // CompanionDesignPrinciples.md principle 8. This just routes to the
+    // choice; the outcome is entirely up to the two buttons there.
+    if (companionCompletionRecommended) {
+      logEvent(getAnalytics(), "companion_completion_prompt_viewed", { planId: currentPlanId, actionIndex: companionActionIndex });
+      setCompanionStage("completion-choice");
+    } else {
+      setCompanionStage("companion-active");
+    }
+  };
+
+  const handleCompanionChooseContinue = () => {
+    logEvent(getAnalytics(), "companion_continued_past_complete", { planId: currentPlanId, actionIndex: companionActionIndex });
+    // No stale recommendation should carry into the next action - the next
+    // generateNextAction call will judge completion fresh, on its own terms.
+    setCompanionCompletionRecommended(false);
+    setCompanionCompletionReason(null);
     setCompanionStage("companion-active");
+  };
+
+  const handleCompanionChooseFinish = () => {
+    // Local timestamp for the immediate UI - CompanionCompletedSummary can
+    // render right away without waiting on the serverTimestamp() write below
+    // to round-trip back into `results`.
+    setCompanionCompletedProject({ completedAt: new Date().toISOString(), reason: companionCompletionReason });
+    logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, actionIndex: companionActionIndex });
+    setCompanionStage("project-complete");
+    if (isPro && currentPlanId) {
+      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        companionComplete: { completedAt: serverTimestamp(), reason: companionCompletionReason },
+      }).catch(e => console.log("Save companion complete error:", e.message));
+    }
+  };
+
+  const handleCompanionAcknowledgeComplete = () => {
+    // Routes to Your Plan in its completed state, not a blank screen -
+    // "finished" is what makes CompanionCard render nothing; the results
+    // screen renders CompanionCompletedSummary in its place whenever
+    // companionCompletedProject / results.companionComplete is set.
+    setCompanionStage("finished");
   };
 
   const handleCompanionUpgradeRequest = () => {
@@ -898,25 +1059,70 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // function once a plan has just been retroactively saved, before
     // currentPlanId state has actually re-rendered with the new value.
     const effectivePlanId = planIdOverride || currentPlanId;
+    // Restored on any failure below - the stage is only ever allowed to move
+    // forward (into "generating" and then "reveal") after a valid server
+    // response. Never a hardcoded fallback destination.
+    const stageBeforeSubmit = companionStage;
     setProgressPhoto({ uri: progressUri, base64: progressBase64 });
     if (!isPro) {
       setCompanionStage("paywall-prompt");
       logEvent(getAnalytics(), "companion_paywall_viewed", { analysisId: analysisIdRef.current });
       return;
     }
+
+    const originalSource = companionOriginalPhotoRef.current;
+    if (!originalSource) {
+      // Don't touch companionStage at all - the user stays exactly where
+      // they were (normally "celebrating", whose button is what led here),
+      // so the submission button is already enabled again and nothing about
+      // the current action is overwritten. This is the resumed-plan race
+      // where restorePhotoFromPlan's download hasn't resolved yet.
+      console.log("Companion next-action error: original photo not yet available");
+      logEvent(getAnalytics(), "companion_action_failed", { planId: effectivePlanId, actionIndex: companionActionIndex, reason: "missing_original_photo" });
+      Alert.alert("Still loading", "We're still loading your original photo. Please try again in a moment.");
+      return;
+    }
+
     setCompanionStage("generating");
     startCompanionTips();
     try {
       const beforeSource = companionBasePhotoRef.current;
       if (!beforeSource) throw new Error("Missing before photo for comparison");
+
+      // The original never changes mid-session, so its compressed/encoded
+      // form is cached and reused rather than redone on every single step.
+      let compressedOriginal = companionOriginalCompressedRef.current;
+      if (!compressedOriginal || compressedOriginal.uri !== originalSource) {
+        const originalResult = await manipulateAsync(originalSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
+        compressedOriginal = { uri: originalSource, base64: originalResult.base64 };
+        companionOriginalCompressedRef.current = compressedOriginal;
+      }
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
-      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}".\n\nName the single clearest, most specific visible change between the two photos, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step"}`;
+
+      const nextPrompt = `You are a warm, encouraging professional organizer. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state right before this specific step, (3) the state right after the user just completed this step: "${companionActionText}".\n\nFirst, compare photo 2 and photo 3 only. Name the single clearest, most specific visible change between them, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall progress on this space. Using only what you can actually see: has clutter decreased, are related items now grouped, is the intended surface or area now usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Never set this true merely because the step the user just finished succeeded; judge only the overall original-vs-now comparison.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step","completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos - for example: 'Your bookshelf now has a clear surface and grouped items' or 'There's still a stack of books that could find a home.'"}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
-      const result = await generateNextActionFn({ beforeImageBase64: compressedBefore.base64, afterImageBase64: compressedAfter.base64, prompt: nextPrompt });
+      const result = await generateNextActionFn({
+        originalImageBase64: compressedOriginal.base64,
+        beforeImageBase64: compressedBefore.base64,
+        afterImageBase64: compressedAfter.base64,
+        prompt: nextPrompt,
+      });
       const raw = result.data?.text || "";
       const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
       const parsed = JSON.parse(cleaned);
+
+      const visibleChangeText = typeof parsed.visibleChange === "string" && parsed.visibleChange.trim() ? parsed.visibleChange.trim() : null;
+      const nextActionText = typeof parsed.companionAction === "string" && parsed.companionAction.trim() ? parsed.companionAction.trim() : null;
+      if (!visibleChangeText || !nextActionText) {
+        throw new Error("Malformed response: missing visibleChange or companionAction");
+      }
+      // Completion fields are judged separately from the two required fields
+      // above - a malformed completion judgment defaults safely and still
+      // lets the next action proceed, rather than breaking the whole loop
+      // over a non-critical field.
+      const completionRecommended = typeof parsed.completionRecommended === "boolean" ? parsed.completionRecommended : false;
+      const completionReasonText = typeof parsed.completionReason === "string" && parsed.completionReason.trim() ? parsed.completionReason.trim() : null;
 
       // Upload the progress photo to Storage (same pattern as the original analysis
       // photo) so it can be persisted on the plan doc, not just held in memory.
@@ -954,7 +1160,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           ...(progressPhotoUrl ? { progressPhotos: arrayUnion({ actionIndex: companionActionIndex, url: progressPhotoUrl, uploadedAt: new Date().toISOString() }) } : {}),
           companionAction: {
             actionIndex: newActionIndex,
-            text: parsed.companionAction || "",
+            text: nextActionText,
             status: "suggested",
             suggestedAt: new Date().toISOString(),
             startedAt: null,
@@ -971,13 +1177,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       logEvent(getAnalytics(), "companion_action_viewed", { planId: effectivePlanId, actionIndex: newActionIndex });
 
       companionBasePhotoRef.current = progressUri;
-      setCompanionActionText(parsed.companionAction || "");
+      setCompanionActionText(nextActionText);
       setCompanionActionIndex(newActionIndex);
+      setCompanionCompletionRecommended(completionRecommended);
+      setCompanionCompletionReason(completionReasonText);
 
       // Before/after reveal (Milestone 8): show the comparison and the visible-
       // change reaction before the next action appears, not instead of it.
-      const visibleChangeText = (parsed.visibleChange && parsed.visibleChange.trim())
-        || "You completed this step and moved the space forward.";
       setCompanionRevealBefore(beforeSource);
       setCompanionRevealAfter(progressUri);
       setCompanionVisibleChange(visibleChangeText);
@@ -988,7 +1194,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     } catch (e) {
       console.log("Companion next-action error:", e.message);
       logEvent(getAnalytics(), "companion_action_failed", { planId: effectivePlanId, actionIndex: companionActionIndex, reason: e.message });
-      setCompanionStage("celebrating"); // fall back to the photo-share moment rather than strand the user
+      // Never a hardcoded fallback stage - only enter reveal/further stages
+      // after a valid server response. Revert to wherever the user actually
+      // was, so the button that got them here is still there and tappable.
+      setCompanionStage(stageBeforeSubmit);
+      Alert.alert("Something went wrong", "We couldn't review your progress. Please try again.");
     } finally {
       stopCompanionTips();
     }
@@ -1211,12 +1421,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const restorePhotoFromPlan = async (item) => {
     activePlanIdRef.current = item.id;
     setPhoto(null); // clear immediately so nothing can fire generateVisualization with a stale photo while this loads
+    // The [results] effect seeds companionOriginalPhotoRef from `photo` too,
+    // but that effect fires synchronously on setResults(item) - before this
+    // download resolves. Reset here and set it again below once the real
+    // local file is ready, so a resumed plan never gets stuck with a stale or
+    // missing original photo ref.
+    companionOriginalPhotoRef.current = null;
+    companionOriginalCompressedRef.current = null;
     if (!item.photoUrl) return;
     try {
       const localUri = FileSystem.cacheDirectory + `plan_photo_${item.id}.jpg`;
       const { uri } = await FileSystem.downloadAsync(item.photoUrl, localUri);
       if (activePlanIdRef.current !== item.id) return; // user switched/left before this resolved
       setPhoto({ uri, base64: null, mimeType: "image/jpeg" });
+      companionOriginalPhotoRef.current = uri;
     } catch (e) {
       console.log("Restore plan photo error:", e.message);
       if (activePlanIdRef.current === item.id) setPhoto(null);
@@ -1659,8 +1877,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2233,6 +2451,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // RESULTS SCREEN
   if (results) {
     dlog(`[COMPANION DEBUG 5] render gate, companionActionText: ${JSON.stringify(companionActionText)} | would render CompanionCard: ${!!companionActionText}`);
+    // companionCompletedProject (set the instant the user finishes, this
+    // session) takes priority over results.companionComplete (the persisted
+    // field, read back on a later resume) since it's always the freshest.
+    // Data being ready is not the same as it being time to show the summary -
+    // the celebratory "project-complete" stage still needs to play first;
+    // the summary only replaces CompanionCard once the user acknowledges it
+    // (companionStage becomes "finished") or the plan is reopened already
+    // complete (the [results] effect sets "finished" directly in that case).
+    const projectCompleteData = companionCompletedProject || results.companionComplete || null;
+    const showCompletedSummary = companionStage === "finished" && !!projectCompleteData;
+    const completedAtValue = projectCompleteData?.completedAt ?? null;
+    const completedReasonValue = projectCompleteData?.reason ?? null;
+    // Prefer the persisted Storage URLs (always correct for a resumed plan);
+    // fall back to the live session's local refs for the instant right after
+    // finishing, before those URLs exist on `results` yet.
+    const lastProgressPhotoUrl = results.progressPhotos?.length ? results.progressPhotos[results.progressPhotos.length - 1].url : null;
+    const completedBeforeUri = results.photoUrl || companionOriginalPhotoRef.current || null;
+    const completedCurrentUri = lastProgressPhotoUrl || companionBasePhotoRef.current || null;
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
@@ -2283,17 +2519,29 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               <Text style={s.budgetBannerText}>💰 Based on your ${budget} budget. Best Match highlighted below.</Text>
             </View>
           ) : null}
-          {companionActionText && (
+          {companionActionText && !showCompletedSummary && (
             <CompanionCard
               stage={companionStage}
               actionText={companionActionText}
               tipIndex={companionTipIndex}
               actionIndex={companionActionIndex}
+              completionReason={companionCompletionReason}
               onStart={handleCompanionStart}
               onComplete={handleCompanionComplete}
               onSharePhoto={handleCompanionSharePhoto}
               onFinishedForToday={handleCompanionFinishedForToday}
               onUpgrade={handleCompanionUpgradeRequest}
+              onChooseFinish={handleCompanionChooseFinish}
+              onChooseContinue={handleCompanionChooseContinue}
+              onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
+            />
+          )}
+          {showCompletedSummary && (
+            <CompanionCompletedSummary
+              completedAt={completedAtValue}
+              reason={completedReasonValue}
+              beforeUri={completedBeforeUri}
+              currentUri={completedCurrentUri}
             />
           )}
           <CompanionRevealModal
@@ -2864,6 +3112,11 @@ const s = StyleSheet.create({
   revealModalImageArea: { flex: 1, paddingHorizontal: 12, paddingTop: 8 },
   revealModalFooter: { paddingHorizontal: 18, paddingTop: 10, paddingBottom: 18 },
   revealModalDragHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 },
+  completedBadgeRow: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
+  completedBadge: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.green, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4, marginRight: 8 },
+  completedBadgeText: { color: "white", fontSize: 12, fontFamily: "Inter_600SemiBold", marginLeft: 4 },
+  completedDateText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate },
+  completedSliderArea: { height: 220, borderRadius: 12, overflow: "hidden", marginTop: 4 },
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
