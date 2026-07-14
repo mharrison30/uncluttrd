@@ -582,6 +582,51 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (vizTipTimer.current) clearInterval(vizTipTimer.current);
   };
 
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
+  const [showPaywall, setShowPaywall] = useState(false);
+  const [paywallPlan, setPaywallPlan] = useState("yearly");
+  // Tags which entry point opened the (single, shared) paywall screen, for the
+  // subscription_started source property. Set to "companion" only by the
+  // Companion upgrade prompt; reset back to the default whenever the paywall
+  // is dismissed without purchasing, so a later unrelated paywall open never
+  // inherits a stale "companion" tag. Every other existing entry point never
+  // touches this — it's already correct by default.
+  const [paywallSource, setPaywallSource] = useState("general_paywall");
+  const [selectedRoom, setSelectedRoom] = useState(null);
+  const resultsScrollRef = useRef(null);
+  const [loadMsg, setLoadMsg] = useState(0);
+  const loadTimer = useRef(null);
+
+  const LOAD_MESSAGES = [
+    "Studying your space layout...",
+    "Identifying what needs to stay and what can go...",
+    "Selecting storage solutions for your budget...",
+    "Building your three-tier organization plan...",
+    "Almost ready...",
+  ];
+
+  const startLoadMessages = () => {
+    setLoadMsg(0);
+    let i = 0;
+    loadTimer.current = setInterval(() => {
+      i = Math.min(i + 1, LOAD_MESSAGES.length - 1);
+      setLoadMsg(i);
+    }, 2500);
+  };
+
+  const stopLoadMessages = () => {
+    if (loadTimer.current) clearInterval(loadTimer.current);
+    setLoadMsg(0);
+  };
+  const [tier, setTier] = useState("mid");
+  const [tierTouched, setTierTouched] = useState(false); // true once the user actually taps a tier pill
+  const [budget, setBudget] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState(null);
+  const [err, setErr] = useState(null);
+
   // ── Companion loop state ──────────────────────────────────
   // Analytics-only correlator for the free-tier funnel, since free plans are
   // never persisted and so never get a real Firestore planId. Minted once per
@@ -844,51 +889,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       ]
     );
   };
-
-  const [showHistory, setShowHistory] = useState(false);
-  const [history, setHistory] = useState([]);
-  const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
-  const [showPaywall, setShowPaywall] = useState(false);
-  const [paywallPlan, setPaywallPlan] = useState("yearly");
-  // Tags which entry point opened the (single, shared) paywall screen, for the
-  // subscription_started source property. Set to "companion" only by the
-  // Companion upgrade prompt; reset back to the default whenever the paywall
-  // is dismissed without purchasing, so a later unrelated paywall open never
-  // inherits a stale "companion" tag. Every other existing entry point never
-  // touches this — it's already correct by default.
-  const [paywallSource, setPaywallSource] = useState("general_paywall");
-  const [selectedRoom, setSelectedRoom] = useState(null);
-  const resultsScrollRef = useRef(null);
-  const [loadMsg, setLoadMsg] = useState(0);
-  const loadTimer = useRef(null);
-
-  const LOAD_MESSAGES = [
-    "Studying your space layout...",
-    "Identifying what needs to stay and what can go...",
-    "Selecting storage solutions for your budget...",
-    "Building your three-tier organization plan...",
-    "Almost ready...",
-  ];
-
-  const startLoadMessages = () => {
-    setLoadMsg(0);
-    let i = 0;
-    loadTimer.current = setInterval(() => {
-      i = Math.min(i + 1, LOAD_MESSAGES.length - 1);
-      setLoadMsg(i);
-    }, 2500);
-  };
-
-  const stopLoadMessages = () => {
-    if (loadTimer.current) clearInterval(loadTimer.current);
-    setLoadMsg(0);
-  };
-  const [tier, setTier] = useState("mid");
-  const [tierTouched, setTierTouched] = useState(false); // true once the user actually taps a tier pill
-  const [budget, setBudget] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState(null);
-  const [err, setErr] = useState(null);
 
   const pickPhoto = async () => {
     try {
