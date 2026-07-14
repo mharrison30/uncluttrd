@@ -3,21 +3,67 @@ const { defineSecret } = require("firebase-functions/params");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const { toFile } = require("openai/uploads");
+const admin = require("firebase-admin");
+
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+const db = admin.firestore();
 
 const ANTHROPIC_KEY = defineSecret("ANTHROPIC_KEY");
 const OPENAI_KEY = defineSecret("OPENAI_KEY");
 
+const FREE_MONTHLY_LIMIT = 3;
+const IDEMPOTENCY_TTL_DAYS = 60; // within the requested 30-90 day range; requires a Firestore TTL policy on expiresAt (console/gcloud config, not code)
+
+// "Calendar month" is defined in UTC server-side - the simplest, most
+// tamper-resistant definition, though it means a user right at a month
+// boundary could see rollover at a different local-clock moment than
+// midnight-their-timezone. Flagged as a deliberate choice, not an oversight.
+const currentMonthUTC = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
+
 exports.analyzePhoto = onCall(
   { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
   async (request) => {
-    const { imageBase64, prompt } = request.data || {};
+    const { imageBase64, prompt, analysisId } = request.data || {};
 
-    if (!imageBase64 || !prompt) {
-      throw new HttpsError("invalid-argument", "Missing image or prompt.");
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    if (!imageBase64 || !prompt || !analysisId) {
+      throw new HttpsError("invalid-argument", "Missing image, prompt, or analysisId.");
+    }
+
+    const uid = request.auth.uid;
+    const userRef = db.collection("users").doc(uid);
+    // Structured as a subcollection under the user's own doc so ownership is
+    // enforced by path, not a separate uid-match check in code or rules.
+    const idemRef = userRef.collection("analysisIdempotency").doc(analysisId);
+
+    // Idempotency: a retry of the same analysisId (network retry, Cloud
+    // Function retry) replays the original result - no second Anthropic
+    // call, no second count, no double-counting.
+    const idemSnap = await idemRef.get();
+    if (idemSnap.exists) {
+      const cached = idemSnap.data();
+      return { text: cached.text, analysesRemaining: cached.analysesRemaining };
+    }
+
+    // Pre-check (plain read, outside any transaction) - reject before paying
+    // for an Anthropic call the user isn't entitled to make.
+    const userSnap = await userRef.get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+    const month = currentMonthUTC();
+
+    if (userData.isPro !== true) {
+      const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
+      if (effectiveCount >= FREE_MONTHLY_LIMIT) {
+        throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
+      }
     }
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
-
+    let text;
     try {
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
@@ -39,12 +85,63 @@ exports.analyzePhoto = onCall(
           },
         ],
       });
-
-      const text = message.content.find((b) => b.type === "text")?.text || "";
-      return { text };
+      text = message.content.find((b) => b.type === "text")?.text || "";
     } catch (err) {
       throw new HttpsError("internal", err.message || "Analysis failed.");
     }
+
+    // Only on success: re-read and re-check inside the transaction itself,
+    // not just trusting the earlier pre-check. If a concurrent request
+    // already used the last slot between the pre-check and now, this
+    // request's already-paid-for Anthropic call is not counted or cached -
+    // accepted per the approved design rather than building a reservation
+    // system for a rare concurrency edge case. The user still sees their
+    // plan; it's simply not charged against their limit either way.
+    let analysesRemaining = null;
+    try {
+      await db.runTransaction(async (tx) => {
+        const freshSnap = await tx.get(userRef);
+        const freshData = freshSnap.exists ? freshSnap.data() : {};
+        const expiresAt = admin.firestore.Timestamp.fromMillis(
+          Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
+        );
+
+        if (freshData.isPro === true) {
+          analysesRemaining = null;
+          tx.set(idemRef, {
+            text,
+            analysesRemaining: null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt,
+          });
+          return;
+        }
+
+        const freshEffectiveCount = freshData.analysisCountMonth === month ? (freshData.analysisCount || 0) : 0;
+        if (freshEffectiveCount >= FREE_MONTHLY_LIMIT) {
+          // Lost the race - do not increment, do not cache. Anthropic cost
+          // is accepted as spent; the user still gets to see this result.
+          analysesRemaining = 0;
+          return;
+        }
+
+        const newCount = freshEffectiveCount + 1;
+        tx.set(userRef, { analysisCount: newCount, analysisCountMonth: month }, { merge: true });
+        analysesRemaining = FREE_MONTHLY_LIMIT - newCount;
+        tx.set(idemRef, {
+          text,
+          analysesRemaining,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt,
+        });
+      });
+    } catch (txErr) {
+      // The analysis itself already succeeded - don't fail the whole
+      // request over bookkeeping. Log and still return the plan.
+      console.error("analyzePhoto count transaction failed:", txErr.message);
+    }
+
+    return { text, analysesRemaining };
   }
 );
 

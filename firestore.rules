@@ -2,10 +2,37 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      // analysisCount/analysisCountMonth are permanently server-owned (written
+      // only by the Admin SDK inside analyzePhoto's transaction). A client
+      // create must not seed a nonzero/rollover-primed value for itself.
+      allow create: if request.auth != null && request.auth.uid == userId
+        && (!('analysisCount' in request.resource.data) || request.resource.data.analysisCount == 0)
+        && !('analysisCountMonth' in request.resource.data);
+
+      // Client updates may only ever touch isPro (temporary, pending the
+      // RevenueCat-webhook migration in BACKLOG.md) - this alone guarantees
+      // analysisCount/analysisCountMonth can't be touched by any client write,
+      // no separate equality check needed.
+      allow update: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPro']);
+
+      // NOT tightened per the flagged conflict: blocking delete here would
+      // break the existing client-side account deletion flow (deleteDoc while
+      // still authenticated - see DecisionLog.md). Left as-is pending a
+      // decision on moving account deletion server-side.
+      allow delete: if request.auth != null && request.auth.uid == userId;
 
       match /plans/{planId} {
         allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Server (Admin SDK) only - Admin SDK bypasses rules entirely, so this
+      // is purely a statement of intent: no client ever has a legitimate
+      // reason to read or write its own idempotency records directly.
+      match /analysisIdempotency/{analysisId} {
+        allow read, write: if false;
       }
     }
   }

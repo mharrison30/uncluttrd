@@ -1320,12 +1320,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
       const analyzePhotoFn = httpsCallable(functions, "analyzePhoto");
       let raw = "";
+      let analysesRemaining = null; // server's real count, per this analysis - not a local guess
       try {
-        const result = await analyzePhotoFn({ imageBase64, prompt });
+        const result = await analyzePhotoFn({ imageBase64, prompt, analysisId: analysisIdRef.current });
         raw = result.data?.text || "";
+        analysesRemaining = typeof result.data?.analysesRemaining === "number" ? result.data.analysesRemaining : null;
         dlog(`[COMPANION DEBUG 1] raw analyzePhotoFn response: ${raw}`);
       } catch (fnErr) {
         console.log("Function error:", fnErr.code, fnErr.message);
+        if (fnErr.code === "functions/resource-exhausted") {
+          // Server-enforced free-plan limit, not a transient failure - show
+          // the paywall directly rather than a generic error message.
+          setShowPaywall(true);
+          return;
+        }
         logEvent(getAnalytics(), "plan_failed", { reason: fnErr.code });
         if (fnErr.code === "functions/unavailable" || (fnErr.message || "").includes("Network")) {
           setErr("No internet connection. Please check your WiFi or cellular and try again.");
@@ -1352,11 +1360,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
       savePlanToHistory(parsed);
       setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
-      if (!isPro) {
-        const current = analyses || 0;
-        const newCount = current + 1;
-        await AsyncStorage.setItem("analysisCount", newCount.toString());
+      // analysesRemaining is the server's real count (null means Pro/unlimited)
+      // - AsyncStorage is now a display cache only, never authoritative.
+      if (typeof analysesRemaining === "number") {
+        const newCount = Math.max(0, 3 - analysesRemaining);
         setAnalyses(newCount);
+        await AsyncStorage.setItem("analysisCount", newCount.toString());
       }
     } catch (e) {
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
@@ -2544,6 +2553,10 @@ function AppRoot() {
   const [skipPref, setSkipPref] = useState(false);
   const [isPro, setIsPro] = useState(false);
   const [analyses, setAnalyses] = useState(null); // null = not loaded yet
+  // Lets the RevenueCat listener (registered once, [] deps) attribute later
+  // entitlement changes to whichever account is actually signed in right now,
+  // without the stale-closure trap a plain `user` reference would have here.
+  const currentUidRef = useRef(null);
 
   const [fontsLoaded] = useFonts({
     Inter_400Regular,
@@ -2553,26 +2566,29 @@ function AppRoot() {
   });
 
   useEffect(() => {
-    // Initialize RevenueCat
+    // Initialize RevenueCat. SDK configuration and the ongoing listener are
+    // legitimately one-time/global concerns, not per-auth-change ones - the
+    // authoritative per-account entitlement fetch lives in onAuthStateChanged
+    // below, sequenced after Purchases.logIn() so it reads the right account.
+    // The standalone getCustomerInfo() that used to live here was removed -
+    // it raced against that authoritative fetch for no benefit and was part
+    // of the original leakage risk.
     try {
       Purchases.configure({ apiKey: "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" }); Purchases.configure({ apiKey: Platform.OS === "android" ? "goog_zsRKzNXkxcdeXQLKducjtXXsJhP" : "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" });
 
-      // Verify entitlement live on launch rather than trusting the local cache alone.
-      // Catches lapsed/refunded subscriptions and syncs Pro status on a new device.
-      Purchases.getCustomerInfo()
-        .then(customerInfo => {
-          const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
-          setIsPro(proActive);
-          AsyncStorage.setItem("isPro", proActive ? "true" : "false");
-        })
-        .catch(e => console.log("RevenueCat getCustomerInfo error:", e.message));
-
       // Keep Pro status in sync if it changes while the app is open
-      // (e.g. a refund processes, or the subscription is restored on another device).
+      // (e.g. a refund processes, or the subscription is restored on another
+      // device). Reads currentUidRef rather than closing over `user` directly,
+      // since this effect only runs once and would otherwise always see
+      // whichever value `user` had at mount (null).
       const listener = (customerInfo) => {
         const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
         setIsPro(proActive);
         AsyncStorage.setItem("isPro", proActive ? "true" : "false");
+        if (currentUidRef.current) {
+          updateDoc(doc(db, "users", currentUidRef.current), { isPro: proActive })
+            .catch(e => console.log("Sync isPro error:", e.message));
+        }
       };
       Purchases.addCustomerInfoUpdateListener(listener);
       return () => Purchases.removeCustomerInfoUpdateListener(listener);
@@ -2590,19 +2606,49 @@ function AppRoot() {
   }, []);
 
   useEffect(() => {
-    const init = async () => {
-      const saved = await AsyncStorage.getItem("skipOnboarding");
+    // skipOnboarding is intentionally device-scoped, not account-scoped - it's
+    // a UI preference ("has this device seen onboarding"), not account data,
+    // so it stays a one-time mount load separate from the auth callback below.
+    AsyncStorage.getItem("skipOnboarding").then(saved => {
       if (saved === "true") setSkipPref(true);
-      const pro = await AsyncStorage.getItem("isPro");
-      if (pro === "true") setIsPro(true);
-      const count = await AsyncStorage.getItem("analysisCount");
-      if (count) setAnalyses(parseInt(count) || 0);
-    };
-    init();
+    });
 
-    const unsub = onAuthStateChanged(auth, u => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      // Reset account-specific state FIRST, before anything async, so no
+      // previous account's isPro/analyses can render even for one frame -
+      // this replaces the old mount-only AsyncStorage init(), which is the
+      // root cause of both the free-plan count and isPro leaking across
+      // accounts signed into the same device.
+      setAnalyses(0);
+      setIsPro(false);
+      currentUidRef.current = u ? u.uid : null;
       setUser(u);
       setLoading(false);
+
+      if (!u) {
+        // Signed out - clear the display cache too, so nothing stale lingers
+        // for whoever signs in next before their own data loads.
+        await AsyncStorage.removeItem("analysisCount");
+        await AsyncStorage.removeItem("isPro");
+        return;
+      }
+
+      ensureUserDocument(u).catch(e => console.log("Ensure user doc error:", e.message));
+
+      // Load this account's real server-side analysis count. Same
+      // month-rollover math as the server (see functions/index.js
+      // currentMonthUTC), computed here only for correct initial display -
+      // the server remains authoritative on every actual analyzePhoto call.
+      try {
+        const userSnap = await getDoc(doc(db, "users", u.uid));
+        const data = userSnap.exists() ? userSnap.data() : {};
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const effectiveCount = data.analysisCountMonth === currentMonth ? (data.analysisCount || 0) : 0;
+        setAnalyses(effectiveCount);
+        await AsyncStorage.setItem("analysisCount", effectiveCount.toString());
+      } catch (e) {
+        console.log("Load analysisCount error:", e.message);
+      }
 
       // Link RevenueCat's customer record to our Firebase UID so it's identifiable
       // in the RevenueCat dashboard by UID/email/name (needed for manual promo grants),
@@ -2611,20 +2657,27 @@ function AppRoot() {
       // fresh sign-in, and post-signup, where handleAuth forces a sign-out/sign-in
       // to get here with displayName already set). logIn() is idempotent, so repeat calls
       // for the same user are safe and just refresh the attributes below.
-      if (u) {
-        ensureUserDocument(u).catch(e => console.log("Ensure user doc error:", e.message));
+      try {
+        await Purchases.logIn(u.uid);
+        const nameParts = (u.displayName || "").trim().split(" ");
+        Purchases.setAttributes({
+          "$email": u.email || "",
+          "$displayName": u.displayName || "",
+          "firstName": nameParts[0] || "",
+          "lastName": nameParts.slice(1).join(" "),
+        });
 
-        Purchases.logIn(u.uid)
-          .then(() => {
-            const nameParts = (u.displayName || "").trim().split(" ");
-            Purchases.setAttributes({
-              "$email": u.email || "",
-              "$displayName": u.displayName || "",
-              "firstName": nameParts[0] || "",
-              "lastName": nameParts.slice(1).join(" "),
-            });
-          })
-          .catch(e => console.log("RevenueCat logIn error:", e.message));
+        // Fresh entitlement read for THIS account, sequenced after logIn() -
+        // calling this any earlier would read whichever account RevenueCat
+        // was previously tracking, not the one that just signed in.
+        const customerInfo = await Purchases.getCustomerInfo();
+        const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
+        setIsPro(proActive);
+        await AsyncStorage.setItem("isPro", proActive ? "true" : "false");
+        updateDoc(doc(db, "users", u.uid), { isPro: proActive })
+          .catch(e => console.log("Sync isPro error:", e.message));
+      } catch (e) {
+        console.log("RevenueCat logIn/getCustomerInfo error:", e.message);
       }
     });
     return unsub;
