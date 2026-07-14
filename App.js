@@ -720,6 +720,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // analysis, never written to Firestore. See Analytics.md / DecisionLog.md
   // 2026-07-13 (Companion Analytics: Event Catalog, Philosophy, and Commerce Reuse).
   const analysisIdRef = useRef(null);
+  // Holds { analysisId, photoUri } for the most recent analysis attempt that
+  // never succeeded, so a retry of the exact same photo reuses the same
+  // analysisId instead of minting a fresh one - the server treats a repeated
+  // analysisId as idempotent, so a retry can't consume a second free use.
+  // Cleared on success (a completed ID must never be reused - that would just
+  // replay the old cached result) and in reset()/goHome().
+  const lastFailedAnalysisRef = useRef(null);
   const secondsSince = (msTimestamp) => (msTimestamp ? Math.round((Date.now() - msTimestamp) / 1000) : null);
 
   const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | companion-active | paywall-prompt | finished
@@ -1282,7 +1289,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (!photo?.base64) { setErr("Please select a photo first."); return; }
     if (!isPro && (analyses || 0) >= 3) { setShowPaywall(true); return; }
     console.log("Starting analysis...");
-    analysisIdRef.current = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    if (lastFailedAnalysisRef.current && lastFailedAnalysisRef.current.photoUri === photo?.uri) {
+      analysisIdRef.current = lastFailedAnalysisRef.current.analysisId; // retry of the same photo - reuse, don't consume a second free use
+    } else {
+      analysisIdRef.current = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
     setLoading(true); setErr(null); setResults(null); setCurrentPlanId(null); startLoadMessages();
     try {
       const budgetNote = budget
@@ -1334,6 +1345,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           setShowPaywall(true);
           return;
         }
+        lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
         logEvent(getAnalytics(), "plan_failed", { reason: fnErr.code });
         if (fnErr.code === "functions/unavailable" || (fnErr.message || "").includes("Network")) {
           setErr("No internet connection. Please check your WiFi or cellular and try again.");
@@ -1345,12 +1357,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const match = raw.match(/\{[\s\S]*\}/);
       dlog(`[COMPANION DEBUG 2] regex match found: ${!!match} | extracted length: ${match ? match[0].length : 0}`);
       if (!match) {
+        lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
         logEvent(getAnalytics(), "plan_failed", { reason: "unparseable_response" });
         setErr("We had trouble reading your space. Try a clearer, well-lit photo.");
         return;
       }
       const parsed = JSON.parse(match[0]);
       dlog(`[COMPANION DEBUG 3] parsed.firstAction: ${JSON.stringify(parsed.firstAction)} | typeof: ${typeof parsed.firstAction}`);
+      lastFailedAnalysisRef.current = null; // this analysisId succeeded - never reuse it, a later reuse would just replay this cached result
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
       if (parsed.firstAction) {
@@ -1368,6 +1382,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         await AsyncStorage.setItem("analysisCount", newCount.toString());
       }
     } catch (e) {
+      lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
       if (e.message.includes("Network")) {
         setErr("No internet connection. Please check your WiFi or cellular and try again.");
@@ -1620,8 +1635,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly

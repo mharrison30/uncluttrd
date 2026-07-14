@@ -35,5 +35,12 @@ service cloud.firestore {
         allow read, write: if false;
       }
     }
+
+    // Server (Admin SDK) only - deletion-monitoring breadcrumbs written by
+    // recordUserDocDeletion and read by checkOrphanedUserDeletions. No client
+    // has a legitimate reason to read or write these directly.
+    match /deletionAudit/{uid} {
+      allow read, write: if false;
+    }
   }
 }

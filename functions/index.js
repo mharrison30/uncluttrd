@@ -1,4 +1,6 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
@@ -15,6 +17,8 @@ const OPENAI_KEY = defineSecret("OPENAI_KEY");
 
 const FREE_MONTHLY_LIMIT = 3;
 const IDEMPOTENCY_TTL_DAYS = 60; // within the requested 30-90 day range; requires a Firestore TTL policy on expiresAt (console/gcloud config, not code)
+const DELETION_AUDIT_TTL_DAYS = 30; // requires a Firestore TTL policy on expiresAt, same as above
+const DELETION_CHECK_GRACE_MINUTES = 10; // give the client's Auth deletion call time to land before flagging
 
 // "Calendar month" is defined in UTC server-side - the simplest, most
 // tamper-resistant definition, though it means a user right at a month
@@ -226,3 +230,53 @@ exports.generateVisualization = onCall(
     }
   }
 );
+
+// --- Deletion monitoring (pure observability - no change to the existing
+// client-side deletion flow). A client can delete users/{uid} without also
+// deleting the Auth account (see BACKLOG.md), which would let someone get a
+// fresh free-plan allowance by re-registering the same Auth account. This
+// pair of functions gives a queryable signal if that's actually happening,
+// without touching the deletion flow itself.
+
+exports.recordUserDocDeletion = onDocumentDeleted("users/{userId}", async (event) => {
+  const { userId } = event.params;
+  const expiresAt = admin.firestore.Timestamp.fromMillis(
+    Date.now() + DELETION_AUDIT_TTL_DAYS * 24 * 60 * 60 * 1000
+  );
+  await db.collection("deletionAudit").doc(userId).set({
+    uid: userId,
+    firestoreDeletedAt: admin.firestore.FieldValue.serverTimestamp(),
+    checked: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt,
+  });
+});
+
+exports.checkOrphanedUserDeletions = onSchedule("every 30 minutes", async () => {
+  const cutoffMs = Date.now() - DELETION_CHECK_GRACE_MINUTES * 60 * 1000;
+  // Equality-only filter (checked == false) so this runs on the automatic
+  // single-field index - no composite index to provision before deploying.
+  // The grace-period cutoff is applied in code below instead of in the query.
+  const snap = await db.collection("deletionAudit").where("checked", "==", false).get();
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    const deletedAtMs = data.firestoreDeletedAt ? data.firestoreDeletedAt.toMillis() : 0;
+    if (deletedAtMs > cutoffMs) continue; // still within the grace window - check it on a later sweep
+
+    const uid = doc.id;
+    try {
+      await admin.auth().getUser(uid);
+      // Auth account still exists well after the Firestore doc was deleted -
+      // the delete-without-deleteUser bypass. Logged only; no action taken.
+      console.warn(`[deletionAudit] uid ${uid}: Firestore user doc deleted but Auth account still exists - possible free-plan bypass.`);
+    } catch (err) {
+      if (err.code !== "auth/user-not-found") {
+        console.error(`[deletionAudit] uid ${uid}: getUser check failed, will retry next sweep:`, err.message);
+        continue; // leave unchecked so this gets rechecked
+      }
+      // Expected path: the Auth account is really gone, full deletion completed normally.
+    }
+    await doc.ref.set({ checked: true, checkedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  }
+});
