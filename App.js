@@ -494,8 +494,10 @@ function CompanionProgressBar({ actionIndex }) {
 // Drag-to-compare before/after slider. Plain PanResponder + useState (no new
 // dependency, no Animated). Width/clip can't use the native driver anyway,
 // and a single drag gesture with no competing animation doesn't need one.
+// Fills whatever size its parent gives it (measured via onLayout) rather than
+// a fixed height, so the same component works full-screen in a modal.
 function BeforeAfterSlider({ beforeUri, afterUri }) {
-  const [width, setWidth] = useState(0);
+  const [size, setSize] = useState({ width: 0, height: 0 });
   const [sliderPos, setSliderPos] = useState(0);
   const startPos = useRef(0);
 
@@ -505,7 +507,7 @@ function BeforeAfterSlider({ beforeUri, afterUri }) {
       onMoveShouldSetPanResponder: () => true,
       onPanResponderGrant: () => { startPos.current = sliderPos; },
       onPanResponderMove: (evt, gestureState) => {
-        setSliderPos(Math.max(0, Math.min(width, startPos.current + gestureState.dx)));
+        setSliderPos(Math.max(0, Math.min(size.width, startPos.current + gestureState.dx)));
       },
     })
   ).current;
@@ -514,16 +516,16 @@ function BeforeAfterSlider({ beforeUri, afterUri }) {
 
   return (
     <View
-      style={s.beforeAfterContainer}
+      style={[s.beforeAfterContainer, { width: "100%", height: "100%" }]}
       onLayout={(e) => {
-        const w = e.nativeEvent.layout.width;
-        setWidth(w);
-        setSliderPos(w / 2);
+        const { width, height } = e.nativeEvent.layout;
+        setSize({ width, height });
+        setSliderPos(width / 2);
       }}
     >
-      <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width }]} resizeMode="cover" />
-      <View style={[s.beforeAfterClip, { width: sliderPos }]}>
-        <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width }]} resizeMode="cover" />
+      <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
+      <View style={[s.beforeAfterClip, { width: sliderPos, height: size.height }]}>
+        <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
       </View>
       <Text style={[s.beforeAfterLabel, { left: 10 }]}>BEFORE</Text>
       <Text style={[s.beforeAfterLabel, { right: 10 }]}>AFTER</Text>
@@ -540,10 +542,12 @@ function BeforeAfterSlider({ beforeUri, afterUri }) {
 
 function CompanionCard({
   stage, actionText, tipIndex, actionIndex,
-  revealBeforeUri, revealAfterUri, visibleChangeText, revealReady,
-  onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade, onRevealContinue,
+  onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade,
 }) {
-  if (stage === "finished") return null;
+  // "reveal" is rendered as its own full-screen CompanionRevealModal, not
+  // inline here - see the results screen render for why (not enough room in
+  // a scrolling card for a before/after slider worth dragging).
+  if (stage === "finished" || stage === "reveal") return null;
 
   const GENERATING_TIPS = [
     "Looking at what's changed...",
@@ -558,24 +562,6 @@ function CompanionCard({
           <ActivityIndicator color={BRAND.green} />
           <Text style={s.companionTipText}>{GENERATING_TIPS[tipIndex % GENERATING_TIPS.length]}</Text>
         </View>
-      </View>
-    );
-  }
-
-  if (stage === "reveal") {
-    return (
-      <View style={s.companionCard}>
-        <CompanionProgressBar actionIndex={actionIndex} />
-        <BeforeAfterSlider beforeUri={revealBeforeUri} afterUri={revealAfterUri} />
-        <Text style={{ fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 }}>Drag to compare</Text>
-        <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
-        {revealReady ? (
-          <TouchableOpacity style={s.companionBtn} onPress={onRevealContinue}>
-            <Text style={s.companionBtnText}>Ready to keep going?</Text>
-          </TouchableOpacity>
-        ) : (
-          <View style={{ height: 51 }} />
-        )}
       </View>
     );
   }
@@ -627,6 +613,44 @@ function CompanionCard({
         </TouchableOpacity>
       )}
     </View>
+  );
+}
+
+// Full-screen reveal, replacing the old inline card so the before/after
+// slider gets real screen space to drag across instead of a cramped 260px
+// strip inside a scrolling card. Same drag-to-compare interaction and
+// BEFORE/AFTER labels as before - this only changes where it's presented and
+// how much room it gets. onDismiss is used by both the close affordance and
+// the continue button - closing and continuing are the same transition here,
+// there's nothing to "cancel back" to once the progress photo is already in.
+function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visibleChangeText, revealReady, onDismiss }) {
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onDismiss}>
+      <SafeAreaView style={s.revealModalSafe}>
+        <View style={s.revealModalHeader}>
+          <TouchableOpacity style={s.revealModalClose} onPress={onDismiss} accessibilityLabel="Close" accessibilityRole="button">
+            <X size={18} color={BRAND.ink} strokeWidth={2.25} />
+          </TouchableOpacity>
+        </View>
+        <View style={s.revealModalProgressWrap}>
+          <CompanionProgressBar actionIndex={actionIndex} />
+        </View>
+        <View style={s.revealModalImageArea}>
+          <BeforeAfterSlider beforeUri={beforeUri} afterUri={afterUri} />
+        </View>
+        <View style={s.revealModalFooter}>
+          <Text style={s.revealModalDragHint}>Drag to compare</Text>
+          <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
+          {revealReady ? (
+            <TouchableOpacity style={s.companionBtn} onPress={onDismiss}>
+              <Text style={s.companionBtnText}>Ready to keep going?</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={{ height: 51 }} />
+          )}
+        </View>
+      </SafeAreaView>
+    </Modal>
   );
 }
 
@@ -2265,18 +2289,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               actionText={companionActionText}
               tipIndex={companionTipIndex}
               actionIndex={companionActionIndex}
-              revealBeforeUri={companionRevealBefore}
-              revealAfterUri={companionRevealAfter}
-              visibleChangeText={companionVisibleChange}
-              revealReady={companionRevealReady}
               onStart={handleCompanionStart}
               onComplete={handleCompanionComplete}
               onSharePhoto={handleCompanionSharePhoto}
               onFinishedForToday={handleCompanionFinishedForToday}
               onUpgrade={handleCompanionUpgradeRequest}
-              onRevealContinue={handleCompanionRevealContinue}
             />
           )}
+          <CompanionRevealModal
+            visible={companionStage === "reveal"}
+            actionIndex={companionActionIndex}
+            beforeUri={companionRevealBefore}
+            afterUri={companionRevealAfter}
+            visibleChangeText={companionVisibleChange}
+            revealReady={companionRevealReady}
+            onDismiss={handleCompanionRevealContinue}
+          />
           {results.tiers?.map(t => {
             const m = meta(t.id);
             const isSelectedTier = t.id === tier;
@@ -2822,13 +2850,20 @@ const s = StyleSheet.create({
   companionProgressTrack: { height: 4, backgroundColor: BRAND.offWhite, borderRadius: 2, overflow: "hidden" },
   companionProgressFill: { height: 4, backgroundColor: BRAND.green, borderRadius: 2 },
   companionVisibleChangeText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, lineHeight: 20, marginBottom: 16, textAlign: "center" },
-  beforeAfterContainer: { height: 260, borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
-  beforeAfterImage: { height: 260, position: "absolute", top: 0, left: 0 },
-  beforeAfterClip: { position: "absolute", top: 0, left: 0, height: 260, overflow: "hidden" },
+  beforeAfterContainer: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
+  beforeAfterImage: { position: "absolute", top: 0, left: 0 },
+  beforeAfterClip: { position: "absolute", top: 0, left: 0, overflow: "hidden" },
   beforeAfterLabel: { position: "absolute", top: 10, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
   beforeAfterHandle: { position: "absolute", top: 0, bottom: 0, width: 40, alignItems: "center", justifyContent: "center" },
   beforeAfterHandleLine: { position: "absolute", width: 2, top: 0, bottom: 0, backgroundColor: "white" },
   beforeAfterHandleKnob: { width: 32, height: 32, borderRadius: 16, backgroundColor: "white", flexDirection: "row", alignItems: "center", justifyContent: "center", shadowColor: "#000", shadowOpacity: 0.3, shadowRadius: 4, shadowOffset: { width: 0, height: 1 }, elevation: 4 },
+  revealModalSafe: { flex: 1, backgroundColor: BRAND.white },
+  revealModalHeader: { flexDirection: "row", justifyContent: "flex-end", paddingHorizontal: 16, paddingTop: 8 },
+  revealModalClose: { width: 36, height: 36, borderRadius: 18, backgroundColor: BRAND.offWhite, alignItems: "center", justifyContent: "center" },
+  revealModalProgressWrap: { paddingHorizontal: 18, paddingTop: 4 },
+  revealModalImageArea: { flex: 1, paddingHorizontal: 12, paddingTop: 8 },
+  revealModalFooter: { paddingHorizontal: 18, paddingTop: 10, paddingBottom: 18 },
+  revealModalDragHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 },
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
