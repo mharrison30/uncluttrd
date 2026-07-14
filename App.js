@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler
+  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, PanResponder
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -476,7 +476,73 @@ function AuthScreen() {
 // Renders the single-action Companion loop, one decision at a time,
 // per CompanionDesignPrinciples.md. Purely prop-driven — placement on
 // the results screen is a separate change (Milestone 4).
-function CompanionCard({ stage, actionText, tipIndex, onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade }) {
+// Simple visual progress indicator — grows with actionIndex, never reaches
+// 100% (the loop is open-ended, there is no fixed "done"). Exists purely to
+// reinforce "visibly closer to the room you wanted," not to track a total.
+function CompanionProgressBar({ actionIndex }) {
+  const pct = Math.min(90, 15 + (actionIndex - 1) * 20);
+  return (
+    <View style={{ marginBottom: 14 }}>
+      <Text style={s.companionProgressCaption}>Getting closer</Text>
+      <View style={s.companionProgressTrack}>
+        <View style={[s.companionProgressFill, { width: `${pct}%` }]} />
+      </View>
+    </View>
+  );
+}
+
+// Drag-to-compare before/after slider. Plain PanResponder + useState (no new
+// dependency, no Animated) — width/clip can't use the native driver anyway,
+// and a single drag gesture with no competing animation doesn't need one.
+function BeforeAfterSlider({ beforeUri, afterUri }) {
+  const [width, setWidth] = useState(0);
+  const [sliderPos, setSliderPos] = useState(0);
+  const startPos = useRef(0);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => { startPos.current = sliderPos; },
+      onPanResponderMove: (evt, gestureState) => {
+        setSliderPos(Math.max(0, Math.min(width, startPos.current + gestureState.dx)));
+      },
+    })
+  ).current;
+
+  if (!beforeUri || !afterUri) return null;
+
+  return (
+    <View
+      style={s.beforeAfterContainer}
+      onLayout={(e) => {
+        const w = e.nativeEvent.layout.width;
+        setWidth(w);
+        setSliderPos(w / 2);
+      }}
+    >
+      <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width }]} resizeMode="cover" />
+      <View style={[s.beforeAfterClip, { width: sliderPos }]}>
+        <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width }]} resizeMode="cover" />
+      </View>
+      <Text style={[s.beforeAfterLabel, { left: 10 }]}>BEFORE</Text>
+      <Text style={[s.beforeAfterLabel, { right: 10 }]}>AFTER</Text>
+      <View style={[s.beforeAfterHandle, { left: sliderPos - 20 }]} {...panResponder.panHandlers}>
+        <View style={s.beforeAfterHandleLine} />
+        <View style={s.beforeAfterHandleKnob}>
+          <ChevronRight size={12} color={BRAND.ink} strokeWidth={2.5} style={{ marginRight: 2 }} />
+          <ChevronRight size={12} color={BRAND.ink} strokeWidth={2.5} style={{ marginLeft: -8, transform: [{ rotate: "180deg" }] }} />
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function CompanionCard({
+  stage, actionText, tipIndex, actionIndex,
+  revealBeforeUri, revealAfterUri, visibleChangeText, revealReady,
+  onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade, onRevealContinue,
+}) {
   if (stage === "finished") return null;
 
   const GENERATING_TIPS = [
@@ -496,6 +562,24 @@ function CompanionCard({ stage, actionText, tipIndex, onStart, onComplete, onSha
     );
   }
 
+  if (stage === "reveal") {
+    return (
+      <View style={s.companionCard}>
+        <CompanionProgressBar actionIndex={actionIndex} />
+        <BeforeAfterSlider beforeUri={revealBeforeUri} afterUri={revealAfterUri} />
+        <Text style={{ fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 }}>Drag to compare</Text>
+        <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
+        {revealReady ? (
+          <TouchableOpacity style={s.companionBtn} onPress={onRevealContinue}>
+            <Text style={s.companionBtnText}>Ready to keep going?</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={{ height: 51 }} />
+        )}
+      </View>
+    );
+  }
+
   if (stage === "paywall-prompt") {
     return (
       <View style={s.companionCard}>
@@ -511,6 +595,7 @@ function CompanionCard({ stage, actionText, tipIndex, onStart, onComplete, onSha
   if (stage === "celebrating") {
     return (
       <View style={s.companionCard}>
+        <CompanionProgressBar actionIndex={actionIndex} />
         <Text style={s.companionTitle}>Nice work</Text>
         <Text style={s.companionBody}>Great progress.</Text>
         <TouchableOpacity style={s.companionBtn} onPress={onSharePhoto}>
@@ -524,6 +609,7 @@ function CompanionCard({ stage, actionText, tipIndex, onStart, onComplete, onSha
   const title = stage === "companion-active" ? "Ready to keep going?" : "Let's Start Here";
   return (
     <View style={s.companionCard}>
+      <CompanionProgressBar actionIndex={actionIndex} />
       <Text style={s.companionTitle}>{title}</Text>
       <Text style={s.companionBody}>{actionText}</Text>
       {stage === "started" ? (
@@ -665,6 +751,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
   const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
+  // Before/after reveal (Milestone 8) — populated right before entering the
+  // "reveal" stage, cleared on reset/goHome like everything else here.
+  const [companionRevealBefore, setCompanionRevealBefore] = useState(null);
+  const [companionRevealAfter, setCompanionRevealAfter] = useState(null);
+  const [companionVisibleChange, setCompanionVisibleChange] = useState(null);
+  const [companionRevealReady, setCompanionRevealReady] = useState(false); // gates the continue button so the user has a beat to register the change first
+  const companionRevealTimer = useRef(null);
 
   const startCompanionTips = () => {
     setCompanionTipIndex(0);
@@ -703,6 +796,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionCompletedAt(null);
     setProgressPhoto(null);
     companionBasePhotoRef.current = photo?.uri || null;
+    // Inlined rather than calling a shared helper — that helper is declared
+    // later in this function (near reset/goHome), and referencing it from an
+    // effect this early would reintroduce the exact TDZ bug already fixed once.
+    if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
+    setCompanionRevealBefore(null);
+    setCompanionRevealAfter(null);
+    setCompanionVisibleChange(null);
+    setCompanionRevealReady(false);
   }, [results]);
 
   const handleCompanionStart = () => {
@@ -747,6 +848,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     logEvent(getAnalytics(), "companion_session_completed", { planId: currentPlanId });
   };
 
+  const handleCompanionRevealContinue = () => {
+    if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
+    setCompanionStage("companion-active");
+  };
+
   const handleCompanionUpgradeRequest = () => {
     logEvent(getAnalytics(), "companion_upgrade_clicked", { analysisId: analysisIdRef.current });
     // Reuses the existing paywall screen entirely unchanged — same screen every
@@ -769,7 +875,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (!beforeSource) throw new Error("Missing before photo for comparison");
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
-      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}". In one warm sentence, acknowledge what's improved. Then suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way — one or two warm sentences, no time estimate stated, no list-like phrasing.\n\nReturn ONLY valid JSON, nothing else — no markdown, no backticks.\n\n{"progressNote":"one warm sentence acknowledging the improvement","companionAction":"one or two warm sentences describing the next step"}`;
+      const nextPrompt = `You are a warm, encouraging professional organizer. Compare these two photos of the same space: the first is before, the second is after the user completed this step: "${companionActionText}".\n\nName the single clearest, most specific visible change between the two photos, in one short sentence. Only describe what you can confidently see — no percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way — one or two warm sentences, no time estimate stated, no list-like phrasing.\n\nReturn ONLY valid JSON, nothing else — no markdown, no backticks.\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step"}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({ beforeImageBase64: compressedBefore.base64, afterImageBase64: compressedAfter.base64, prompt: nextPrompt });
       const raw = result.data?.text || "";
@@ -831,7 +937,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       companionBasePhotoRef.current = progressUri;
       setCompanionActionText(parsed.companionAction || "");
       setCompanionActionIndex(newActionIndex);
-      setCompanionStage("companion-active");
+
+      // Before/after reveal (Milestone 8): show the comparison and the visible-
+      // change reaction before the next action appears, not instead of it.
+      const visibleChangeText = (parsed.visibleChange && parsed.visibleChange.trim())
+        || "You completed this step and moved the space forward.";
+      setCompanionRevealBefore(beforeSource);
+      setCompanionRevealAfter(progressUri);
+      setCompanionVisibleChange(visibleChangeText);
+      setCompanionRevealReady(false);
+      setCompanionStage("reveal");
+      if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
+      companionRevealTimer.current = setTimeout(() => setCompanionRevealReady(true), 1200);
     } catch (e) {
       console.log("Companion next-action error:", e.message);
       logEvent(getAnalytics(), "companion_action_failed", { planId: currentPlanId, actionIndex: companionActionIndex, reason: e.message });
@@ -1430,8 +1547,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCurrentPlanId(item.id);
     restorePhotoFromPlan(item);
   };
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; };
+  const clearCompanionRevealState = () => {
+    if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
+    setCompanionRevealBefore(null);
+    setCompanionRevealAfter(null);
+    setCompanionVisibleChange(null);
+    setCompanionRevealReady(false);
+  };
+  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; analysisIdRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2045,11 +2169,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               stage={companionStage}
               actionText={companionActionText}
               tipIndex={companionTipIndex}
+              actionIndex={companionActionIndex}
+              revealBeforeUri={companionRevealBefore}
+              revealAfterUri={companionRevealAfter}
+              visibleChangeText={companionVisibleChange}
+              revealReady={companionRevealReady}
               onStart={handleCompanionStart}
               onComplete={handleCompanionComplete}
               onSharePhoto={handleCompanionSharePhoto}
               onFinishedForToday={handleCompanionFinishedForToday}
               onUpgrade={handleCompanionUpgradeRequest}
+              onRevealContinue={handleCompanionRevealContinue}
             />
           )}
           {results.tiers?.map(t => {
@@ -2549,6 +2679,17 @@ const s = StyleSheet.create({
   companionSecondaryBtn: { marginTop: 12, padding: 8, alignItems: "center" },
   companionSecondaryBtnText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textDecorationLine: "underline" },
   companionTipText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginTop: 10 },
+  companionProgressCaption: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginBottom: 6, letterSpacing: 0.3 },
+  companionProgressTrack: { height: 4, backgroundColor: BRAND.offWhite, borderRadius: 2, overflow: "hidden" },
+  companionProgressFill: { height: 4, backgroundColor: BRAND.green, borderRadius: 2 },
+  companionVisibleChangeText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, lineHeight: 20, marginBottom: 16, textAlign: "center" },
+  beforeAfterContainer: { height: 260, borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
+  beforeAfterImage: { height: 260, position: "absolute", top: 0, left: 0 },
+  beforeAfterClip: { position: "absolute", top: 0, left: 0, height: 260, overflow: "hidden" },
+  beforeAfterLabel: { position: "absolute", top: 10, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
+  beforeAfterHandle: { position: "absolute", top: 0, bottom: 0, width: 40, alignItems: "center", justifyContent: "center" },
+  beforeAfterHandleLine: { position: "absolute", width: 2, top: 0, bottom: 0, backgroundColor: "white" },
+  beforeAfterHandleKnob: { width: 32, height: 32, borderRadius: 16, backgroundColor: "white", flexDirection: "row", alignItems: "center", justifyContent: "center", shadowColor: "#000", shadowOpacity: 0.3, shadowRadius: 4, shadowOffset: { width: 0, height: 1 }, elevation: 4 },
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
