@@ -268,22 +268,30 @@ function AuthScreen() {
   const [err, setErr] = useState(null);
 
   const handleAuth = async () => {
-    if (!email || !password) { setErr("Please enter your email and password."); return; }
+    // Trimmed locally rather than mutating email/password state directly, so
+    // the visible TextInput isn't silently altered while the user is still
+    // looking at it. A pasted trailing space (common from copy-paste) would
+    // otherwise reach Firebase untouched - on the email side that produces
+    // "auth/invalid-email", which reads as a wrong/unrelated error since the
+    // whitespace itself is invisible in the field.
+    const trimmedEmail = email.trim();
+    const trimmedPassword = password.trim();
+    if (!trimmedEmail || !trimmedPassword) { setErr("Please enter your email and password."); return; }
     if (mode === "signup" && !firstName) { setErr("Please enter your first name."); return; }
     if (mode === "signup" && !lastName) { setErr("Please enter your last name."); return; }
-    if (password.length < 6) { setErr("Password must be at least 6 characters."); return; }
+    if (trimmedPassword.length < 6) { setErr("Password must be at least 6 characters."); return; }
     setLoading(true); setErr(null);
     try {
       if (mode === "signup") {
         const fullName = [firstName, lastName, suffix].filter(Boolean).join(" ");
-        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        const cred = await createUserWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
         await updateProfile(cred.user, { displayName: fullName });
         await ensureUserDocument(cred.user, { referralSource: referralSource || null });
         // Sign out and back in to force auth state to refresh with new displayName
         await signOut(auth);
-        await signInWithEmailAndPassword(auth, email, password);
+        await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
       } else {
-        await signInWithEmailAndPassword(auth, email, password);
+        await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
       }
     } catch (e) {
       if (e.code === "auth/email-already-in-use") setErr("An account with this email already exists.");
@@ -297,10 +305,11 @@ function AuthScreen() {
   };
 
   const handleForgotPassword = async () => {
-    if (!email) { setErr("Enter your email above, then tap Forgot Password."); return; }
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) { setErr("Enter your email above, then tap Forgot Password."); return; }
     setLoading(true); setErr(null);
     try {
-      await sendPasswordResetEmail(auth, email);
+      await sendPasswordResetEmail(auth, trimmedEmail);
       Alert.alert("Check your email", "If an account exists for that email, we've sent a link to reset your password.");
     } catch (e) {
       if (e.code === "auth/user-not-found") {
@@ -705,6 +714,29 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
   );
 }
 
+// Backstop for the AI's own free-form output - the analyzePhoto and
+// generateNextAction prompts both explicitly forbid em dashes, but this
+// catches any that slip through anyway. A comma reads naturally in the
+// large majority of sentences an em dash actually appears in.
+function stripEmDashes(text) {
+  if (typeof text !== "string") return text;
+  return text.replace(/\s*—\s*/g, ", ").replace(/,(\s*,)+/g, ",").trim();
+}
+
+// Recursively applies stripEmDashes to every string in a parsed AI JSON
+// response (nested arrays/objects included, e.g. tiers[].suggestions[]),
+// since any free-form field the model wrote is equally exposed.
+function sanitizeAiText(value) {
+  if (typeof value === "string") return stripEmDashes(value);
+  if (Array.isArray(value)) return value.map(sanitizeAiText);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key in value) out[key] = sanitizeAiText(value[key]);
+    return out;
+  }
+  return value;
+}
+
 // Handles both a Firestore Timestamp (has .toDate()) and a plain Date/ISO
 // string - the latter is what's used for the instant right after the user
 // finishes, before the serverTimestamp() write round-trips back into results.
@@ -1100,7 +1132,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
 
-      const nextPrompt = `You are a warm, encouraging professional organizer. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state right before this specific step, (3) the state right after the user just completed this step: "${companionActionText}".\n\nFirst, compare photo 2 and photo 3 only. Name the single clearest, most specific visible change between them, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall progress on this space. Using only what you can actually see: has clutter decreased, are related items now grouped, is the intended surface or area now usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Never set this true merely because the step the user just finished succeeded; judge only the overall original-vs-now comparison.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step","completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos - for example: 'Your bookshelf now has a clear surface and grouped items' or 'There's still a stack of books that could find a home.'"}`;
+      const nextPrompt = `You are a warm, encouraging professional organizer. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state right before this specific step, (3) the state right after the user just completed this step: "${companionActionText}".\n\nFirst, compare photo 2 and photo 3 only. Name the single clearest, most specific visible change between them, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall progress on this space. Using only what you can actually see: has clutter decreased, are related items now grouped, is the intended surface or area now usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Never set this true merely because the step the user just finished succeeded; judge only the overall original-vs-now comparison.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step","completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos - for example: 'Your bookshelf now has a clear surface and grouped items' or 'There's still a stack of books that could find a home.'"}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({
         originalImageBase64: compressedOriginal.base64,
@@ -1110,7 +1142,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       });
       const raw = result.data?.text || "";
       const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
-      const parsed = JSON.parse(cleaned);
+      // Backstop for the prompt's own "never use em dashes" instruction.
+      const parsed = sanitizeAiText(JSON.parse(cleaned));
 
       const visibleChangeText = typeof parsed.visibleChange === "string" && parsed.visibleChange.trim() ? parsed.visibleChange.trim() : null;
       const nextActionText = typeof parsed.companionAction === "string" && parsed.companionAction.trim() ? parsed.companionAction.trim() : null;
@@ -1541,7 +1574,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const budgetNote = budget
         ? `The user has a specific budget of $${budget}. Highlight which tier best fits their budget, but still show all three.`
         : `Show all three tiers: Budget (under $50), Mid-Range ($50-$200), and Premium ($200+).`;
-      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify one single "first action": the single most obvious, encouraging, doable-right-now step for this space, independent of budget tier. It should be scoped to roughly 15-20 minutes of real work, small enough to start immediately, substantial enough to feel like real progress. Describe what to do, in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label, not an estimate of how long it will take.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstAction":"one or two warm sentences describing the single best doable-right-now step","tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify one single "first action": the single most obvious, encouraging, doable-right-now step for this space, independent of budget tier. It should be scoped to roughly 15-20 minutes of real work, small enough to start immediately, substantial enough to feel like real progress. Describe what to do, in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label, not an estimate of how long it will take.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstAction":"one or two warm sentences describing the single best doable-right-now step","tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -1604,7 +1637,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         setErr("We had trouble reading your space. Try a clearer, well-lit photo.");
         return;
       }
-      const parsed = JSON.parse(match[0]);
+      // Backstop for the prompt's own "never use em dashes" instruction -
+      // covers every free-form field the model wrote (overview, proTip,
+      // suggestions, firstAction, etc.), not just Companion text.
+      const parsed = sanitizeAiText(JSON.parse(match[0]));
       dlog(`[COMPANION DEBUG 3] parsed.firstAction: ${JSON.stringify(parsed.firstAction)} | typeof: ${typeof parsed.firstAction}`);
       lastFailedAnalysisRef.current = null; // this analysisId succeeded - never reuse it, a later reuse would just replay this cached result
       setResults(parsed);
@@ -2913,6 +2949,21 @@ function AppRoot() {
       setAnalyses(0);
       setIsPro(false);
       currentUidRef.current = u ? u.uid : null;
+      if (u) {
+        // Right after sign-in (especially the forced signOut/signIn re-auth
+        // in handleAuth's signup flow), auth.currentUser can still be a
+        // partially-hydrated object - profile fields like displayName can
+        // fill in a beat later via the SDK's own background refresh, which
+        // mutates this same object in place without firing onAuthStateChanged
+        // again. Reloading before setUser() ensures the first render already
+        // has the real value, instead of it only self-correcting whenever
+        // some unrelated re-render happens to occur later.
+        try {
+          await u.reload();
+        } catch (e) {
+          console.log("User reload error:", e.message);
+        }
+      }
       setUser(u);
       setLoading(false);
 
