@@ -2303,7 +2303,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="dark-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
@@ -2354,7 +2354,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="dark-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
@@ -2420,7 +2420,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
@@ -2461,7 +2461,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
@@ -2811,7 +2811,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     <SafeAreaView style={s.safe}>
       <StatusBar barStyle="dark-content" />
       <View style={[s.hdr, { alignItems: "flex-start" }]}>
-        <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+        <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
           <DrawerIcon size={54} dark={true} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
