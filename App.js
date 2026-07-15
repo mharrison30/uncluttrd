@@ -2008,7 +2008,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // action. Plans where firstAction was never even started don't count; there's
   // nothing to "continue" yet. Free-tier sessions are never persisted, so this
   // only ever applies to Pro plans (history is already Pro-only, see loadHistory).
+  // A plan the user already finished is never resumable, regardless of what
+  // companionAction/firstAction still say - companionComplete is never cleared
+  // once set, so without this check a finished project would keep showing the
+  // Home "continue where you left off" banner forever.
   const isCompanionResumable = (plan) => {
+    if (plan?.companionComplete) return false;
     if (plan?.companionAction) return true;
     if (plan?.firstAction && typeof plan.firstAction === "object" && plan.firstAction.status && plan.firstAction.status !== "suggested") return true;
     return false;
