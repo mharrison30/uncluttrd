@@ -1399,7 +1399,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }
   };
 
-  // Load history from AsyncStorage
+  // Loads History from Firestore. isPro is in the dependency array on
+  // purpose - MainApp mounts as soon as `user` is set, which happens before
+  // the RevenueCat entitlement round trip in onAuthStateChanged resolves.
+  // With an empty deps array this effect used to fire once on mount, see
+  // isPro still false at that instant, and never run again even after isPro
+  // correctly flipped true moments later - a real Pro user could get a
+  // permanently empty History for the whole session depending on how fast
+  // that round trip happened to resolve. Re-running on the isPro transition
+  // fixes it at the source instead of guessing at retry/timing workarounds.
   useEffect(() => {
     const loadHistory = async () => {
       if (!isPro) return;
@@ -1415,7 +1423,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
     };
     loadHistory();
-  }, []);
+  }, [isPro]);
 
   useEffect(() => {
     if (showPaywall) {
