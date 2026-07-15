@@ -563,8 +563,17 @@ function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
         moveLogCounter.current = 0;
       },
       onPanResponderTerminationRequest: () => {
-        dlog(`[SLIDER DEBUG] onPanResponderTerminationRequest received | label=${debugLabel}`);
-        return true; // unchanged from the implicit default - logging only, not a behavior change
+        // Confirmed root cause (not a hypothesis): the completedSummary
+        // usage lives inside the results ScrollView, which was requesting
+        // (and, with the old implicit-true default, winning) the gesture
+        // mid-drag - onPanResponderGrant had already fired, the drag was
+        // already underway, and the ScrollView tore it away anyway. Once
+        // this handle owns the gesture, it now refuses to give it back, so
+        // a drag that's already started can't be stolen. The reveal-modal
+        // usage isn't inside any ScrollView, so this never even gets called
+        // there - same fix, harmless where it isn't needed.
+        dlog(`[SLIDER DEBUG] onPanResponderTerminationRequest received | label=${debugLabel} | refusing`);
+        return false;
       },
     })
   ).current;
