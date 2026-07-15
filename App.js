@@ -520,18 +520,51 @@ function CompanionProgressBar({ actionIndex, complete }) {
 // and a single drag gesture with no competing animation doesn't need one.
 // Fills whatever size its parent gives it (measured via onLayout) rather than
 // a fixed height, so the same component works full-screen in a modal.
-function BeforeAfterSlider({ beforeUri, afterUri }) {
+function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [sliderPos, setSliderPos] = useState(0);
   const startPos = useRef(0);
+  // TEMP DEBUG. Throttles onPanResponderMove logging (which fires many times
+  // per drag) to every Nth event, so a single drag doesn't flood the shared
+  // log buffer while still showing the gesture is continuing to fire.
+  const moveLogCounter = useRef(0);
 
   const panResponder = useRef(
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => { startPos.current = sliderPos; },
+      onStartShouldSetPanResponder: () => {
+        dlog(`[SLIDER DEBUG] onStartShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPos}`);
+        return true;
+      },
+      onMoveShouldSetPanResponder: () => {
+        dlog(`[SLIDER DEBUG] onMoveShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPos}`);
+        return true;
+      },
+      onPanResponderGrant: () => {
+        dlog(`[SLIDER DEBUG] onPanResponderGrant fired | label=${debugLabel} | sliderPos=${sliderPos} | size=${JSON.stringify(size)}`);
+        startPos.current = sliderPos;
+      },
       onPanResponderMove: (evt, gestureState) => {
+        moveLogCounter.current += 1;
+        if (moveLogCounter.current % 10 === 1) {
+          dlog(`[SLIDER DEBUG] onPanResponderMove #${moveLogCounter.current} | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | startPos=${startPos.current}`);
+        }
         setSliderPos(Math.max(0, Math.min(size.width, startPos.current + gestureState.dx)));
+      },
+      onPanResponderRelease: (evt, gestureState) => {
+        dlog(`[SLIDER DEBUG] onPanResponderRelease | label=${debugLabel} | finalDx=${gestureState.dx.toFixed(1)} | moveEvents=${moveLogCounter.current}`);
+        moveLogCounter.current = 0;
+      },
+      onPanResponderTerminate: (evt, gestureState) => {
+        // Not previously handled at all - if this fires, something else in
+        // the view tree (e.g. a ScrollView) is claiming the gesture away
+        // mid-drag, a different failure mode than the edge-clipping bug
+        // fixed in 81ef78b.
+        dlog(`[SLIDER DEBUG] onPanResponderTerminate (gesture stolen) | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | moveEvents=${moveLogCounter.current}`);
+        moveLogCounter.current = 0;
+      },
+      onPanResponderTerminationRequest: () => {
+        dlog(`[SLIDER DEBUG] onPanResponderTerminationRequest received | label=${debugLabel}`);
+        return true; // unchanged from the implicit default - logging only, not a behavior change
       },
     })
   ).current;
@@ -708,7 +741,7 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
           <CompanionProgressBar actionIndex={actionIndex} />
         </View>
         <View style={s.revealModalImageArea}>
-          <BeforeAfterSlider beforeUri={beforeUri} afterUri={afterUri} />
+          <BeforeAfterSlider beforeUri={beforeUri} afterUri={afterUri} debugLabel="revealModal" />
         </View>
         <View style={s.revealModalFooter}>
           <Text style={s.revealModalDragHint}>Drag to compare</Text>
@@ -784,11 +817,36 @@ function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri 
       {reason ? <Text style={s.companionBody}>{reason}</Text> : null}
       {beforeUri && currentUri && (
         <View style={s.completedSliderArea}>
-          <BeforeAfterSlider beforeUri={beforeUri} afterUri={currentUri} />
+          <BeforeAfterSlider beforeUri={beforeUri} afterUri={currentUri} debugLabel="completedSummary" />
         </View>
       )}
     </View>
   );
+}
+
+// TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
+// outside MainApp's closure - BeforeAfterSlider in particular, for the
+// touch-event instrumentation below - can log into the same buffer without
+// prop-drilling a logger through CompanionRevealModal/CompanionCompletedSummary.
+// Retrieved via the existing long-press-to-share mechanism on the header logo
+// (see debugShareLog in MainApp). Remove once the photo-pipeline and slider
+// investigations are closed.
+const debugLogBuffer = [];
+function dlog(line) {
+  console.log(line);
+  debugLogBuffer.push(`${new Date().toISOString()} ${line}`);
+}
+// Lightweight, non-cryptographic fingerprint for a base64 image payload -
+// cheap enough to run on a ~150-400KB string without hashing every byte.
+// Purpose is purely to confirm two payloads are the same or different
+// content, not to be collision-proof.
+function debugHashBase64(b64) {
+  if (!b64) return "null";
+  let hash = 0;
+  for (let i = 0; i < b64.length; i += 37) {
+    hash = (hash * 31 + b64.charCodeAt(i)) | 0;
+  }
+  return `len${b64.length}:h${hash}`;
 }
 
 function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) {
@@ -892,22 +950,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | reveal | companion-active | paywall-prompt | completion-choice | project-complete | finished
   const [companionActionText, setCompanionActionText] = useState(null);
-  // TEMP DEBUG. Remove once the "Let's Start Here" no-show bug is found.
-  // In-memory buffer so these logs can be exported via the OS share sheet on a
-  // device with no attached Xcode/Mac. See debugShareLog() and its trigger.
-  const debugLogRef = useRef([]);
-  const dlog = (line) => {
-    console.log(line);
-    debugLogRef.current.push(`${new Date().toISOString()} ${line}`);
-  };
   const debugShareLog = async () => {
-    const text = debugLogRef.current.length ? debugLogRef.current.join("\n\n") : "(no debug log entries captured yet)";
+    const text = debugLogBuffer.length ? debugLogBuffer.join("\n\n") : "(no debug log entries captured yet)";
     try {
       await Share.share({ message: text, title: "Companion Debug Log" });
     } catch (e) {
       Alert.alert("Share failed", e.message);
     }
   };
+  // Fires once per mount so a shared log can be matched to the exact build
+  // that produced it - confirms whether a given device is actually running
+  // the code containing a given fix, not a stale/cached build.
+  useEffect(() => {
+    dlog("[BUILD DEBUG] MainApp mounted | marker: photo-pipeline-and-slider-instrumentation-v1");
+  }, []);
   // Fires whenever this state actually settles (not when the setter is called),
   // since setState is async. This is the true post-update value.
   useEffect(() => {
@@ -993,10 +1049,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionCompletionReason(null);
     setCompanionCompletedProject(null);
     setProgressPhoto(null);
+    dlog(`[PHOTO DEBUG] [results] effect: companionBasePhotoRef ${companionBasePhotoRef.current} -> ${photo?.uri || null}`);
     companionBasePhotoRef.current = photo?.uri || null;
     // See restorePhotoFromPlan for why this is also (re)set there - this line
     // alone is correct for a fresh analysis, where `photo` is already loaded
     // synchronously by the time results arrives.
+    dlog(`[PHOTO DEBUG] [results] effect: companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> ${photo?.uri || null}`);
     companionOriginalPhotoRef.current = photo?.uri || null;
     companionOriginalCompressedRef.current = null;
     // Inlined rather than calling a shared helper. That helper is declared
@@ -1108,6 +1166,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // function once a plan has just been retroactively saved, before
     // currentPlanId state has actually re-rendered with the new value.
     const effectivePlanId = planIdOverride || currentPlanId;
+    dlog(`[PHOTO DEBUG] submitCompanionProgressPhoto called | actionIndex=${companionActionIndex} | progressUri=${progressUri} | progressBase64Len=${progressBase64?.length ?? "null"} | companionBasePhotoRef.current=${companionBasePhotoRef.current} | t=${Date.now()}`);
     // Restored on any failure below - the stage is only ever allowed to move
     // forward (into "generating" and then "reveal") after a valid server
     // response. Never a hardcoded fallback destination.
@@ -1148,6 +1207,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
+
+      dlog(`[PHOTO DEBUG] about to call generateNextAction | actionIndex=${companionActionIndex} | beforeSource=${beforeSource} | progressUri(after)=${progressUri} | originalHash=${debugHashBase64(compressedOriginal.base64)} | beforeHash=${debugHashBase64(compressedBefore.base64)} | afterHash=${debugHashBase64(compressedAfter.base64)} | t=${Date.now()}`);
 
       const nextPrompt = `You are a warm, encouraging professional organizer. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state right before this specific step, (3) the state right after the user just completed this step: "${companionActionText}".\n\nFirst, compare photo 2 and photo 3 only. Name the single clearest, most specific visible change between them, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, based only on what is visible in photo 3 (the current state) right now. Never suggest moving, removing, or addressing anything that isn't visible in photo 3, even if it was visible in photo 1 or photo 2 - if something was already handled in an earlier step, treat it as already done and do not mention it again. Before suggesting it, verify the specific problem you're describing is genuinely visible and unaddressed in photo 3 right now, not a common decluttering trope you're defaulting to (like tidying cables, sorting an organizer, or grouping similar items) - if that exact area is already organized in photo 3, it does not need this suggestion, even if it's a typical thing to suggest in a space like this. If you cannot find any genuine unaddressed problem anywhere in photo 3, that itself is a meaningful signal this space may be substantially complete - let it inform completionRecommended below rather than inventing a task; in that case, write companionAction as a brief, honest, low-key note (such as a small finishing touch or simply enjoying the results) instead of fabricating a problem that isn't there. Doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall progress on this space. Using only what you can actually see: has clutter decreased, are related items now grouped, is the intended surface or area now usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Never set this true merely because the step the user just finished succeeded; judge only the overall original-vs-now comparison.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step","completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos - for example: 'Your bookshelf now has a clear surface and grouped items' or 'There's still a stack of books that could find a home.'"}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
@@ -1226,6 +1287,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
       logEvent(getAnalytics(), "companion_action_viewed", { planId: effectivePlanId, actionIndex: newActionIndex });
 
+      dlog(`[PHOTO DEBUG] generateNextAction response received | actionIndex ${companionActionIndex} -> ${newActionIndex} | companionAction="${nextActionText}" | completionRecommended=${completionRecommended} | t=${Date.now()}`);
+      dlog(`[PHOTO DEBUG] companionBasePhotoRef updating | from=${companionBasePhotoRef.current} | to=${progressUri}`);
       companionBasePhotoRef.current = progressUri;
       setCompanionActionText(nextActionText);
       setCompanionActionIndex(newActionIndex);
@@ -1476,6 +1539,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // download resolves. Reset here and set it again below once the real
     // local file is ready, so a resumed plan never gets stuck with a stale or
     // missing original photo ref.
+    dlog(`[PHOTO DEBUG] restorePhotoFromPlan: companionOriginalPhotoRef reset to null | planId=${item.id}`);
     companionOriginalPhotoRef.current = null;
     companionOriginalCompressedRef.current = null;
     if (!item.photoUrl) return;
@@ -1484,6 +1548,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const { uri } = await FileSystem.downloadAsync(item.photoUrl, localUri);
       if (activePlanIdRef.current !== item.id) return; // user switched/left before this resolved
       setPhoto({ uri, base64: null, mimeType: "image/jpeg" });
+      dlog(`[PHOTO DEBUG] restorePhotoFromPlan: companionOriginalPhotoRef null -> ${uri} | planId=${item.id}`);
       companionOriginalPhotoRef.current = uri;
     } catch (e) {
       console.log("Restore plan photo error:", e.message);
@@ -1930,8 +1995,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
