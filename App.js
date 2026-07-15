@@ -524,6 +524,22 @@ function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [sliderPos, setSliderPos] = useState(0);
   const startPos = useRef(0);
+  // The PanResponder below is built once - useRef(PanResponder.create(...))
+  // only ever keeps the closures from the component's very first render, and
+  // discards every PanResponder.create(...) call on later renders. Reading
+  // `size`/`sliderPos` directly inside those callbacks meant they were
+  // permanently frozen at size={0,0} and sliderPos=0 - whatever they were
+  // before onLayout ever measured anything - so onPanResponderMove's clamp
+  // (Math.min(size.width, ...)) could never exceed 0, forcing every drag to
+  // compute exactly 0 regardless of how far the touch moved. These refs
+  // mirror the state and are updated everywhere the state is, so the frozen
+  // callbacks read the live value via .current instead of the stale closure.
+  const sizeRef = useRef(size);
+  const sliderPosRef = useRef(sliderPos);
+  const updateSliderPos = (value) => {
+    sliderPosRef.current = value;
+    setSliderPos(value);
+  };
   // TEMP DEBUG. Throttles onPanResponderMove logging (which fires many times
   // per drag) to every Nth event, so a single drag doesn't flood the shared
   // log buffer while still showing the gesture is continuing to fire.
@@ -532,23 +548,24 @@ function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => {
-        dlog(`[SLIDER DEBUG] onStartShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPos}`);
+        dlog(`[SLIDER DEBUG] onStartShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPosRef.current}`);
         return true;
       },
       onMoveShouldSetPanResponder: () => {
-        dlog(`[SLIDER DEBUG] onMoveShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPos}`);
+        dlog(`[SLIDER DEBUG] onMoveShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPosRef.current}`);
         return true;
       },
       onPanResponderGrant: () => {
-        dlog(`[SLIDER DEBUG] onPanResponderGrant fired | label=${debugLabel} | sliderPos=${sliderPos} | size=${JSON.stringify(size)}`);
-        startPos.current = sliderPos;
+        dlog(`[SLIDER DEBUG] onPanResponderGrant fired | label=${debugLabel} | sliderPos=${sliderPosRef.current} | size=${JSON.stringify(sizeRef.current)}`);
+        startPos.current = sliderPosRef.current;
       },
       onPanResponderMove: (evt, gestureState) => {
         moveLogCounter.current += 1;
+        const nextPos = Math.max(0, Math.min(sizeRef.current.width, startPos.current + gestureState.dx));
         if (moveLogCounter.current % 10 === 1) {
-          dlog(`[SLIDER DEBUG] onPanResponderMove #${moveLogCounter.current} | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | startPos=${startPos.current}`);
+          dlog(`[SLIDER DEBUG] onPanResponderMove #${moveLogCounter.current} | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | startPos=${startPos.current} | sizeWidth=${sizeRef.current.width} | nextPos=${nextPos.toFixed(1)}`);
         }
-        setSliderPos(Math.max(0, Math.min(size.width, startPos.current + gestureState.dx)));
+        updateSliderPos(nextPos);
       },
       onPanResponderRelease: (evt, gestureState) => {
         dlog(`[SLIDER DEBUG] onPanResponderRelease | label=${debugLabel} | finalDx=${gestureState.dx.toFixed(1)} | moveEvents=${moveLogCounter.current}`);
@@ -585,8 +602,9 @@ function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
       style={{ width: "100%", height: "100%", position: "relative" }}
       onLayout={(e) => {
         const { width, height } = e.nativeEvent.layout;
+        sizeRef.current = { width, height };
         setSize({ width, height });
-        setSliderPos(width / 2);
+        updateSliderPos(width / 2);
       }}
     >
       {/* Only the two image layers need overflow:hidden, for the rounded
