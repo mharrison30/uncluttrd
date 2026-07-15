@@ -540,20 +540,32 @@ function BeforeAfterSlider({ beforeUri, afterUri }) {
 
   return (
     <View
-      style={[s.beforeAfterContainer, { width: "100%", height: "100%" }]}
+      style={{ width: "100%", height: "100%", position: "relative" }}
       onLayout={(e) => {
         const { width, height } = e.nativeEvent.layout;
         setSize({ width, height });
         setSliderPos(width / 2);
       }}
     >
-      <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
-      <View style={[s.beforeAfterClip, { width: sliderPos, height: size.height }]}>
-        <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
+      {/* Only the two image layers need overflow:hidden, for the rounded
+          corners. The handle used to be a child of this same clipped view -
+          dragging it to a full edge (sliderPos near 0 or size.width) pushed
+          half its touch target outside these bounds, so the clip silently
+          ate the tap and the drag looked "stuck." It's now a sibling below,
+          in an unclipped wrapper, so its full hit area is always available. */}
+      <View style={[s.beforeAfterContainer, { width: "100%", height: "100%" }]}>
+        <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
+        <View style={[s.beforeAfterClip, { width: sliderPos, height: size.height }]}>
+          <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
+        </View>
       </View>
       <Text style={[s.beforeAfterLabel, { left: 10 }]}>BEFORE</Text>
       <Text style={[s.beforeAfterLabel, { right: 10 }]}>AFTER</Text>
-      <View style={[s.beforeAfterHandle, { left: sliderPos - 20 }]} {...panResponder.panHandlers}>
+      <View
+        style={[s.beforeAfterHandle, { left: sliderPos - 20 }]}
+        hitSlop={{ top: 20, bottom: 20, left: 20, right: 20 }}
+        {...panResponder.panHandlers}
+      >
         <View style={s.beforeAfterHandleLine} />
         <View style={s.beforeAfterHandleKnob}>
           <ChevronRight size={12} color={BRAND.ink} strokeWidth={2.5} style={{ marginRight: 2 }} />
@@ -720,7 +732,12 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
 // large majority of sentences an em dash actually appears in.
 function stripEmDashes(text) {
   if (typeof text !== "string") return text;
-  return text.replace(/\s*—\s*/g, ", ").replace(/,(\s*,)+/g, ",").trim();
+  // Covers the real em dash plus the most likely lookalikes a model can
+  // emit for the same purpose (horizontal bar, doubled hyphen used as a
+  // plain-text stand-in). Deliberately excludes the en dash (–) alone -
+  // that has legitimate uses in number ranges (e.g. "50-200") and banning
+  // it would risk mangling text the prompt never asked to avoid.
+  return text.replace(/\s*(—|―|--)\s*/g, ", ").replace(/,(\s*,)+/g, ",").trim();
 }
 
 // Recursively applies stripEmDashes to every string in a parsed AI JSON
