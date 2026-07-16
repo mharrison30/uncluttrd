@@ -14,6 +14,13 @@ const db = admin.firestore();
 
 const ANTHROPIC_KEY = defineSecret("ANTHROPIC_KEY");
 const OPENAI_KEY = defineSecret("OPENAI_KEY");
+const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
+// Resend's shared sandbox sender - works with no domain verification, but
+// can only deliver to the email address the Resend account itself signed up
+// with. Fine for a single-recipient canary alert; would need a verified
+// custom domain to send to any other address.
+const CANARY_ALERT_FROM = "Uncluttrd Canary <onboarding@resend.dev>";
+const CANARY_ALERT_TO = "michael@earthwiseenergy.net";
 
 const FREE_MONTHLY_LIMIT = 3;
 const IDEMPOTENCY_TTL_DAYS = 60; // within the requested 30-90 day range; requires a Firestore TTL policy on expiresAt (console/gcloud config, not code)
@@ -321,68 +328,100 @@ exports.checkOrphanedUserDeletions = onSchedule("every 30 minutes", async () => 
 // BACKLOG.md and DecisionLog.md). This exists specifically so that class of
 // regression is caught within one run interval (15 minutes), not hours.
 //
-// Alerting setup (one-time, console-only - no CLI path for Cloud Monitoring
-// alert policies in this environment):
-// 1. Cloud Console > Logging > Logs Explorer (project cluttrd-3e335).
-// 2. Create a log-based metric (counter) with filter:
-//      resource.type="cloud_run_revision"
-//      resource.labels.service_name="analyzephotocanary"
-//      textPayload:"[CANARY_ALERT]"
-// 3. Cloud Console > Monitoring > Alerting > Create Policy, condition:
-//    that log-based metric, count > 0 over a 15-minute window.
-// 4. Add a notification channel (email is simplest) and save.
-// Every failure below is logged with the exact "[CANARY_ALERT]" tag the
-// filter above matches - nothing else in this codebase uses that string.
-exports.analyzePhotoCanary = onSchedule("every 15 minutes", async () => {
-  const uid = CANARY_TEST_UID.value();
-  if (!uid) {
-    console.error("[CANARY_ALERT] CANARY_TEST_UID is not configured - canary cannot run.");
-    return;
-  }
+// Alerting is a direct call to Resend's transactional email API, in the same
+// execution that detects the failure - not a Cloud Monitoring log-based
+// metric + alert policy. That pipeline proved unreliable to verify across
+// multiple attempts (the metric wasn't findable in the alert policy picker,
+// the policy didn't show up when checked, then wasn't findable in Metrics
+// Explorer either) - a problem with confirming it works, not just a
+// preference. A direct API call has one failure mode to reason about: either
+// the email sends or it doesn't, both visible in this function's own logs.
+// The "[CANARY_ALERT]" log line stays as-is, additively - useful for direct
+// log inspection regardless of whether the email pipeline is healthy.
+exports.analyzePhotoCanary = onSchedule(
+  { schedule: "every 15 minutes", secrets: [RESEND_API_KEY] },
+  async () => {
+    const uid = CANARY_TEST_UID.value();
+    if (!uid) {
+      const msg = "CANARY_TEST_UID is not configured - canary cannot run.";
+      console.error(`[CANARY_ALERT] ${msg}`);
+      await sendCanaryAlertEmail(msg);
+      return;
+    }
 
-  const analysisId = `canary-${Date.now()}`;
+    const analysisId = `canary-${Date.now()}`;
+    try {
+      // Mint a real ID token for the dedicated test account, exactly like a
+      // real signed-in user's client would send - this exercises the actual
+      // authenticated path real users take, not just "is the function up."
+      const customToken = await admin.auth().createCustomToken(uid);
+      const signInResp = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${FIREBASE_WEB_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+        }
+      );
+      const signInData = await signInResp.json();
+      if (!signInResp.ok || !signInData.idToken) {
+        throw new Error(`Custom token exchange failed: ${JSON.stringify(signInData)}`);
+      }
+
+      const callResp = await fetch(
+        "https://us-central1-cluttrd-3e335.cloudfunctions.net/analyzePhoto",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${signInData.idToken}`,
+          },
+          body: JSON.stringify({
+            data: { imageBase64: CANARY_TEST_IMAGE_BASE64, prompt: "Reply with only the word: ok", analysisId },
+          }),
+        }
+      );
+      const callData = await callResp.json();
+
+      if (!callResp.ok || callData.error) {
+        throw new Error(`analyzePhoto call failed: HTTP ${callResp.status} - ${JSON.stringify(callData.error || callData)}`);
+      }
+
+      console.log(`[canary] analyzePhoto OK | analysisId=${analysisId} | responseLength=${callData.result?.text?.length ?? 0}`);
+    } catch (err) {
+      // Distinct, greppable tag - kept for direct log inspection even though
+      // alerting no longer depends on anything watching for it.
+      const msg = `analyzePhoto canary failed | analysisId=${analysisId} | error=${err.message}`;
+      console.error(`[CANARY_ALERT] ${msg}`);
+      await sendCanaryAlertEmail(msg);
+    }
+  }
+);
+
+// Sends the canary failure email directly via Resend, in the same execution
+// that detected the failure. Wrapped in its own try/catch so a Resend outage
+// or bad key can't crash the canary function itself or mask the original
+// failure - a failure to send just logs a second, distinctly-tagged line,
+// same log-inspection fallback as the primary alert.
+async function sendCanaryAlertEmail(errorMessage) {
   try {
-    // Mint a real ID token for the dedicated test account, exactly like a
-    // real signed-in user's client would send - this exercises the actual
-    // authenticated path real users take, not just "is the function up."
-    const customToken = await admin.auth().createCustomToken(uid);
-    const signInResp = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${FIREBASE_WEB_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: customToken, returnSecureToken: true }),
-      }
-    );
-    const signInData = await signInResp.json();
-    if (!signInResp.ok || !signInData.idToken) {
-      throw new Error(`Custom token exchange failed: ${JSON.stringify(signInData)}`);
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${RESEND_API_KEY.value()}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: CANARY_ALERT_FROM,
+        to: [CANARY_ALERT_TO],
+        subject: "analyzePhoto canary failed",
+        text: `analyzePhoto canary failed at ${new Date().toISOString()}\n\n${errorMessage}`,
+      }),
+    });
+    if (!resp.ok) {
+      console.error(`[CANARY_ALERT] Resend email send failed: HTTP ${resp.status} - ${await resp.text()}`);
     }
-
-    const callResp = await fetch(
-      "https://us-central1-cluttrd-3e335.cloudfunctions.net/analyzePhoto",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${signInData.idToken}`,
-        },
-        body: JSON.stringify({
-          data: { imageBase64: CANARY_TEST_IMAGE_BASE64, prompt: "Reply with only the word: ok", analysisId },
-        }),
-      }
-    );
-    const callData = await callResp.json();
-
-    if (!callResp.ok || callData.error) {
-      throw new Error(`analyzePhoto call failed: HTTP ${callResp.status} - ${JSON.stringify(callData.error || callData)}`);
-    }
-
-    console.log(`[canary] analyzePhoto OK | analysisId=${analysisId} | responseLength=${callData.result?.text?.length ?? 0}`);
-  } catch (err) {
-    // Distinct, greppable tag so the Cloud Monitoring log-based metric
-    // above can alert on this specific string without matching unrelated
-    // errors elsewhere in the project's logs.
-    console.error(`[CANARY_ALERT] analyzePhoto canary failed | analysisId=${analysisId} | error=${err.message}`);
+  } catch (emailErr) {
+    console.error(`[CANARY_ALERT] Resend email send threw: ${emailErr.message}`);
   }
-});
+}
