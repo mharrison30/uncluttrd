@@ -31,38 +31,54 @@ exports.analyzePhoto = onCall(
   async (request) => {
     const { imageBase64, prompt, analysisId } = request.data || {};
 
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "Sign in required.");
-    }
-    if (!imageBase64 || !prompt || !analysisId) {
-      throw new HttpsError("invalid-argument", "Missing image, prompt, or analysisId.");
+    if (!imageBase64 || !prompt) {
+      throw new HttpsError("invalid-argument", "Missing image or prompt.");
     }
 
-    const uid = request.auth.uid;
-    const userRef = db.collection("users").doc(uid);
-    // Structured as a subcollection under the user's own doc so ownership is
-    // enforced by path, not a separate uid-match check in code or rules.
-    const idemRef = userRef.collection("analysisIdempotency").doc(analysisId);
+    // HOTFIX (2026-07-15): build 15, the live public App Store version at
+    // time of writing, predates analysisId entirely and calls this function
+    // without it. Requiring request.auth and analysisId as hard
+    // preconditions (added in 85168f3) rejected every real production call
+    // outright - restored to exactly analyzePhoto's pre-85168f3 shape (no
+    // auth requirement, imageBase64/prompt only) for the base call. Auth +
+    // free-plan enforcement + idempotency now only engage when BOTH a uid
+    // and an analysisId are present - the exact shape the Companion-era
+    // client sends. Anything older/different is processed with no count
+    // check and no idempotency protection, same as this function behaved
+    // before 85168f3. See BACKLOG.md - temporary compatibility shim until
+    // build 15 is no longer the live App Store version.
+    const uid = request.auth?.uid || null;
+    const enforceLimit = !!(uid && analysisId);
+    let userRef = null;
+    let idemRef = null;
+    let month = null;
 
-    // Idempotency: a retry of the same analysisId (network retry, Cloud
-    // Function retry) replays the original result - no second Anthropic
-    // call, no second count, no double-counting.
-    const idemSnap = await idemRef.get();
-    if (idemSnap.exists) {
-      const cached = idemSnap.data();
-      return { text: cached.text, analysesRemaining: cached.analysesRemaining };
-    }
+    if (enforceLimit) {
+      userRef = db.collection("users").doc(uid);
+      // Structured as a subcollection under the user's own doc so ownership is
+      // enforced by path, not a separate uid-match check in code or rules.
+      idemRef = userRef.collection("analysisIdempotency").doc(analysisId);
 
-    // Pre-check (plain read, outside any transaction) - reject before paying
-    // for an Anthropic call the user isn't entitled to make.
-    const userSnap = await userRef.get();
-    const userData = userSnap.exists ? userSnap.data() : {};
-    const month = currentMonthUTC();
+      // Idempotency: a retry of the same analysisId (network retry, Cloud
+      // Function retry) replays the original result - no second Anthropic
+      // call, no second count, no double-counting.
+      const idemSnap = await idemRef.get();
+      if (idemSnap.exists) {
+        const cached = idemSnap.data();
+        return { text: cached.text, analysesRemaining: cached.analysesRemaining };
+      }
 
-    if (userData.isPro !== true) {
-      const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
-      if (effectiveCount >= FREE_MONTHLY_LIMIT) {
-        throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
+      // Pre-check (plain read, outside any transaction) - reject before paying
+      // for an Anthropic call the user isn't entitled to make.
+      const userSnap = await userRef.get();
+      const userData = userSnap.exists ? userSnap.data() : {};
+      month = currentMonthUTC();
+
+      if (userData.isPro !== true) {
+        const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
+        if (effectiveCount >= FREE_MONTHLY_LIMIT) {
+          throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
+        }
       }
     }
 
@@ -101,48 +117,53 @@ exports.analyzePhoto = onCall(
     // accepted per the approved design rather than building a reservation
     // system for a rare concurrency edge case. The user still sees their
     // plan; it's simply not charged against their limit either way.
+    // Skipped entirely for a request with no uid/analysisId (see the
+    // hotfix note above) - there's no safe, idempotency-protected way to
+    // count against a limit for a caller shape that can't dedupe a retry.
     let analysesRemaining = null;
-    try {
-      await db.runTransaction(async (tx) => {
-        const freshSnap = await tx.get(userRef);
-        const freshData = freshSnap.exists ? freshSnap.data() : {};
-        const expiresAt = admin.firestore.Timestamp.fromMillis(
-          Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
-        );
+    if (enforceLimit) {
+      try {
+        await db.runTransaction(async (tx) => {
+          const freshSnap = await tx.get(userRef);
+          const freshData = freshSnap.exists ? freshSnap.data() : {};
+          const expiresAt = admin.firestore.Timestamp.fromMillis(
+            Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
+          );
 
-        if (freshData.isPro === true) {
-          analysesRemaining = null;
+          if (freshData.isPro === true) {
+            analysesRemaining = null;
+            tx.set(idemRef, {
+              text,
+              analysesRemaining: null,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              expiresAt,
+            });
+            return;
+          }
+
+          const freshEffectiveCount = freshData.analysisCountMonth === month ? (freshData.analysisCount || 0) : 0;
+          if (freshEffectiveCount >= FREE_MONTHLY_LIMIT) {
+            // Lost the race - do not increment, do not cache. Anthropic cost
+            // is accepted as spent; the user still gets to see this result.
+            analysesRemaining = 0;
+            return;
+          }
+
+          const newCount = freshEffectiveCount + 1;
+          tx.set(userRef, { analysisCount: newCount, analysisCountMonth: month }, { merge: true });
+          analysesRemaining = FREE_MONTHLY_LIMIT - newCount;
           tx.set(idemRef, {
             text,
-            analysesRemaining: null,
+            analysesRemaining,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             expiresAt,
           });
-          return;
-        }
-
-        const freshEffectiveCount = freshData.analysisCountMonth === month ? (freshData.analysisCount || 0) : 0;
-        if (freshEffectiveCount >= FREE_MONTHLY_LIMIT) {
-          // Lost the race - do not increment, do not cache. Anthropic cost
-          // is accepted as spent; the user still gets to see this result.
-          analysesRemaining = 0;
-          return;
-        }
-
-        const newCount = freshEffectiveCount + 1;
-        tx.set(userRef, { analysisCount: newCount, analysisCountMonth: month }, { merge: true });
-        analysesRemaining = FREE_MONTHLY_LIMIT - newCount;
-        tx.set(idemRef, {
-          text,
-          analysesRemaining,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          expiresAt,
         });
-      });
-    } catch (txErr) {
-      // The analysis itself already succeeded - don't fail the whole
-      // request over bookkeeping. Log and still return the plan.
-      console.error("analyzePhoto count transaction failed:", txErr.message);
+      } catch (txErr) {
+        // The analysis itself already succeeded - don't fail the whole
+        // request over bookkeeping. Log and still return the plan.
+        console.error("analyzePhoto count transaction failed:", txErr.message);
+      }
     }
 
     return { text, analysesRemaining };

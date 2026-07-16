@@ -17,6 +17,19 @@ Priority levels:
 
 ## Open Items
 
+### 🔴 analyzePhoto compatibility shim for build 15 (live App Store version)
+**Context:** `85168f3` (Jul 14, 2026 free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and was deployed straight to `cluttrd-3e335` - the same Firebase project the live public App Store app (confirmed via App Store Connect to be **build 15**, which predates `analysisId` entirely) also uses. There is no staging/production project split (`.firebaserc` has one alias) and no separate EAS build profile for internal testing (every build this whole session, including TestFlight ones, used the `production` profile). Every real production user's photo analysis was being rejected outright with `invalid-argument`/`unauthenticated` - a live outage on core functionality, not a single-user report.
+
+**Hotfix shipped (Jul 15, 2026):** `analyzePhoto` no longer requires `request.auth` or `analysisId` as base preconditions - restored to its exact pre-`85168f3` validation (`imageBase64`/`prompt` only). Free-plan enforcement (idempotency + count check/increment) now only engages when **both** a uid and an `analysisId` are present - the shape the Companion-era client sends. A request missing either is processed with no count check and no idempotency protection, exactly like this function behaved before `85168f3`. Deployed and live-verified with a build-15-shaped request (no `analysisId`, no auth header) - confirmed it now reaches the Anthropic call instead of being rejected at the precondition check.
+
+**This is temporary, not the real fix.** The actual fix is getting a `feature/companion`-based build (with `analysisId`) approved and released as the new live App Store version, at which point every real user will be sending `analysisId` again and this compatibility shim becomes dead code for organic traffic (though it's harmless to leave in indefinitely as a defensive fallback).
+
+**Follow-up actions:**
+- Track App Store review/release status for the next build containing `analysisId` support: once it's live, free-plan enforcement is fully restored for all real users again.
+- Consider whether a staging Firebase project (separate from `cluttrd-3e335`) and/or a non-`production` EAS profile for internal/TestFlight builds is worth setting up, so a backend change tied to an unreleased client feature can never again be deployed live to the same project real App Store traffic hits before that client ships.
+
+---
+
 ### 🟡 Launch Metrics Dashboard
 **Context:** Once users arrive, these metrics become more important than features. Set up monitoring before public launch so data is available from day one.
 
