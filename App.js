@@ -25,6 +25,7 @@ import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "fire
 import { getFunctions, httpsCallable } from "firebase/functions";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
+import Constants from "expo-constants";
 
 // Firebase config
 const firebaseConfig = {
@@ -89,6 +90,14 @@ function DrawerIcon({ size = 38, dark = false }) {
     </Svg>
   );
 }
+
+// Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
+// build profile sets explicitly (see eas.json) - "staging" for
+// development/preview, "production" only for the production profile. Drives
+// the persistent in-app banner below; there is no runtime toggle for this,
+// by design, matching the same reasoning as the backend/bundle-ID switch.
+const APP_ENV = Constants.expoConfig?.extra?.APP_ENV;
+const IS_STAGING = APP_ENV !== "production";
 
 const BRAND = {
   green: "#1E9E52", greenLight: "#E6F7EE", greenMid: "#A8DDBF",
@@ -3178,13 +3187,22 @@ function AppRoot() {
 export default function App() {
   return (
     <SafeAreaProvider>
-      <AppRoot />
+      {IS_STAGING && (
+        <SafeAreaView edges={["top"]} style={s.stagingBanner}>
+          <Text style={s.stagingBannerText}>STAGING</Text>
+        </SafeAreaView>
+      )}
+      <View style={{ flex: 1 }}>
+        <AppRoot />
+      </View>
     </SafeAreaProvider>
   );
 }
 
 
 const s = StyleSheet.create({
+  stagingBanner: { backgroundColor: "#F59E0B", alignItems: "center", justifyContent: "center", paddingVertical: 4 },
+  stagingBannerText: { color: "#1F2937", fontSize: 12, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   safe: { flex: 1, backgroundColor: BRAND.offWhite },
   scrollContent: { padding: 20, paddingBottom: 80 },
   hdr: { backgroundColor: BRAND.navy, borderBottomWidth: 0, paddingTop: 22, paddingBottom: 18, paddingHorizontal: 20, flexDirection: "row", alignItems: "center", gap: 12 },
