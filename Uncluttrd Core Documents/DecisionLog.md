@@ -11,6 +11,39 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-16 — Staging environment: final model
+**Decision:** A dedicated staging Firebase project and a dedicated staging bundle ID (`com.mharrison.uncluttrd.staging`), separate from production (`com.mharrison.uncluttrd`, unchanged), structurally close the backend/frontend mismatch class of bug behind the `2026-07-15` outage below.
+
+Three EAS build profiles, mapped as:
+
+| Profile | Firebase | Bundle ID | Purpose |
+|---|---|---|---|
+| `development` | Staging | Staging | Local dev with dev client |
+| `preview` | Staging | Staging | Internal testing build |
+| `production` | Production | Production | Real App Store app |
+
+`development` and `preview` deliberately share the staging bundle ID — they never need to coexist installed simultaneously with each other, only with `production`, which they never touch. **Rule: only the `production` EAS profile may resolve to the production bundle ID or the production Firebase project**, enforced via `app.config.js` reading a build-time env var, not a runtime toggle — the same reasoning as the `2026-07-15` rule above: no build should be able to decide at runtime which backend it's talking to.
+
+Visual distinction on a staging build, all three signals together, not just one: a distinct display name (`Uncluttrd Staging`), a visually distinct app icon (clearly marked, e.g. an "STG" badge), and a persistent in-app "STAGING" banner. Redundant on purpose — a build sitting on a real device for days should never be mistaken for production by anyone glancing at a home screen or a screenshot.
+
+**Setup, confirmed:**
+- A new Apple App ID for the staging bundle ID, and a near-empty App Store Connect entry that is never published and never submitted for review — it exists solely so Apple can sign builds against that bundle ID.
+- RevenueCat: no new project. A second app (`iOS Staging`) added under the existing Uncluttrd RevenueCat project, sharing entitlement configuration with production — RevenueCat apps are keyed to bundle ID, not backend, and sandbox-vs-production purchase routing is already handled automatically by RevenueCat per-receipt, independent of which Firebase project is behind it.
+- A new staging Firebase project, replicated per the discovery pass's Phase 1 findings: `firestore.rules`, `storage.rules`, all six Cloud Functions (`analyzePhoto`, `generateNextAction`, `generateVisualization`, `recordUserDocDeletion`, `checkOrphanedUserDeletions`, `analyzePhotoCanary`), and their secrets (`ANTHROPIC_KEY`, `OPENAI_KEY`, `CANARY_TEST_UID`).
+
+**Reason:** A shared bundle ID between staging and production was considered and rejected (see below) specifically because it would leave open exactly the ambiguity this whole effort exists to remove — "which backend is this install actually talking to" needs to be answerable by the OS's own app identity, not by trusting that the right build profile was used. A separate bundle ID also lets `development`/`preview` genuinely never touch production even by accident, since they're a different installed app entirely, not just a different runtime configuration of the same one.
+
+**Alternatives considered:**
+- Same bundle ID for staging and production, differing only by which Firebase config is bundled at build time (the original discovery-pass default assumption). Rejected — two builds with the same bundle ID can't be installed side-by-side on one device, and nothing at the OS level distinguishes them once installed; the whole safety property would rest entirely on build-profile discipline, the same category of human-process trust that the `2026-07-15` outage already demonstrated isn't sufficient on its own.
+- A separate RevenueCat project for staging. Rejected — RevenueCat apps are scoped to a bundle ID/store listing, not a backend; a second app under the existing project is sufficient, and splitting projects would mean maintaining duplicate entitlement/product configuration for no isolation benefit.
+- Single visual signal (just a banner, or just an icon) to distinguish staging. Rejected — redundant signals were preferred deliberately, since any single one is the kind of thing a screenshot or a glance can miss.
+
+**Outcome:** Approved. Proceeding to Phase 1 (staging Firebase project, Apple App ID/App Store Connect placeholder, RevenueCat staging app) before Phase 2 (the `app.config.js` migration implementing bundle-ID/name/icon/banner switching and the corresponding `eas.json` changes).
+
+**Impact:** Architecture, Process, Reliability, Build/Release
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 
