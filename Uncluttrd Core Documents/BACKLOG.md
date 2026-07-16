@@ -3,9 +3,13 @@
 Last updated: June 2026
 Status: Living document. Add items as they are identified. Close them when shipped.
 
+> 📌 **Current live build (App Store): build 15** — confirmed via App Store Connect, 2026-07-15. Predates `analysisId` and the `85168f3` free-plan enforcement work entirely. **Update this line on every App Store/Play Store release** — see the backward-compatibility house rule in DecisionLog.md, added after the 2026-07-15 `analyzePhoto` outage this line exists to prevent a repeat of.
+
 **Rule: If an idea will take more than 15 minutes to implement or requires future consideration, it belongs in this backlog before the discussion ends.**
 
 **Rule: No feature gets built until it's documented in Vision.md, Architecture.md, Commerce.md, CommerceImplementation.md, Analytics.md, or DecisionLog.md. See DecisionLog.md for the full project document map.**
+
+**Rule: Any Cloud Function change that alters a required request shape must be checked against the pinned live build number above before deploying. See DecisionLog.md, 2026-07-15.**
 
 Priority levels:
 - 🔴 **Critical** — blocks launch or causes data loss

@@ -1,7 +1,7 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { defineSecret } = require("firebase-functions/params");
+const { defineSecret, defineString } = require("firebase-functions/params");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const { toFile } = require("openai/uploads");
@@ -19,6 +19,26 @@ const FREE_MONTHLY_LIMIT = 3;
 const IDEMPOTENCY_TTL_DAYS = 60; // within the requested 30-90 day range; requires a Firestore TTL policy on expiresAt (console/gcloud config, not code)
 const DELETION_AUDIT_TTL_DAYS = 30; // requires a Firestore TTL policy on expiresAt, same as above
 const DELETION_CHECK_GRACE_MINUTES = 10; // give the client's Auth deletion call time to land before flagging
+
+// Dedicated test account the canary calls analyzePhoto as, so the check
+// exercises the real authenticated path a live user takes (auth + a
+// generated analysisId), not just "is the function reachable." Defaults to
+// the account already flagged isTestAccount: true in its own Firestore doc
+// (users/{uid}), which is also isPro: true so canary runs never touch the
+// free-plan count. Override by setting a different uid via `firebase
+// functions:config` / a deployed .env value if a separate dedicated account
+// is preferred.
+const CANARY_TEST_UID = defineString("CANARY_TEST_UID", { default: "m4ecZ9B9B1XmDrOiAQfFPjdjyNB3" });
+// The project's public, client-embedded Firebase API key (same value
+// already shipped inside GoogleService-Info.plist) - used only to exchange
+// a custom token for a real ID token via the Identity Toolkit REST API.
+// Not a secret: Firebase API keys are designed to be public and rely on
+// security rules/App Check for protection, not secrecy.
+const FIREBASE_WEB_API_KEY = "AIzaSyAvgaO7X_IyUDZbUrYGGB4k_tTV6TpQOl4";
+// A small, genuinely valid, real JPEG (64x64, derived from the app's own
+// favicon) - large/real enough that Anthropic actually processes it and
+// returns real analysis text, not just enough to pass a byte-count check.
+const CANARY_TEST_IMAGE_BASE64 = "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";
 
 // "Calendar month" is defined in UTC server-side - the simplest, most
 // tamper-resistant definition, though it means a user right at a month
@@ -291,5 +311,78 @@ exports.checkOrphanedUserDeletions = onSchedule("every 30 minutes", async () => 
       // Expected path: the Auth account is really gone, full deletion completed normally.
     }
     await doc.ref.set({ checked: true, checkedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  }
+});
+
+// --- Production canary for analyzePhoto ---------------------------------
+// Built directly in response to the Jul 15, 2026 outage (build 15, the live
+// App Store version, was rejected by analyzePhoto's new auth/analysisId
+// requirement for hours before it was caught by a real user report - see
+// BACKLOG.md and DecisionLog.md). This exists specifically so that class of
+// regression is caught within one run interval (15 minutes), not hours.
+//
+// Alerting setup (one-time, console-only - no CLI path for Cloud Monitoring
+// alert policies in this environment):
+// 1. Cloud Console > Logging > Logs Explorer (project cluttrd-3e335).
+// 2. Create a log-based metric (counter) with filter:
+//      resource.type="cloud_run_revision"
+//      resource.labels.service_name="analyzephotocanary"
+//      textPayload:"[CANARY_ALERT]"
+// 3. Cloud Console > Monitoring > Alerting > Create Policy, condition:
+//    that log-based metric, count > 0 over a 15-minute window.
+// 4. Add a notification channel (email is simplest) and save.
+// Every failure below is logged with the exact "[CANARY_ALERT]" tag the
+// filter above matches - nothing else in this codebase uses that string.
+exports.analyzePhotoCanary = onSchedule("every 15 minutes", async () => {
+  const uid = CANARY_TEST_UID.value();
+  if (!uid) {
+    console.error("[CANARY_ALERT] CANARY_TEST_UID is not configured - canary cannot run.");
+    return;
+  }
+
+  const analysisId = `canary-${Date.now()}`;
+  try {
+    // Mint a real ID token for the dedicated test account, exactly like a
+    // real signed-in user's client would send - this exercises the actual
+    // authenticated path real users take, not just "is the function up."
+    const customToken = await admin.auth().createCustomToken(uid);
+    const signInResp = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${FIREBASE_WEB_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+      }
+    );
+    const signInData = await signInResp.json();
+    if (!signInResp.ok || !signInData.idToken) {
+      throw new Error(`Custom token exchange failed: ${JSON.stringify(signInData)}`);
+    }
+
+    const callResp = await fetch(
+      "https://us-central1-cluttrd-3e335.cloudfunctions.net/analyzePhoto",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${signInData.idToken}`,
+        },
+        body: JSON.stringify({
+          data: { imageBase64: CANARY_TEST_IMAGE_BASE64, prompt: "Reply with only the word: ok", analysisId },
+        }),
+      }
+    );
+    const callData = await callResp.json();
+
+    if (!callResp.ok || callData.error) {
+      throw new Error(`analyzePhoto call failed: HTTP ${callResp.status} - ${JSON.stringify(callData.error || callData)}`);
+    }
+
+    console.log(`[canary] analyzePhoto OK | analysisId=${analysisId} | responseLength=${callData.result?.text?.length ?? 0}`);
+  } catch (err) {
+    // Distinct, greppable tag so the Cloud Monitoring log-based metric
+    // above can alert on this specific string without matching unrelated
+    // errors elsewhere in the project's logs.
+    console.error(`[CANARY_ALERT] analyzePhoto canary failed | analysisId=${analysisId} | error=${err.message}`);
   }
 });
