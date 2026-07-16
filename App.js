@@ -299,10 +299,13 @@ function AuthScreen() {
         // Sign out and back in to force auth state to refresh with new displayName
         await signOut(auth);
         await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+        dlog(`[AUTH_DEBUG] signup success | uid=${auth.currentUser?.uid} email=${auth.currentUser?.email} authAppProjectId=${auth.app?.options?.projectId} authAppApiKey=${auth.app?.options?.apiKey} authAppAppId=${auth.app?.options?.appId} builtAppEnv=${APP_ENV}`);
       } else {
-        await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+        const cred = await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+        dlog(`[AUTH_DEBUG] signin success | uid=${cred.user?.uid} email=${cred.user?.email} authAppProjectId=${auth.app?.options?.projectId} authAppApiKey=${auth.app?.options?.apiKey} authAppAppId=${auth.app?.options?.appId} builtAppEnv=${APP_ENV}`);
       }
     } catch (e) {
+      dlog(`[AUTH_DEBUG] auth threw | code=${e.code} message=${e.message} authAppProjectId=${auth.app?.options?.projectId} builtAppEnv=${APP_ENV}`);
       if (e.code === "auth/email-already-in-use") setErr("An account with this email already exists.");
       else if (e.code === "auth/invalid-email") setErr("Please enter a valid email address.");
       else if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") setErr("Incorrect email or password.");
