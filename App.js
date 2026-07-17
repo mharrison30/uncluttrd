@@ -27,6 +27,34 @@ import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
 
+// TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
+// outside MainApp's closure - BeforeAfterSlider in particular, for the
+// touch-event instrumentation below - can log into the same buffer without
+// prop-drilling a logger through CompanionRevealModal/CompanionCompletedSummary.
+// Declared before Firebase init (below) so early init-time logging can use it
+// too, without hitting the temporal-dead-zone crash a later declaration would
+// cause at module-evaluation time. Retrieved via the existing
+// long-press-to-share mechanism on the header logo (see debugShareLog in
+// MainApp). Remove once the photo-pipeline, slider, and staging-isolation
+// investigations are closed.
+const debugLogBuffer = [];
+function dlog(line) {
+  console.log(line);
+  debugLogBuffer.push(`${new Date().toISOString()} ${line}`);
+}
+// Lightweight, non-cryptographic fingerprint for a base64 image payload -
+// cheap enough to run on a ~150-400KB string without hashing every byte.
+// Purpose is purely to confirm two payloads are the same or different
+// content, not to be collision-proof.
+function debugHashBase64(b64) {
+  if (!b64) return "null";
+  let hash = 0;
+  for (let i = 0; i < b64.length; i += 37) {
+    hash = (hash * 31 + b64.charCodeAt(i)) | 0;
+  }
+  return `len${b64.length}:h${hash}`;
+}
+
 // Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
 // build profile sets explicitly (see eas.json) - "staging" for
 // development/preview, "production" only for the production profile. Read
@@ -54,7 +82,9 @@ const stagingFirebaseConfig = {
 };
 const firebaseConfig = IS_PRODUCTION ? productionFirebaseConfig : stagingFirebaseConfig;
 
-const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+const preInitAppsCount = getApps().length;
+const firebaseApp = preInitAppsCount === 0 ? initializeApp(firebaseConfig) : getApp();
+dlog(`[FIREBASE_INIT_DEBUG] preInitAppsCount=${preInitAppsCount} tookBranch=${preInitAppsCount === 0 ? "initializeApp" : "getApp"} selectedConfigProjectId=${firebaseConfig.projectId} resultingAppProjectId=${firebaseApp.options.projectId} appName=${firebaseApp.name} builtAppEnv=${APP_ENV}`);
 let auth;
 try {
   auth = initializeAuth(firebaseApp, { persistence: getReactNativePersistence(AsyncStorage) });
@@ -877,31 +907,6 @@ function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri 
       )}
     </View>
   );
-}
-
-// TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
-// outside MainApp's closure - BeforeAfterSlider in particular, for the
-// touch-event instrumentation below - can log into the same buffer without
-// prop-drilling a logger through CompanionRevealModal/CompanionCompletedSummary.
-// Retrieved via the existing long-press-to-share mechanism on the header logo
-// (see debugShareLog in MainApp). Remove once the photo-pipeline and slider
-// investigations are closed.
-const debugLogBuffer = [];
-function dlog(line) {
-  console.log(line);
-  debugLogBuffer.push(`${new Date().toISOString()} ${line}`);
-}
-// Lightweight, non-cryptographic fingerprint for a base64 image payload -
-// cheap enough to run on a ~150-400KB string without hashing every byte.
-// Purpose is purely to confirm two payloads are the same or different
-// content, not to be collision-proof.
-function debugHashBase64(b64) {
-  if (!b64) return "null";
-  let hash = 0;
-  for (let i = 0; i < b64.length; i += 37) {
-    hash = (hash * 31 + b64.charCodeAt(i)) | 0;
-  }
-  return `len${b64.length}:h${hash}`;
 }
 
 function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) {
@@ -1750,6 +1755,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       logEvent(getAnalytics(), "plan_started");
 
       const analyzePhotoFn = httpsCallable(functions, "analyzePhoto");
+      dlog(`[FIREBASE_CALL_DEBUG] about to call analyzePhoto | functionsAppProjectId=${functions.app?.options?.projectId} functionsRegion=${functions.region ?? "unknown"} authAppProjectId=${auth.app?.options?.projectId} authUid=${auth.currentUser?.uid} builtAppEnv=${APP_ENV}`);
       let raw = "";
       let analysesRemaining = null; // server's real count, per this analysis - not a local guess
       try {
