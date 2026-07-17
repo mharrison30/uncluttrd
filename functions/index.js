@@ -40,8 +40,12 @@ const CANARY_TEST_UID = defineString("CANARY_TEST_UID", { default: "m4ecZ9B9B1Xm
 // already shipped inside GoogleService-Info.plist) - used only to exchange
 // a custom token for a real ID token via the Identity Toolkit REST API.
 // Not a secret: Firebase API keys are designed to be public and rely on
-// security rules/App Check for protection, not secrecy.
-const FIREBASE_WEB_API_KEY = "AIzaSyAvgaO7X_IyUDZbUrYGGB4k_tTV6TpQOl4";
+// security rules/App Check for protection, not secrecy. Project-scoped the
+// same way as CANARY_TEST_UID: the default here is production's key, and
+// .env.cluttrd-staging overrides it for staging deploys - otherwise a
+// staging-minted custom token gets exchanged against production's Identity
+// Toolkit, which fails on project mismatch.
+const CANARY_WEB_API_KEY = defineString("CANARY_WEB_API_KEY", { default: "AIzaSyAvgaO7X_IyUDZbUrYGGB4k_tTV6TpQOl4" });
 // A small, genuinely valid, real JPEG (64x64, derived from the app's own
 // favicon) - large/real enough that Anthropic actually processes it and
 // returns real analysis text, not just enough to pass a byte-count check.
@@ -356,7 +360,7 @@ exports.analyzePhotoCanary = onSchedule(
       // authenticated path real users take, not just "is the function up."
       const customToken = await admin.auth().createCustomToken(uid);
       const signInResp = await fetch(
-        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${FIREBASE_WEB_API_KEY}`,
+        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${CANARY_WEB_API_KEY.value()}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -368,8 +372,11 @@ exports.analyzePhotoCanary = onSchedule(
         throw new Error(`Custom token exchange failed: ${JSON.stringify(signInData)}`);
       }
 
+      // Derived from the running project, not hardcoded to production - so
+      // the canary always calls its own project's analyzePhoto, never
+      // production's regardless of which project this function is deployed to.
       const callResp = await fetch(
-        "https://us-central1-cluttrd-3e335.cloudfunctions.net/analyzePhoto",
+        `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/analyzePhoto`,
         {
           method: "POST",
           headers: {
