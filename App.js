@@ -1456,7 +1456,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // fixes it at the source instead of guessing at retry/timing workarounds.
   useEffect(() => {
     const loadHistory = async () => {
-      if (!isPro) return;
       try {
         console.log("Loading history for user:", user.uid);
         const q = query(collection(db, "users", user.uid, "plans"), orderBy("createdAt", "desc"), limit(20));
@@ -1477,9 +1476,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }
   }, [showPaywall]);
 
-  // Save plan to Firestore after successful analysis
+  // Save plan to Firestore after successful analysis - free and Pro alike.
+  // The free-plan monthly limit (functions/index.js's analyzePhoto) is
+  // enforced entirely via analysisCount/analysisCountMonth on the user doc,
+  // independent of this write, so saving here doesn't interact with it.
   const savePlanToHistory = async (plan) => {
-    if (!isPro) { console.log("Not pro - skipping save"); return; }
     try {
       console.log("Saving plan for user:", user.uid);
       const entry = {
@@ -1539,51 +1540,65 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   // Reacts to isPro transitioning false -> true mid-session (e.g. a purchase
-  // completed partway through a free-tier Companion loop). Without this, a
-  // plan analyzed while free never gets a currentPlanId, and every subsequent
-  // Companion write silently no-ops on that guard for the rest of the
-  // session. Single effect, not scattered per-guard patches - see
-  // DecisionLog.md 2026-07-14 for the investigation that found this.
+  // completed partway through a free-tier Companion loop). Free plans now
+  // save immediately (see savePlanToHistory), so currentPlanId is normally
+  // already set by the time this fires - the retroactive-save branch below
+  // is now a narrow safety net for the async race between `results` being
+  // set and that save's Firestore write actually resolving, not the primary
+  // path it used to be. The deferred-continuation branch is a separate
+  // concern and must NOT be gated on !currentPlanId the way it used to be:
+  // a free user who hit the paywall mid-continuing-loop
+  // (submitCompanionProgressPhoto's isPro gate) and upgrades right there
+  // needs that submission resumed regardless of whether a plan doc already
+  // existed, which it normally already does now. See DecisionLog.md
+  // 2026-07-14 for the investigation that originally found the need for
+  // this effect.
   const prevIsProRef = useRef(isPro);
   useEffect(() => {
     const justBecamePro = !prevIsProRef.current && isPro;
     prevIsProRef.current = isPro;
-    if (!justBecamePro || !results || currentPlanId) return; // nothing to retroactively fix
+    if (!justBecamePro) return;
+    const isPaywallContinuation = companionStage === "paywall-prompt" && !!progressPhoto;
+    if (!isPaywallContinuation && (currentPlanId || !results)) return; // nothing to do
+
     (async () => {
-      const newPlanId = await savePlanToHistory(results);
-      if (!newPlanId) {
-        // Unlike savePlanToHistory's normal console.log-only failures, this
-        // one is user-facing on purpose - this whole effect exists to
-        // prevent silent data loss, so a silent failure here would defeat it.
-        Alert.alert("We couldn't save your progress", "You may need to redo your last step.");
-        return;
-      }
-      // savePlanToHistory only ever writes firstAction fresh ("suggested") -
-      // backfill it to match whatever the client already knows actually
-      // happened, using the same dotted-update pattern
-      // handleCompanionStart/handleCompanionComplete already use elsewhere.
-      const firstActionUpdates = {};
-      if (companionStartedAt) {
-        firstActionUpdates["firstAction.status"] = "started";
-        firstActionUpdates["firstAction.startedAt"] = new Date(companionStartedAt).toISOString();
-      }
-      if (companionStage === "celebrating" || companionStage === "paywall-prompt") {
-        firstActionUpdates["firstAction.status"] = "completed";
-        firstActionUpdates["firstAction.completedAt"] = companionCompletedAt || new Date().toISOString();
-      }
-      if (Object.keys(firstActionUpdates).length) {
-        try {
-          await updateDoc(doc(db, "users", user.uid, "plans", newPlanId), firstActionUpdates);
-        } catch (e) {
-          console.log("Retroactive companion backfill error:", e.message);
+      let planId = currentPlanId;
+      if (!planId && results) {
+        planId = await savePlanToHistory(results);
+        if (!planId) {
+          // Unlike savePlanToHistory's normal console.log-only failures, this
+          // one is user-facing on purpose - this whole effect exists to
+          // prevent silent data loss, so a silent failure here would defeat it.
+          Alert.alert("We couldn't save your progress", "You may need to redo your last step.");
+          return;
+        }
+        // savePlanToHistory only ever writes firstAction fresh ("suggested") -
+        // backfill it to match whatever the client already knows actually
+        // happened, using the same dotted-update pattern
+        // handleCompanionStart/handleCompanionComplete already use elsewhere.
+        const firstActionUpdates = {};
+        if (companionStartedAt) {
+          firstActionUpdates["firstAction.status"] = "started";
+          firstActionUpdates["firstAction.startedAt"] = new Date(companionStartedAt).toISOString();
+        }
+        if (companionStage === "celebrating" || companionStage === "paywall-prompt") {
+          firstActionUpdates["firstAction.status"] = "completed";
+          firstActionUpdates["firstAction.completedAt"] = companionCompletedAt || new Date().toISOString();
+        }
+        if (Object.keys(firstActionUpdates).length) {
+          try {
+            await updateDoc(doc(db, "users", user.uid, "plans", planId), firstActionUpdates);
+          } catch (e) {
+            console.log("Retroactive companion backfill error:", e.message);
+          }
         }
       }
       // paywall-prompt specifically means a progress photo was already
-      // submitted while free and the AI call was skipped - now that a plan
-      // exists and isPro is true, actually run the deferred generation
-      // instead of just correcting the stage cosmetically.
-      if (companionStage === "paywall-prompt" && progressPhoto) {
-        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, newPlanId);
+      // submitted while free and the AI call was skipped - now that isPro is
+      // true, actually run the deferred generation instead of just
+      // correcting the stage cosmetically.
+      if (isPaywallContinuation) {
+        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, planId);
       }
     })();
   }, [isPro]);
@@ -2034,8 +2049,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // user has engaged with it beyond just seeing the suggestion. Either they're
   // mid-loop (a companionAction exists) or they started/finished their first
   // action. Plans where firstAction was never even started don't count; there's
-  // nothing to "continue" yet. Free-tier sessions are never persisted, so this
-  // only ever applies to Pro plans (history is already Pro-only, see loadHistory).
+  // nothing to "continue" yet. Free plans are saved too now, but companionAction
+  // (action 2+) can only ever be set behind submitCompanionProgressPhoto's own
+  // isPro gate - so this naturally stays scoped to a free user's one free
+  // action, with no separate isPro check needed here.
   // A plan the user already finished is never resumable, regardless of what
   // companionAction/firstAction still say - companionComplete is never cleared
   // once set, so without this check a finished project would keep showing the
@@ -2046,7 +2063,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (plan?.firstAction && typeof plan.firstAction === "object" && plan.firstAction.status && plan.firstAction.status !== "suggested") return true;
     return false;
   };
-  const resumablePlan = isPro ? history.find(isCompanionResumable) : null;
+  const resumablePlan = history.find(isCompanionResumable);
 
   const resumeCompanionSession = (item) => {
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
@@ -2370,7 +2387,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
           {[
             { icon: Home, label: "Home", action: goHome },
-            { icon: Folder, label: "My Plans", action: () => { setShowMenu(false); setShowHistory(true); }, pro: true },
+            { icon: Folder, label: "My Plans", action: () => { setShowMenu(false); setShowHistory(true); } },
             { icon: User, label: "Account", action: () => { setShowMenu(false); setShowAccount(true); } },
             { icon: Star, label: "Upgrade to Pro", action: () => { setShowMenu(false); setShowPaywall(true); }, hide: isPro },
             { icon: HelpCircle, label: "Help & FAQ", action: () => { setShowMenu(false); setShowFaq(true); } },
@@ -2429,7 +2446,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(item.spaceType, "What would you like to do?", [
                   { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
-                  { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } },
+                  // Gated the same way as the main results-screen share button
+                  // (isPro ? "How would you like to share?" : "Upgrade to Pro
+                  // for a beautiful branded PDF") - now that free plans are
+                  // saved and reachable from History too, this option would
+                  // otherwise bypass that same Pro-only PDF policy.
+                  isPro
+                    ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
+                    : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
                   { text: "Cancel", style: "cancel" },
                 ]);
               }}>
@@ -2461,7 +2485,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full plan history saved to your account, AI visualization of your transformed space, and branded PDF sharing. Free users get 3 free transformations per month." },
       { q: "What is the AI Visualization feature?", a: "After getting your organization plan, tap 'See the transformation' on any tier to generate an AI-created image showing what your space could look like after organizing. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full plan." },
-      { q: "Where are my saved plans?", a: "Tap the ☰ menu and select 'My Plans' to see all your past organization plans. This is a Pro feature and plans sync across devices via your account." },
+      { q: "Where are my saved plans?", a: "Tap the ☰ menu and select 'My Plans' to see all your past organization plans, synced across devices via your account. Pro members also get unlimited continuing guidance on each plan and can share a branded PDF." },
       { q: "How do I cancel my subscription?", a: "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
       { q: "Is my data secure?", a: "Yes. Your photos are sent securely to our AI for analysis and are not stored on our servers. Your account data is secured through Firebase, Google's enterprise-grade platform." },
       { q: "The product links aren't working. What do I do?", a: "Make sure you have a stable internet connection. The product links open Google Shopping with a search for the recommended item." },
