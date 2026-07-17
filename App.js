@@ -82,9 +82,7 @@ const stagingFirebaseConfig = {
 };
 const firebaseConfig = IS_PRODUCTION ? productionFirebaseConfig : stagingFirebaseConfig;
 
-const preInitAppsCount = getApps().length;
-const firebaseApp = preInitAppsCount === 0 ? initializeApp(firebaseConfig) : getApp();
-dlog(`[FIREBASE_INIT_DEBUG] preInitAppsCount=${preInitAppsCount} tookBranch=${preInitAppsCount === 0 ? "initializeApp" : "getApp"} selectedConfigProjectId=${firebaseConfig.projectId} resultingAppProjectId=${firebaseApp.options.projectId} appName=${firebaseApp.name} builtAppEnv=${APP_ENV}`);
+const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 let auth;
 try {
   auth = initializeAuth(firebaseApp, { persistence: getReactNativePersistence(AsyncStorage) });
@@ -345,13 +343,10 @@ function AuthScreen() {
         // Sign out and back in to force auth state to refresh with new displayName
         await signOut(auth);
         await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
-        dlog(`[AUTH_DEBUG] signup success | uid=${auth.currentUser?.uid} email=${auth.currentUser?.email} authAppProjectId=${auth.app?.options?.projectId} authAppApiKey=${auth.app?.options?.apiKey} authAppAppId=${auth.app?.options?.appId} builtAppEnv=${APP_ENV}`);
       } else {
-        const cred = await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
-        dlog(`[AUTH_DEBUG] signin success | uid=${cred.user?.uid} email=${cred.user?.email} authAppProjectId=${auth.app?.options?.projectId} authAppApiKey=${auth.app?.options?.apiKey} authAppAppId=${auth.app?.options?.appId} builtAppEnv=${APP_ENV}`);
+        await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
       }
     } catch (e) {
-      dlog(`[AUTH_DEBUG] auth threw | code=${e.code} message=${e.message} authAppProjectId=${auth.app?.options?.projectId} builtAppEnv=${APP_ENV}`);
       if (e.code === "auth/email-already-in-use") setErr("An account with this email already exists.");
       else if (e.code === "auth/invalid-email") setErr("Please enter a valid email address.");
       else if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") setErr("Incorrect email or password.");
@@ -1755,7 +1750,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       logEvent(getAnalytics(), "plan_started");
 
       const analyzePhotoFn = httpsCallable(functions, "analyzePhoto");
-      dlog(`[FIREBASE_CALL_DEBUG] about to call analyzePhoto | functionsAppProjectId=${functions.app?.options?.projectId} functionsRegion=${functions.region ?? "unknown"} authAppProjectId=${auth.app?.options?.projectId} authUid=${auth.currentUser?.uid} builtAppEnv=${APP_ENV}`);
       let raw = "";
       let analysesRemaining = null; // server's real count, per this analysis - not a local guess
       try {
