@@ -27,8 +27,16 @@ import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
 
+// Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
+// build profile sets explicitly (see eas.json) - "staging" for
+// development/preview, "production" only for the production profile. Read
+// before Firebase initializes below so the selected firebaseConfig can never
+// silently default to production.
+const APP_ENV = Constants.expoConfig?.extra?.APP_ENV;
+const IS_PRODUCTION = APP_ENV === "production";
+
 // Firebase config
-const firebaseConfig = {
+const productionFirebaseConfig = {
   apiKey: "AIzaSyB4R4hI8_Ej_jwqmukO4y_j1vD1hvIl8-8",
   authDomain: "auth.uncluttrd.app",
   projectId: "cluttrd-3e335",
@@ -36,6 +44,15 @@ const firebaseConfig = {
   messagingSenderId: "427768202763",
   appId: "1:427768202763:web:f47a4005880db50085690e"
 };
+const stagingFirebaseConfig = {
+  apiKey: "AIzaSyDgBFIR35WcYYllxuGVNDmfGGMt4Hq71E4",
+  authDomain: "cluttrd-staging.firebaseapp.com",
+  projectId: "cluttrd-staging",
+  storageBucket: "cluttrd-staging.firebasestorage.app",
+  messagingSenderId: "247455199173",
+  appId: "1:247455199173:web:b3c11631fd4aa4770965ac"
+};
+const firebaseConfig = IS_PRODUCTION ? productionFirebaseConfig : stagingFirebaseConfig;
 
 const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 let auth;
@@ -91,13 +108,12 @@ function DrawerIcon({ size = 38, dark = false }) {
   );
 }
 
-// Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
-// build profile sets explicitly (see eas.json) - "staging" for
-// development/preview, "production" only for the production profile. Drives
-// the persistent in-app banner below; there is no runtime toggle for this,
-// by design, matching the same reasoning as the backend/bundle-ID switch.
-const APP_ENV = Constants.expoConfig?.extra?.APP_ENV;
-const IS_STAGING = APP_ENV !== "production";
+// APP_ENV/IS_PRODUCTION are read above, before Firebase initializes, so the
+// selected firebaseConfig can never silently default to production.
+// IS_STAGING drives the persistent in-app banner below; there is no runtime
+// toggle for this, by design, matching the same reasoning as the
+// backend/bundle-ID switch.
+const IS_STAGING = !IS_PRODUCTION;
 
 const BRAND = {
   green: "#1E9E52", greenLight: "#E6F7EE", greenMid: "#A8DDBF",
