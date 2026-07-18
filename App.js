@@ -3075,7 +3075,14 @@ function AppRoot() {
     // it raced against that authoritative fetch for no benefit and was part
     // of the original leakage risk.
     try {
-      Purchases.configure({ apiKey: "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" }); Purchases.configure({ apiKey: Platform.OS === "android" ? "goog_zsRKzNXkxcdeXQLKducjtXXsJhP" : "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" });
+      // iOS key is APP_ENV-branched the same way firebaseConfig is - production
+      // and staging are separate RevenueCat apps (see DecisionLog.md
+      // 2026-07-16), each with their own API key, keyed to bundle ID. Without
+      // this, a staging build configures against production's app and its
+      // entitlement/offering lookups silently fail. Android's key is not yet
+      // known to be staging-aware - left as-is, not assumed fixed.
+      const iosApiKey = IS_PRODUCTION ? "appl_SIucLbhCtkbSMSuMrhGyxsfWmxx" : "appl_ZHUurKUlRoGySqASsIkNlbnWEDd";
+      Purchases.configure({ apiKey: Platform.OS === "android" ? "goog_zsRKzNXkxcdeXQLKducjtXXsJhP" : iosApiKey });
 
       // Keep Pro status in sync if it changes while the app is open
       // (e.g. a refund processes, or the subscription is restored on another
