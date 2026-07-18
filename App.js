@@ -1153,7 +1153,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [unresolvedReview, setUnresolvedReview] = useState(null);
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
-  const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
+  // Most recent "before" photo used for the next comparison. Set once when
+  // results first arrive (fresh analysis) or once a resumed plan's photo (or
+  // last progress photo) finishes downloading (see restorePhotoFromPlan) -
+  // not just the [results] effect, since that effect fires synchronously on
+  // setResults(item), before a resumed session's download has resolved
+  // (DecisionLog.md 2026-07-18 - was previously never set on resume at all,
+  // leaving submitCompanionProgressPhoto permanently unable to proceed).
+  const companionBasePhotoRef = useRef(null);
   // The very first "before" photo for the whole project - unlike
   // companionBasePhotoRef, this never rolls forward. Set once when results
   // first arrive (fresh analysis) or once a resumed plan's photo finishes
@@ -1860,6 +1867,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setPhoto({ uri, base64: null, mimeType: "image/jpeg" });
       dlog(`[PHOTO DEBUG] restorePhotoFromPlan: companionOriginalPhotoRef null -> ${uri} | planId=${item.id}`);
       companionOriginalPhotoRef.current = uri;
+
+      // companionBasePhotoRef ("before" image for the next comparison) was
+      // never set here at all - resuming straight into batch-active (no
+      // fresh analyzePhoto in this sitting) left it permanently null, since
+      // only a successful submitCompanionProgressPhoto round-trip otherwise
+      // sets it. Prefer the plan's most recent progress photo if one exists
+      // (a truer "most recent known state" than the original), falling back
+      // to the original just downloaded above for a plan with no progress
+      // photos yet (still on its first batch).
+      const lastProgressUrl = item.progressPhotos?.length ? item.progressPhotos[item.progressPhotos.length - 1].url : null;
+      if (lastProgressUrl) {
+        const baseLocalUri = FileSystem.cacheDirectory + `plan_photo_${item.id}_base.jpg`;
+        const { uri: baseUri } = await FileSystem.downloadAsync(lastProgressUrl, baseLocalUri);
+        if (activePlanIdRef.current !== item.id) return;
+        dlog(`[PHOTO DEBUG] restorePhotoFromPlan: companionBasePhotoRef null -> ${baseUri} (last progress photo) | planId=${item.id}`);
+        companionBasePhotoRef.current = baseUri;
+      } else {
+        dlog(`[PHOTO DEBUG] restorePhotoFromPlan: companionBasePhotoRef null -> ${uri} (original, no progress photos yet) | planId=${item.id}`);
+        companionBasePhotoRef.current = uri;
+      }
     } catch (e) {
       console.log("Restore plan photo error:", e.message);
       if (activePlanIdRef.current === item.id) setPhoto(null);
