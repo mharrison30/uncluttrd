@@ -55,6 +55,15 @@ function debugHashBase64(b64) {
   return `len${b64.length}:h${hash}`;
 }
 
+// Stable per-item id for batch checklist items - only needs to be unique
+// within one plan's lifetime, not globally, so a counter + timestamp is
+// sufficient without pulling in a uuid dependency.
+let batchItemIdCounter = 0;
+function makeItemId() {
+  batchItemIdCounter += 1;
+  return `item-${Date.now()}-${batchItemIdCounter}`;
+}
+
 // Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
 // build profile sets explicitly (see eas.json) - "staging" for
 // development/preview, "production" only for the production profile. Read
@@ -538,14 +547,14 @@ function AuthScreen() {
 // Renders the single-action Companion loop, one decision at a time,
 // per CompanionDesignPrinciples.md. Purely prop-driven. Placement on
 // the results screen is a separate change (Milestone 4).
-// Simple visual progress indicator. Grows with actionIndex, capped at 90%
+// Simple visual progress indicator. Grows with batchIndex, capped at 90%
 // while the loop is ongoing (open-ended, no fixed "done" from the AI's side).
 // The only way this bar ever reaches 100% is the `complete` prop, driven by
 // the user's own choice to finish - see CompanionDesignPrinciples.md
 // principle 8. That's why this is the one place in the loop that animates:
 // the fill to 100% is meant to read as a distinct, earned moment.
-function CompanionProgressBar({ actionIndex, complete }) {
-  const pct = Math.min(90, 15 + (actionIndex - 1) * 20);
+function CompanionProgressBar({ batchIndex, complete }) {
+  const pct = Math.min(90, 15 + (batchIndex - 1) * 20);
   const widthAnim = useRef(new Animated.Value(pct)).current;
 
   useEffect(() => {
@@ -690,16 +699,17 @@ function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
 }
 
 function CompanionCard({
-  stage, actionText, tipIndex, actionIndex, completionReason,
-  onStart, onComplete, onSharePhoto, onFinishedForToday, onUpgrade,
-  onChooseFinish, onChooseContinue, onAcknowledgeComplete,
+  stage, tipIndex, batchIndex, completionReason,
+  onUpgrade, onChooseFinish, onChooseContinue, onAcknowledgeComplete,
 }) {
-  // "reveal" is rendered as its own full-screen CompanionRevealModal, not
-  // inline here - see the results screen render for why (not enough room in
-  // a scrolling card for a before/after slider worth dragging). Once the
-  // whole project is finished, the results screen renders
-  // CompanionCompletedSummary in this card's place instead - see there.
-  if (stage === "finished" || stage === "reveal") return null;
+  // "reveal" is its own full-screen CompanionRevealModal, and "batch-active"
+  // is its own BatchChecklist component - neither renders here (see the
+  // results screen render for why: not enough room in a scrolling card for a
+  // before/after slider worth dragging, and a checklist needs its own layout
+  // rhythm, not this card's single-title-single-body shape). Once the whole
+  // project is finished, the results screen renders CompanionCompletedSummary
+  // in this card's place instead - see there.
+  if (stage === "finished" || stage === "reveal" || stage === "batch-active") return null;
 
   const GENERATING_TIPS = [
     "Looking at what's changed...",
@@ -731,26 +741,13 @@ function CompanionCard({
     );
   }
 
-  if (stage === "celebrating") {
-    return (
-      <View style={s.companionCard}>
-        <CompanionProgressBar actionIndex={actionIndex} />
-        <Text style={s.companionTitle}>Nice work</Text>
-        <Text style={s.companionBody}>Great progress.</Text>
-        <TouchableOpacity style={s.companionBtn} onPress={onSharePhoto}>
-          <Text style={s.companionBtnText}>Show me what you accomplished</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
   // The AI recommends finishing, but never decides it - see
   // CompanionDesignPrinciples.md principle 8. Both buttons use the same
   // style/size on purpose: neither is the "default" choice.
   if (stage === "completion-choice") {
     return (
       <View style={s.companionCard}>
-        <CompanionProgressBar actionIndex={actionIndex} />
+        <CompanionProgressBar batchIndex={batchIndex} />
         <Text style={s.companionTitle}>This is looking good</Text>
         <Text style={s.companionBody}>{completionReason}</Text>
         <TouchableOpacity style={s.companionBtn} onPress={onChooseFinish}>
@@ -766,7 +763,7 @@ function CompanionCard({
   if (stage === "project-complete") {
     return (
       <View style={s.companionCard}>
-        <CompanionProgressBar actionIndex={actionIndex} complete />
+        <CompanionProgressBar batchIndex={batchIndex} complete />
         <Text style={s.companionTitle}>You did it</Text>
         <Text style={s.companionBody}>You turned this space into something that works better for you.</Text>
         <TouchableOpacity style={s.companionBtn} onPress={onAcknowledgeComplete}>
@@ -776,28 +773,136 @@ function CompanionCard({
     );
   }
 
-  // suggested | started | companion-active share one layout
-  const title = stage === "companion-active" ? "Ready to keep going?" : "Let's Start Here";
+  return null;
+}
+
+// The batch checklist itself (stage "batch-active"). Intro framing line
+// precedes the list every time a new batch is shown (DecisionLog.md
+// 2026-07-18) - plain checkboxes, no progress counters, no per-item
+// start/stop ceremony, just toggle what's true. Continue and Pause are
+// visually distinct (Pause is a secondary/lower-emphasis action) since
+// they mean different things - "plan my next session" vs. "remember where
+// I left off" - even though the underlying mechanics converge on the same
+// review + photo flow.
+function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause }) {
   return (
     <View style={s.companionCard}>
-      <CompanionProgressBar actionIndex={actionIndex} />
-      <Text style={s.companionTitle}>{title}</Text>
-      <Text style={s.companionBody}>{actionText}</Text>
-      {stage === "started" ? (
-        <TouchableOpacity style={s.companionBtn} onPress={onComplete}>
-          <Text style={s.companionBtnText}>I'm Done</Text>
-        </TouchableOpacity>
-      ) : (
-        <TouchableOpacity style={s.companionBtn} onPress={onStart}>
-          <Text style={s.companionBtnText}>I'm Ready</Text>
-        </TouchableOpacity>
-      )}
-      {stage === "companion-active" && (
-        <TouchableOpacity style={s.companionSecondaryBtn} onPress={onFinishedForToday}>
-          <Text style={s.companionSecondaryBtnText}>Finished for today</Text>
-        </TouchableOpacity>
-      )}
+      <CompanionProgressBar batchIndex={batchIndex} />
+      <Text style={s.companionTitle}>Let's Work On These</Text>
+      <Text style={s.companionBody}>Let's make a little more progress. Start wherever you'd like - you don't need to finish everything today.</Text>
+      <View style={{ marginTop: 4, marginBottom: 4 }}>
+        {items.map(item => {
+          const checked = item.status === "checked";
+          return (
+            <TouchableOpacity
+              key={item.id}
+              style={s.batchItemRow}
+              onPress={() => onToggleItem(item.id)}
+              accessibilityRole="checkbox"
+              accessibilityState={{ checked }}
+            >
+              <View style={[s.batchItemCheckbox, checked && s.batchItemCheckboxChecked]}>
+                {checked && <Check size={14} color="white" strokeWidth={3} />}
+              </View>
+              <Text style={[s.batchItemText, checked && s.batchItemTextChecked]}>{item.text}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+      <TouchableOpacity style={s.companionBtn} onPress={onContinue}>
+        <Text style={s.companionBtnText}>Show me what you got done</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={s.companionSecondaryBtn} onPress={onPause}>
+        <Text style={s.companionSecondaryBtnText}>That's enough for today</Text>
+      </TouchableOpacity>
     </View>
+  );
+}
+
+// Unresolved-items review, shown when Continue or Pause is tapped with items
+// still unchecked (DecisionLog.md 2026-07-18). One combined screen for 2+
+// items rather than sequential popups - a chain of modals for someone with
+// several unresolved items would violate Principle 3 (never overwhelm) far
+// more than one screen listing them together. Continue and Pause share this
+// exact component and mechanics; only the framing copy differs, matching the
+// "plan my next session" vs. "remember where I left off" mental model.
+function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
+  // itemId -> { action, reason } as each item gets resolved. Once every item
+  // has an entry, onResolve fires automatically with the complete map -
+  // resolving one item at a time, not one combined submit button, since a
+  // partially-filled-out combined screen shouldn't need a separate confirm
+  // step once nothing is left ambiguous.
+  const [resolved, setResolved] = useState({});
+  const isPause = mode === "pause";
+  const single = items.length === 1;
+
+  const finalizeIfComplete = (next) => {
+    if (Object.keys(next).length >= items.length) onResolve(next);
+    else setResolved(next);
+  };
+
+  const keepForNextTime = (itemId) => finalizeIfComplete({ ...resolved, [itemId]: { action: "carried" } });
+
+  // Reason capture is a lightweight, optional tap-through (never a text
+  // field) - framed as helping the AI plan better next time, never a
+  // scolding. "Skip" with no reason is always available alongside it.
+  const skipItem = (itemId) => {
+    Alert.alert(
+      "Skip this one?",
+      "No worries - this just helps me plan better next time.",
+      [
+        { text: "Not applicable", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "not applicable" } }) },
+        { text: "Changed my mind", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "changed my mind" } }) },
+        { text: "Too hard", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "too hard" } }) },
+        { text: "Skip", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: null } }) },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  };
+
+  const keepAllForNextTime = () => {
+    const next = {};
+    items.forEach(item => { next[item.id] = { action: "carried" }; });
+    onResolve(next);
+  };
+
+  let title, subtitle;
+  if (single) {
+    title = isPause ? "Anything you'd like me to remember for next time?" : `Still working on: ${items[0].text}?`;
+  } else {
+    title = isPause ? "Before we wrap up, what should I remember for next time?" : "Looks like these are still unchecked. What should I do with them?";
+    subtitle = isPause && items.length <= 2 ? "Anything you'd like me to remember for next time?" : null;
+  }
+
+  const pending = items.filter(item => !resolved[item.id]);
+
+  return (
+    <Modal visible animationType="fade" transparent onRequestClose={onCancel}>
+      <View style={s.reviewModalBackdrop}>
+        <View style={s.reviewModalCard}>
+          <Text style={s.companionTitle}>{title}</Text>
+          {subtitle && <Text style={[s.companionBody, { marginBottom: 8 }]}>{subtitle}</Text>}
+          {pending.map(item => (
+            <View key={item.id} style={s.reviewItemBlock}>
+              {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
+              <View style={{ flexDirection: "row", gap: 10 }}>
+                <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
+                  <Text style={s.reviewItemBtnText}>{isPause ? "Still working on it" : "Keep it for next time"}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.reviewItemBtn} onPress={() => skipItem(item.id)}>
+                  <Text style={s.reviewItemBtnText}>Skip it</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          ))}
+          {!single && pending.length > 1 && (
+            <TouchableOpacity style={[s.companionSecondaryBtn, { marginTop: 6 }]} onPress={keepAllForNextTime}>
+              <Text style={s.companionSecondaryBtnText}>Keep all of these for next time</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -808,7 +913,7 @@ function CompanionCard({
 // how much room it gets. onDismiss is used by both the close affordance and
 // the continue button - closing and continuing are the same transition here,
 // there's nothing to "cancel back" to once the progress photo is already in.
-function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visibleChangeText, revealReady, onDismiss }) {
+function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibleChangeText, revealReady, isPause, onDismiss }) {
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onDismiss}>
       <SafeAreaView style={s.revealModalSafe}>
@@ -818,7 +923,7 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
           </TouchableOpacity>
         </View>
         <View style={s.revealModalProgressWrap}>
-          <CompanionProgressBar actionIndex={actionIndex} />
+          <CompanionProgressBar batchIndex={batchIndex} />
         </View>
         <View style={s.revealModalImageArea}>
           <BeforeAfterSlider beforeUri={beforeUri} afterUri={afterUri} debugLabel="revealModal" />
@@ -828,7 +933,7 @@ function CompanionRevealModal({ visible, actionIndex, beforeUri, afterUri, visib
           <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
           {revealReady ? (
             <TouchableOpacity style={s.companionBtn} onPress={onDismiss}>
-              <Text style={s.companionBtnText}>Ready to keep going?</Text>
+              <Text style={s.companionBtnText}>{isPause ? "Finished for today" : "Ready to keep going?"}</Text>
             </TouchableOpacity>
           ) : (
             <View style={{ height: 51 }} />
@@ -886,7 +991,7 @@ function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri 
   const dateText = formatCompletedDate(completedAt);
   return (
     <View style={s.companionCard}>
-      <CompanionProgressBar actionIndex={1} complete />
+      <CompanionProgressBar batchIndex={1} complete />
       <View style={s.completedBadgeRow}>
         <View style={s.completedBadge}>
           <Check size={12} color="white" strokeWidth={3} />
@@ -1001,10 +1106,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // Cleared on success (a completed ID must never be reused - that would just
   // replay the old cached result) and in reset()/goHome().
   const lastFailedAnalysisRef = useRef(null);
-  const secondsSince = (msTimestamp) => (msTimestamp ? Math.round((Date.now() - msTimestamp) / 1000) : null);
 
-  const [companionStage, setCompanionStage] = useState("suggested"); // suggested | started | celebrating | generating | reveal | companion-active | paywall-prompt | completion-choice | project-complete | finished
-  const [companionActionText, setCompanionActionText] = useState(null);
+  const [companionStage, setCompanionStage] = useState("batch-active"); // batch-active | generating | reveal | paywall-prompt | completion-choice | project-complete | finished
+  // The live, in-progress checklist: [{id, text, status}], status one of
+  // "pending" | "checked" | "carried" | "skipped" - carried/skipped are only
+  // ever set by the unresolved-items review, never by direct toggling.
+  const [batchItems, setBatchItems] = useState([]);
   const debugShareLog = async () => {
     const text = debugLogBuffer.length ? debugLogBuffer.join("\n\n") : "(no debug log entries captured yet)";
     try {
@@ -1017,17 +1124,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // that produced it - confirms whether a given device is actually running
   // the code containing a given fix, not a stale/cached build.
   useEffect(() => {
-    dlog("[BUILD DEBUG] MainApp mounted | marker: photo-pipeline-and-slider-instrumentation-v1");
+    dlog("[BUILD DEBUG] MainApp mounted | marker: batch-workflow-v1");
   }, []);
   // Fires whenever this state actually settles (not when the setter is called),
   // since setState is async. This is the true post-update value.
   useEffect(() => {
-    dlog(`[COMPANION DEBUG 4] companionActionText settled to: ${JSON.stringify(companionActionText)}`);
-  }, [companionActionText]);
-  const [companionActionIndex, setCompanionActionIndex] = useState(1); // 1 = firstAction, 2+ = companionAction
-  const [companionStartedAt, setCompanionStartedAt] = useState(null); // ms timestamp, feeds a future secondsSinceStarted analytics property (Milestone 6)
-  const [companionCompletedAt, setCompanionCompletedAt] = useState(null); // ISO string, used when archiving into companionActionHistory
+    dlog(`[COMPANION DEBUG 4] batchItems settled to: ${JSON.stringify(batchItems)}`);
+  }, [batchItems]);
+  const [companionBatchIndex, setCompanionBatchIndex] = useState(1); // 1 = first batch, 2+ = later batches
   const [progressPhoto, setProgressPhoto] = useState(null);
+  // Distinguishes a Pause-triggered photo submission from a Continue-triggered
+  // one, consulted once generation succeeds (batch_session_paused, and
+  // reveal's continue button routes to "finished" instead of the new batch).
+  // A ref, not state, since it's read synchronously inside a callback set up
+  // moments earlier in the same interaction, not across a render.
+  const batchPauseRef = useRef(false);
+  // Holds the unresolved-items review's data while it's showing: null when
+  // hidden, otherwise { mode: "continue" | "pause", items: [...unchecked] }.
+  const [unresolvedReview, setUnresolvedReview] = useState(null);
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
   const companionBasePhotoRef = useRef(null); // most recent "before" photo used for the next comparison
@@ -1069,37 +1183,40 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   // Initializes or resumes the Companion loop whenever a new plan's results arrive.
-  // A fresh analysis returns firstAction as a plain string (see the analyzePhoto
-  // prompt); a reopened saved plan returns the persisted object shape
-  // { text, status, suggestedAt, startedAt, completedAt }. Both are handled here
-  // so resuming a saved plan picks up exactly where it was left, not from scratch.
+  // A fresh analysis returns firstActionBatch as an array of plain strings (see
+  // the analyzePhoto prompt); a reopened saved plan returns the persisted
+  // currentBatch shape { batchIndex, suggestedAt, items: [{id, text, status}] }.
+  // Both are handled here so resuming a saved plan picks up exactly where it
+  // was left, not from scratch.
   useEffect(() => {
     if (!results) return;
-    if (results.companionAction) {
-      setCompanionActionIndex(results.companionAction.actionIndex || 2);
-      setCompanionActionText(results.companionAction.text || null);
-      setCompanionStage(results.companionAction.status === "started" ? "started" : "companion-active");
-      setCompanionStartedAt(results.companionAction.startedAt ? new Date(results.companionAction.startedAt).getTime() : null);
-      // Only reached when reopening a saved plan (a fresh analysis never has a
-      // companionAction yet). This is a resumed view, not a freshly generated one.
-      logEvent(getAnalytics(), "companion_action_viewed", { planId: currentPlanId, actionIndex: results.companionAction.actionIndex || 2 });
-    } else if (results.firstAction) {
-      const isFreshAnalysis = typeof results.firstAction === "string";
-      setCompanionActionIndex(1);
-      setCompanionActionText(isFreshAnalysis ? results.firstAction : (results.firstAction.text || null));
-      setCompanionStage(isFreshAnalysis || results.firstAction.status !== "started" ? "suggested" : "started");
-      setCompanionStartedAt(!isFreshAnalysis && results.firstAction.startedAt ? new Date(results.firstAction.startedAt).getTime() : null);
+    setUnresolvedReview(null);
+    batchPauseRef.current = false;
+    if (results.currentBatch?.items?.length) {
+      setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
+      setBatchItems(results.currentBatch.items);
+      setCompanionStage("batch-active");
+      // Only reached when reopening a saved plan (a fresh analysis composes
+      // batchItems from firstActionBatch below, then batch_shown fires from
+      // analyze() itself). This is a resumed view, not a freshly generated one.
+      logEvent(getAnalytics(), "batch_shown", { planId: currentPlanId, batchIndex: results.currentBatch.batchIndex || 1 });
+    } else if (Array.isArray(results.firstActionBatch)) {
+      const items = results.firstActionBatch
+        .filter(t => typeof t === "string" && t.trim())
+        .map(text => ({ id: makeItemId(), text, status: "pending" }));
+      setCompanionBatchIndex(1);
+      setBatchItems(items);
+      setCompanionStage("batch-active");
     } else {
-      setCompanionActionText(null);
+      setBatchItems([]);
     }
     // A resumed plan that was already finished should land straight on the
-    // completed summary, not reopen mid-loop - "finished" is what makes
-    // CompanionCard render nothing, and CompanionCompletedSummary (gated on
+    // completed summary, not reopen mid-loop - "finished" is what makes the
+    // checklist render nothing, and CompanionCompletedSummary (gated on
     // results.companionComplete / companionCompletedProject) takes its place.
     if (results.companionComplete) {
       setCompanionStage("finished");
     }
-    setCompanionCompletedAt(null);
     setCompanionCompletionRecommended(false);
     setCompanionCompletionReason(null);
     setCompanionCompletedProject(null);
@@ -1122,46 +1239,61 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionRevealReady(false);
   }, [results]);
 
-  const handleCompanionStart = () => {
-    const startedAtIso = new Date().toISOString();
-    setCompanionStartedAt(Date.now());
-    setCompanionStage("started");
-    if (companionActionIndex === 1) {
-      logEvent(getAnalytics(), "first_action_started", { analysisId: analysisIdRef.current });
-    } else {
-      logEvent(getAnalytics(), "companion_action_started", { planId: currentPlanId, actionIndex: companionActionIndex });
-    }
-    if (currentPlanId) {
-      const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
-      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
-        [`${field}.status`]: "started",
-        [`${field}.startedAt`]: startedAtIso,
-      }).catch(e => console.log("Save companion start error:", e.message));
-    }
+  const toggleBatchItem = (itemId) => {
+    setBatchItems(prev => prev.map(item => {
+      if (item.id !== itemId) return item;
+      const checking = item.status !== "checked";
+      logEvent(getAnalytics(), checking ? "batch_step_checked" : "batch_step_unchecked", { planId: currentPlanId, batchIndex: companionBatchIndex, itemId });
+      return { ...item, status: checking ? "checked" : "pending" };
+    }));
   };
 
-  const handleCompanionComplete = () => {
-    const completedAtIso = new Date().toISOString();
-    setCompanionCompletedAt(completedAtIso);
-    setCompanionStage("celebrating");
-    if (companionActionIndex === 1) {
-      logEvent(getAnalytics(), "first_action_completed", { analysisId: analysisIdRef.current, secondsSinceStarted: secondsSince(companionStartedAt) });
-      logEvent(getAnalytics(), "progress_photo_prompted", { analysisId: analysisIdRef.current });
-    } else {
-      logEvent(getAnalytics(), "companion_action_completed", { planId: currentPlanId, actionIndex: companionActionIndex, secondsSinceStarted: secondsSince(companionStartedAt) });
-    }
-    if (currentPlanId) {
-      const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
-      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
-        [`${field}.status`]: "completed",
-        [`${field}.completedAt`]: completedAtIso,
-      }).catch(e => console.log("Save companion complete error:", e.message));
-    }
+  const openBatchPhotoSheet = (isPause) => {
+    Alert.alert(
+      isPause ? "Show me where things stand" : "Show me what you got done",
+      "How would you like to share your progress?",
+      [
+        { text: "Take Photo", onPress: () => captureCompanionPhoto(isPause) },
+        { text: "Choose from Camera Roll", onPress: () => pickCompanionPhoto(isPause) },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
   };
 
-  const handleCompanionFinishedForToday = () => {
-    setCompanionStage("finished");
-    logEvent(getAnalytics(), "companion_session_completed", { planId: currentPlanId });
+  // Shared entry point for both Continue and Pause - same mechanics, only the
+  // mode (used purely for copy in the review, see UnresolvedItemsReview)
+  // differs. Pause skips the review entirely when everything is checked.
+  const openUnresolvedReviewOrPhoto = (mode) => {
+    const unchecked = batchItems.filter(i => i.status !== "checked");
+    if (mode === "continue") {
+      logEvent(getAnalytics(), "batch_continue_tapped", { planId: currentPlanId, batchIndex: companionBatchIndex, checkedCount: batchItems.length - unchecked.length, uncheckedCount: unchecked.length });
+    }
+    if (unchecked.length === 0) {
+      openBatchPhotoSheet(mode === "pause");
+      return;
+    }
+    logEvent(getAnalytics(), "batch_item_skip_popup_shown", { planId: currentPlanId, batchIndex: companionBatchIndex, uncheckedCount: unchecked.length });
+    setUnresolvedReview({ mode, items: unchecked });
+  };
+
+  const handleBatchContinueTapped = () => openUnresolvedReviewOrPhoto("continue");
+  const handleBatchPauseTapped = () => openUnresolvedReviewOrPhoto("pause");
+
+  // resolutions: { [itemId]: { action: "carried" | "skipped", reason?: string } }
+  const handleUnresolvedReviewResolve = (resolutions) => {
+    const mode = unresolvedReview?.mode || "continue";
+    setBatchItems(prev => prev.map(item => {
+      const resolution = resolutions[item.id];
+      if (!resolution) return item;
+      if (resolution.action === "carried") {
+        logEvent(getAnalytics(), "batch_item_marked_not_done", { planId: currentPlanId, batchIndex: companionBatchIndex, itemId: item.id });
+        return { ...item, status: "carried" };
+      }
+      logEvent(getAnalytics(), "batch_item_skipped", { planId: currentPlanId, batchIndex: companionBatchIndex, itemId: item.id, reason: resolution.reason || null });
+      return { ...item, status: "skipped", skipReason: resolution.reason || null };
+    }));
+    setUnresolvedReview(null);
+    openBatchPhotoSheet(mode === "pause");
   };
 
   const handleCompanionRevealContinue = () => {
@@ -1170,20 +1302,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // CompanionDesignPrinciples.md principle 8. This just routes to the
     // choice; the outcome is entirely up to the two buttons there.
     if (companionCompletionRecommended) {
-      logEvent(getAnalytics(), "companion_completion_prompt_viewed", { planId: currentPlanId, actionIndex: companionActionIndex });
+      logEvent(getAnalytics(), "companion_completion_prompt_viewed", { planId: currentPlanId, batchIndex: companionBatchIndex });
       setCompanionStage("completion-choice");
+    } else if (batchPauseRef.current) {
+      // Paused: the new batch is already generated and saved, waiting for
+      // whenever the user actually resumes - see isCompanionResumable.
+      setCompanionStage("finished");
     } else {
-      setCompanionStage("companion-active");
+      setCompanionStage("batch-active");
     }
+    batchPauseRef.current = false;
   };
 
   const handleCompanionChooseContinue = () => {
-    logEvent(getAnalytics(), "companion_continued_past_complete", { planId: currentPlanId, actionIndex: companionActionIndex });
-    // No stale recommendation should carry into the next action - the next
+    logEvent(getAnalytics(), "companion_continued_past_complete", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    // No stale recommendation should carry into the next batch - the next
     // generateNextAction call will judge completion fresh, on its own terms.
     setCompanionCompletionRecommended(false);
     setCompanionCompletionReason(null);
-    setCompanionStage("companion-active");
+    setCompanionStage("batch-active");
   };
 
   const handleCompanionChooseFinish = () => {
@@ -1191,7 +1328,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // render right away without waiting on the serverTimestamp() write below
     // to round-trip back into `results`.
     setCompanionCompletedProject({ completedAt: new Date().toISOString(), reason: companionCompletionReason });
-    logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, actionIndex: companionActionIndex });
+    logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    // Absence of this event after a batch_completion_recommended implies the
+    // user chose "Make one more improvement" instead - see Analytics.md.
+    logEvent(getAnalytics(), "batch_completion_accepted", { planId: currentPlanId, batchIndex: companionBatchIndex });
     setCompanionStage("project-complete");
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
@@ -1202,46 +1342,46 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   const handleCompanionAcknowledgeComplete = () => {
     // Routes to Your Plan in its completed state, not a blank screen -
-    // "finished" is what makes CompanionCard render nothing; the results
+    // "finished" is what makes the checklist render nothing; the results
     // screen renders CompanionCompletedSummary in its place whenever
     // companionCompletedProject / results.companionComplete is set.
     setCompanionStage("finished");
   };
 
   const handleCompanionUpgradeRequest = () => {
-    logEvent(getAnalytics(), "companion_upgrade_clicked", { analysisId: analysisIdRef.current });
+    logEvent(getAnalytics(), "companion_upgrade_clicked", { planId: currentPlanId });
     // Reuses the existing paywall screen entirely unchanged. Same screen every
     // other "Upgrade to Pro" entry point already opens. Only the source tag is new.
     setPaywallSource("companion");
     setShowPaywall(true);
   };
 
-  const submitCompanionProgressPhoto = async (progressUri, progressBase64, planIdOverride = null) => {
+  const submitCompanionProgressPhoto = async (progressUri, progressBase64, planIdOverride = null, isPause = false) => {
     // planIdOverride lets the isPro-mid-session effect re-invoke this exact
     // function once a plan has just been retroactively saved, before
     // currentPlanId state has actually re-rendered with the new value.
     const effectivePlanId = planIdOverride || currentPlanId;
-    dlog(`[PHOTO DEBUG] submitCompanionProgressPhoto called | actionIndex=${companionActionIndex} | progressUri=${progressUri} | progressBase64Len=${progressBase64?.length ?? "null"} | companionBasePhotoRef.current=${companionBasePhotoRef.current} | t=${Date.now()}`);
+    dlog(`[PHOTO DEBUG] submitCompanionProgressPhoto called | batchIndex=${companionBatchIndex} | isPause=${isPause} | progressUri=${progressUri} | progressBase64Len=${progressBase64?.length ?? "null"} | companionBasePhotoRef.current=${companionBasePhotoRef.current} | t=${Date.now()}`);
     // Restored on any failure below - the stage is only ever allowed to move
     // forward (into "generating" and then "reveal") after a valid server
     // response. Never a hardcoded fallback destination.
     const stageBeforeSubmit = companionStage;
     setProgressPhoto({ uri: progressUri, base64: progressBase64 });
+    batchPauseRef.current = isPause;
     if (!isPro) {
       setCompanionStage("paywall-prompt");
-      logEvent(getAnalytics(), "companion_paywall_viewed", { analysisId: analysisIdRef.current });
+      logEvent(getAnalytics(), "companion_paywall_viewed", { planId: effectivePlanId });
       return;
     }
 
     const originalSource = companionOriginalPhotoRef.current;
     if (!originalSource) {
       // Don't touch companionStage at all - the user stays exactly where
-      // they were (normally "celebrating", whose button is what led here),
-      // so the submission button is already enabled again and nothing about
-      // the current action is overwritten. This is the resumed-plan race
-      // where restorePhotoFromPlan's download hasn't resolved yet.
-      console.log("Companion next-action error: original photo not yet available");
-      logEvent(getAnalytics(), "companion_action_failed", { planId: effectivePlanId, actionIndex: companionActionIndex, reason: "missing_original_photo" });
+      // they were, so the submission is still available to retry and nothing
+      // about the current batch is overwritten. This is the resumed-plan
+      // race where restorePhotoFromPlan's download hasn't resolved yet.
+      console.log("Companion next-batch error: original photo not yet available");
+      logEvent(getAnalytics(), "batch_generation_failed", { planId: effectivePlanId, batchIndex: companionBatchIndex, reason: "missing_original_photo" });
       Alert.alert("Still loading", "We're still loading your original photo. Please try again in a moment.");
       return;
     }
@@ -1253,7 +1393,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (!beforeSource) throw new Error("Missing before photo for comparison");
 
       // The original never changes mid-session, so its compressed/encoded
-      // form is cached and reused rather than redone on every single step.
+      // form is cached and reused rather than redone on every single batch.
       let compressedOriginal = companionOriginalCompressedRef.current;
       if (!compressedOriginal || compressedOriginal.uri !== originalSource) {
         const originalResult = await manipulateAsync(originalSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
@@ -1263,9 +1403,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const compressedBefore = await manipulateAsync(beforeSource, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
       const compressedAfter = await manipulateAsync(progressUri, [{ resize: { width: 1024 } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
 
-      dlog(`[PHOTO DEBUG] about to call generateNextAction | actionIndex=${companionActionIndex} | beforeSource=${beforeSource} | progressUri(after)=${progressUri} | originalHash=${debugHashBase64(compressedOriginal.base64)} | beforeHash=${debugHashBase64(compressedBefore.base64)} | afterHash=${debugHashBase64(compressedAfter.base64)} | t=${Date.now()}`);
+      dlog(`[PHOTO DEBUG] about to call generateNextAction | batchIndex=${companionBatchIndex} | beforeSource=${beforeSource} | progressUri(after)=${progressUri} | originalHash=${debugHashBase64(compressedOriginal.base64)} | beforeHash=${debugHashBase64(compressedBefore.base64)} | afterHash=${debugHashBase64(compressedAfter.base64)} | t=${Date.now()}`);
 
-      const nextPrompt = `You are a warm, encouraging professional organizer. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state right before this specific step, (3) the state right after the user just completed this step: "${companionActionText}".\n\nFirst, compare photo 2 and photo 3 only. Name the single clearest, most specific visible change between them, in one short sentence. Only describe what you can confidently see. No percentages, no invented specifics, nothing you can't actually verify by looking at the two images. If you cannot identify one confident, specific visible change, respond with exactly this sentence instead: "You completed this step and moved the space forward."\n\nThen suggest one single new specific next step, based only on what is visible in photo 3 (the current state) right now. Never suggest moving, removing, or addressing anything that isn't visible in photo 3, even if it was visible in photo 1 or photo 2 - if something was already handled in an earlier step, treat it as already done and do not mention it again. Before suggesting it, verify the specific problem you're describing is genuinely visible and unaddressed in photo 3 right now, not a common decluttering trope you're defaulting to (like tidying cables, sorting an organizer, or grouping similar items) - if that exact area is already organized in photo 3, it does not need this suggestion, even if it's a typical thing to suggest in a space like this. If you cannot find any genuine unaddressed problem anywhere in photo 3, that itself is a meaningful signal this space may be substantially complete - let it inform completionRecommended below rather than inventing a task; in that case, write companionAction as a brief, honest, low-key note (such as a small finishing touch or simply enjoying the results) instead of fabricating a problem that isn't there. Doable in roughly 15-20 minutes, written the same way (one or two warm sentences, no time estimate stated, no list-like phrasing).\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall progress on this space. Using only what you can actually see: has clutter decreased, are related items now grouped, is the intended surface or area now usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Never set this true merely because the step the user just finished succeeded; judge only the overall original-vs-now comparison.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence naming the specific visible change, or the exact fallback sentence if none is confident","companionAction":"one or two warm sentences describing the next step","completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos - for example: 'Your bookshelf now has a clear surface and grouped items' or 'There's still a stack of books that could find a home.'"}`;
+      // Priority hierarchy (DecisionLog.md 2026-07-18): the photo is the real
+      // signal, the checklist is intent, and any disagreement is never
+      // surfaced to the user as a correction - the next batch is just
+      // generated naturally around what the photo actually shows.
+      const checkedItems = batchItems.filter(i => i.status === "checked");
+      const carriedItems = batchItems.filter(i => i.status === "carried");
+      const skippedItems = batchItems.filter(i => i.status === "skipped");
+      const checklistLines = batchItems.map(item => {
+        const label = item.status === "checked" ? "the user marked this done"
+          : item.status === "carried" ? "the user is still working on this, not done yet"
+          : item.status === "skipped" ? `the user skipped this${item.skipReason ? ` (reason: ${item.skipReason})` : ""}`
+          : "unresolved";
+        return `- "${item.text}" - ${label}`;
+      }).join("\n");
+
+      const nextPrompt = `You are a warm, encouraging professional organizer helping with an ongoing organizing session. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state at the start of this session, (3) the state right now, after this session's work.\n\nThis session's checklist, and what the user reported for each item:\n${checklistLines}\n\nTrust photo 3 over what the user reported. The checklist reflects intent, not verified fact - if an item was marked done but photo 3 shows it clearly wasn't addressed, don't call out the discrepancy or tell the user they're wrong. Just generate the next batch naturally around what photo 3 actually shows, prioritizing what's genuinely still needed there.\n\nFirst, compare photo 2 and photo 3. In one short sentence, describe the overall visible progress made this session - specific and photo-grounded (name what got cleared or organized), not a generic compliment and not a count of items checked off. If you cannot identify confident, specific visible progress, respond with exactly this sentence instead: "You made progress this session and moved the space forward."\n\nThen generate the next balanced session's worth of steps (a small checklist, not one item and not an exhaustive plan), based only on what is visible in photo 3 right now, accounting for any items above reported as "still working on this, not done yet" - those will be carried into the next session automatically, so do not repeat or rephrase them; only return additional NEW steps needed to round out a well-sized session given what's already carried over. Same qualitative sizing rules as before: don't return several trivial items, don't disguise one overwhelming task as one item, prefer a genuine mix suited to what this space actually needs. Never estimate or state how long any step will take. Before suggesting each new step, verify the problem is genuinely visible and unaddressed in photo 3, not a common decluttering trope you're defaulting to. If no new steps are needed, return an empty list - that combined with nothing carried over is itself a meaningful signal the space may be substantially complete, and should inform completionRecommended below.\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall project progress. Using only what you can actually see: has clutter decreased, are related items grouped, is the intended surface or area usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Judge only the original-vs-now comparison, not whether this specific session went well.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence describing this session's visible progress, or the exact fallback sentence if none is confident","nextBatch":["one or two warm sentences describing one new step","..."],"completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos."}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({
         originalImageBase64: compressedOriginal.base64,
@@ -1279,16 +1434,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const parsed = sanitizeAiText(JSON.parse(cleaned));
 
       const visibleChangeText = typeof parsed.visibleChange === "string" && parsed.visibleChange.trim() ? parsed.visibleChange.trim() : null;
-      const nextActionText = typeof parsed.companionAction === "string" && parsed.companionAction.trim() ? parsed.companionAction.trim() : null;
-      if (!visibleChangeText || !nextActionText) {
-        throw new Error("Malformed response: missing visibleChange or companionAction");
-      }
-      // Completion fields are judged separately from the two required fields
-      // above - a malformed completion judgment defaults safely and still
-      // lets the next action proceed, rather than breaking the whole loop
-      // over a non-critical field.
+      const newItemTexts = Array.isArray(parsed.nextBatch) ? parsed.nextBatch.filter(t => typeof t === "string" && t.trim()) : [];
+      // Completion fields are judged separately from visibleChange above - a
+      // malformed completion judgment defaults safely and still lets the
+      // next batch proceed, rather than breaking the whole loop over a
+      // non-critical field.
       const completionRecommended = typeof parsed.completionRecommended === "boolean" ? parsed.completionRecommended : false;
       const completionReasonText = typeof parsed.completionReason === "string" && parsed.completionReason.trim() ? parsed.completionReason.trim() : null;
+
+      // Client composes the final next batch, not the AI response - carried
+      // items are kept verbatim (their own text/identity), the AI's response
+      // is only ever the NEW items rounding out the session (DecisionLog.md
+      // 2026-07-18: "context for sizing, not source of truth for carried
+      // item identity").
+      const composedItems = [
+        ...carriedItems.map(item => ({ id: item.id, text: item.text, status: "pending" })),
+        ...newItemTexts.map(text => ({ id: makeItemId(), text, status: "pending" })),
+      ];
+      if (!visibleChangeText || (composedItems.length === 0 && !completionRecommended)) {
+        throw new Error("Malformed response: missing visibleChange, or no next batch items and completion not recommended");
+      }
 
       // Upload the progress photo to Storage (same pattern as the original analysis
       // photo) so it can be persisted on the plan doc, not just held in memory.
@@ -1313,45 +1478,50 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         }
       }
 
-      const newActionIndex = companionActionIndex + 1;
+      const newBatchIndex = companionBatchIndex + 1;
       if (effectivePlanId) {
-        const archivedAction = {
-          actionIndex: companionActionIndex,
-          text: companionActionText,
-          startedAt: companionStartedAt ? new Date(companionStartedAt).toISOString() : null,
-          completedAt: companionCompletedAt || new Date().toISOString(),
+        const archivedBatch = {
+          batchIndex: companionBatchIndex,
+          items: batchItems,
+          completedAt: new Date().toISOString(),
         };
         updateDoc(doc(db, "users", user.uid, "plans", effectivePlanId), {
-          companionActionHistory: arrayUnion(archivedAction),
-          ...(progressPhotoUrl ? { progressPhotos: arrayUnion({ actionIndex: companionActionIndex, url: progressPhotoUrl, uploadedAt: new Date().toISOString() }) } : {}),
-          companionAction: {
-            actionIndex: newActionIndex,
-            text: nextActionText,
-            status: "suggested",
+          batchHistory: arrayUnion(archivedBatch),
+          ...(progressPhotoUrl ? { progressPhotos: arrayUnion({ batchIndex: companionBatchIndex, url: progressPhotoUrl, uploadedAt: new Date().toISOString() }) } : {}),
+          currentBatch: {
+            batchIndex: newBatchIndex,
             suggestedAt: new Date().toISOString(),
-            startedAt: null,
-            completedAt: null,
+            items: composedItems,
           },
         }).catch(e => console.log("Save companion progress error:", e.message));
       }
 
-      logEvent(getAnalytics(), "companion_progress_photo_uploaded", { planId: effectivePlanId, actionIndex: companionActionIndex });
-      logEvent(getAnalytics(), "companion_next_action_generated", { planId: effectivePlanId, actionIndex: newActionIndex });
-      if (newActionIndex === 2) {
-        logEvent(getAnalytics(), "companion_session_started", { planId: effectivePlanId });
+      logEvent(getAnalytics(), "batch_photo_submitted", { planId: effectivePlanId, batchIndex: companionBatchIndex, checkedCount: checkedItems.length, carriedCount: carriedItems.length, skippedCount: skippedItems.length });
+      if (isPause) {
+        logEvent(getAnalytics(), "batch_session_paused", { planId: effectivePlanId, batchIndex: companionBatchIndex });
       }
-      logEvent(getAnalytics(), "companion_action_viewed", { planId: effectivePlanId, actionIndex: newActionIndex });
+      if (newBatchIndex === 2) {
+        // Pro north star (replaces companion_session_started - see
+        // DecisionLog.md 2026-07-18): measures engagement into a second
+        // session, not conversion. A free user hitting the paywall never
+        // reaches newBatchIndex 2 in the first place, so this only fires for
+        // genuinely continuing (Pro) sessions.
+        logEvent(getAnalytics(), "batch_second_batch_reached", { planId: effectivePlanId });
+      }
+      if (completionRecommended) {
+        logEvent(getAnalytics(), "batch_completion_recommended", { planId: effectivePlanId, batchIndex: newBatchIndex });
+      }
 
-      dlog(`[PHOTO DEBUG] generateNextAction response received | actionIndex ${companionActionIndex} -> ${newActionIndex} | companionAction="${nextActionText}" | completionRecommended=${completionRecommended} | t=${Date.now()}`);
+      dlog(`[PHOTO DEBUG] generateNextAction response received | batchIndex ${companionBatchIndex} -> ${newBatchIndex} | composedItems=${composedItems.length} | completionRecommended=${completionRecommended} | t=${Date.now()}`);
       dlog(`[PHOTO DEBUG] companionBasePhotoRef updating | from=${companionBasePhotoRef.current} | to=${progressUri}`);
       companionBasePhotoRef.current = progressUri;
-      setCompanionActionText(nextActionText);
-      setCompanionActionIndex(newActionIndex);
+      setBatchItems(composedItems);
+      setCompanionBatchIndex(newBatchIndex);
       setCompanionCompletionRecommended(completionRecommended);
       setCompanionCompletionReason(completionReasonText);
 
-      // Before/after reveal (Milestone 8): show the comparison and the visible-
-      // change reaction before the next action appears, not instead of it.
+      // Before/after reveal: show the comparison and the visible-change
+      // reaction before the next batch appears, not instead of it.
       setCompanionRevealBefore(beforeSource);
       setCompanionRevealAfter(progressUri);
       setCompanionVisibleChange(visibleChangeText);
@@ -1360,19 +1530,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
       companionRevealTimer.current = setTimeout(() => setCompanionRevealReady(true), 1200);
     } catch (e) {
-      console.log("Companion next-action error:", e.message);
-      logEvent(getAnalytics(), "companion_action_failed", { planId: effectivePlanId, actionIndex: companionActionIndex, reason: e.message });
+      console.log("Companion next-batch error:", e.message);
+      logEvent(getAnalytics(), "batch_generation_failed", { planId: effectivePlanId, batchIndex: companionBatchIndex, reason: e.message });
       // Never a hardcoded fallback stage - only enter reveal/further stages
       // after a valid server response. Revert to wherever the user actually
       // was, so the button that got them here is still there and tappable.
       setCompanionStage(stageBeforeSubmit);
+      batchPauseRef.current = false;
       Alert.alert("Something went wrong", "We couldn't review your progress. Please try again.");
     } finally {
       stopCompanionTips();
     }
   };
 
-  const captureCompanionPhoto = async () => {
+  const captureCompanionPhoto = async (isPause = false) => {
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== "granted") {
@@ -1382,14 +1553,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const result = await ImagePicker.launchCameraAsync({ allowsEditing: true, quality: 0.2, base64: true });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];
-        submitCompanionProgressPhoto(a.uri, a.base64);
+        submitCompanionProgressPhoto(a.uri, a.base64, null, isPause);
       }
     } catch (e) {
       Alert.alert("Could not open camera", "Please try again.");
     }
   };
 
-  const pickCompanionPhoto = async () => {
+  const pickCompanionPhoto = async (isPause = false) => {
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== "granted") {
@@ -1399,26 +1570,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], allowsEditing: true, quality: 0.2, base64: true });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];
-        submitCompanionProgressPhoto(a.uri, a.base64);
+        submitCompanionProgressPhoto(a.uri, a.base64, null, isPause);
       }
     } catch (e) {
       Alert.alert("We couldn't open your photos", "Please try again.");
     }
-  };
-
-  const handleCompanionSharePhoto = () => {
-    if (companionActionIndex === 1) {
-      logEvent(getAnalytics(), "progress_photo_started", { analysisId: analysisIdRef.current });
-    }
-    Alert.alert(
-      "Show me what you accomplished",
-      "How would you like to share your progress?",
-      [
-        { text: "Take Photo", onPress: captureCompanionPhoto },
-        { text: "Choose from Camera Roll", onPress: pickCompanionPhoto },
-        { text: "Cancel", style: "cancel" },
-      ]
-    );
   };
 
   const pickPhoto = async () => {
@@ -1493,15 +1649,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         tiers: plan.tiers,
         proTip: plan.proTip,
         vizImages: {},
-        firstAction: plan.firstAction ? {
-          text: plan.firstAction,
-          status: "suggested",
+        currentBatch: Array.isArray(plan.firstActionBatch) && plan.firstActionBatch.length ? {
+          batchIndex: 1,
           suggestedAt: new Date().toISOString(),
-          startedAt: null,
-          completedAt: null,
+          items: plan.firstActionBatch
+            .filter(t => typeof t === "string" && t.trim())
+            .map(text => ({ id: makeItemId(), text, status: "pending" })),
         } : null,
-        companionAction: null,
-        companionActionHistory: [],
+        batchHistory: [],
         progressPhotos: [],
       };
       const docRef = await addDoc(collection(db, "users", user.uid, "plans"), entry);
@@ -1572,22 +1727,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           Alert.alert("We couldn't save your progress", "You may need to redo your last step.");
           return;
         }
-        // savePlanToHistory only ever writes firstAction fresh ("suggested") -
-        // backfill it to match whatever the client already knows actually
-        // happened, using the same dotted-update pattern
-        // handleCompanionStart/handleCompanionComplete already use elsewhere.
-        const firstActionUpdates = {};
-        if (companionStartedAt) {
-          firstActionUpdates["firstAction.status"] = "started";
-          firstActionUpdates["firstAction.startedAt"] = new Date(companionStartedAt).toISOString();
-        }
-        if (companionStage === "celebrating" || companionStage === "paywall-prompt") {
-          firstActionUpdates["firstAction.status"] = "completed";
-          firstActionUpdates["firstAction.completedAt"] = companionCompletedAt || new Date().toISOString();
-        }
-        if (Object.keys(firstActionUpdates).length) {
+        // savePlanToHistory only ever writes currentBatch fresh (every item
+        // "pending") - backfill it with whatever the client already knows
+        // actually happened (checked/carried/skipped items from this
+        // session), since the batch schema has one items array to sync
+        // rather than several separate dotted status/timestamp fields.
+        if (batchItems.length) {
           try {
-            await updateDoc(doc(db, "users", user.uid, "plans", planId), firstActionUpdates);
+            await updateDoc(doc(db, "users", user.uid, "plans", planId), { "currentBatch.items": batchItems });
           } catch (e) {
             console.log("Retroactive companion backfill error:", e.message);
           }
@@ -1596,9 +1743,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // paywall-prompt specifically means a progress photo was already
       // submitted while free and the AI call was skipped - now that isPro is
       // true, actually run the deferred generation instead of just
-      // correcting the stage cosmetically.
+      // correcting the stage cosmetically. batchPauseRef.current still holds
+      // whatever it was set to by that original attempt (a ref, so it
+      // survives across this render), which is why it's read directly here
+      // rather than re-derived.
       if (isPaywallContinuation) {
-        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, planId);
+        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, planId, batchPauseRef.current);
       }
     })();
   }, [isPro]);
@@ -1734,7 +1884,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const budgetNote = budget
         ? `The user has a specific budget of $${budget}. Highlight which tier best fits their budget, but still show all three.`
         : `Show all three tiers: Budget (under $50), Mid-Range ($50-$200), and Premium ($200+).`;
-      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify one single "first action": the single most obvious, encouraging, doable-right-now step for this space, independent of budget tier. It should be scoped to roughly 15-20 minutes of real work, small enough to start immediately, substantial enough to feel like real progress. Before choosing it, verify the specific problem you're about to describe is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, say so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe what to do, in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label, not an estimate of how long it will take.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstAction":"one or two warm sentences describing the single best doable-right-now step","tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -1801,16 +1951,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // covers every free-form field the model wrote (overview, proTip,
       // suggestions, firstAction, etc.), not just Companion text.
       const parsed = sanitizeAiText(JSON.parse(match[0]));
-      dlog(`[COMPANION DEBUG 3] parsed.firstAction: ${JSON.stringify(parsed.firstAction)} | typeof: ${typeof parsed.firstAction}`);
+      dlog(`[COMPANION DEBUG 3] parsed.firstActionBatch: ${JSON.stringify(parsed.firstActionBatch)} | isArray: ${Array.isArray(parsed.firstActionBatch)}`);
       lastFailedAnalysisRef.current = null; // this analysisId succeeded - never reuse it, a later reuse would just replay this cached result
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
-      if (parsed.firstAction) {
-        logEvent(getAnalytics(), "first_action_viewed", { analysisId: analysisIdRef.current });
+      // Awaited (unlike the old fire-and-forget savePlanToHistory call) so the
+      // real planId is available for batch_shown/batch_generation_failed below -
+      // currentPlanId itself doesn't reflect the new doc until a re-render,
+      // and every batch event is now planId-correlated (see Analytics.md).
+      const newPlanId = await savePlanToHistory(parsed);
+      const validBatch = Array.isArray(parsed.firstActionBatch) && parsed.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+      if (validBatch) {
+        logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
       } else {
-        logEvent(getAnalytics(), "first_action_failed", { analysisId: analysisIdRef.current, reason: "missing_first_action" });
+        logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
       }
-      savePlanToHistory(parsed);
       setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
       // analysesRemaining is the server's real count (null means Pro/unlimited)
       // - AsyncStorage is now a display cache only, never authoritative.
@@ -2047,21 +2202,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   // A plan counts as an active Companion session worth surfacing on Home if the
   // user has engaged with it beyond just seeing the suggestion. Either they're
-  // mid-loop (a companionAction exists) or they started/finished their first
-  // action. Plans where firstAction was never even started don't count; there's
-  // nothing to "continue" yet. Free plans are saved too now, but companionAction
-  // (action 2+) can only ever be set behind submitCompanionProgressPhoto's own
-  // isPro gate - so this naturally stays scoped to a free user's one free
-  // action, with no separate isPro check needed here.
+  // mid-loop (at least one item in currentBatch has been checked, carried, or
+  // skipped). A freshly generated batch where every item is still "pending"
+  // doesn't count; there's nothing to "continue" yet. Free plans are saved
+  // and get a currentBatch too now, and the continuing-loop boundary (batch 2+)
+  // is still entirely gated behind submitCompanionProgressPhoto's own isPro
+  // check - this naturally stays scoped to a free user's one free batch, with
+  // no separate isPro check needed here.
   // A plan the user already finished is never resumable, regardless of what
-  // companionAction/firstAction still say - companionComplete is never cleared
-  // once set, so without this check a finished project would keep showing the
-  // Home "continue where you left off" banner forever.
+  // currentBatch still says - companionComplete is never cleared once set, so
+  // without this check a finished project would keep showing the Home
+  // "continue where you left off" banner forever.
   const isCompanionResumable = (plan) => {
     if (plan?.companionComplete) return false;
-    if (plan?.companionAction) return true;
-    if (plan?.firstAction && typeof plan.firstAction === "object" && plan.firstAction.status && plan.firstAction.status !== "suggested") return true;
-    return false;
+    const items = plan?.currentBatch?.items;
+    if (!Array.isArray(items) || items.length === 0) return false;
+    return items.some(i => i.status !== "pending");
   };
   const resumablePlan = history.find(isCompanionResumable);
 
@@ -2080,8 +2236,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("suggested"); setCompanionActionText(null); setCompanionActionIndex(1); setCompanionStartedAt(null); setCompanionCompletedAt(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2660,7 +2816,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
   // RESULTS SCREEN
   if (results) {
-    dlog(`[COMPANION DEBUG 5] render gate, companionActionText: ${JSON.stringify(companionActionText)} | would render CompanionCard: ${!!companionActionText}`);
+    dlog(`[COMPANION DEBUG 5] render gate, batchItems: ${batchItems.length} | stage: ${companionStage}`);
     // companionCompletedProject (set the instant the user finishes, this
     // session) takes priority over results.companionComplete (the persisted
     // field, read back on a later resume) since it's always the freshest.
@@ -2729,22 +2885,27 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               <Text style={s.budgetBannerText}>💰 Based on your ${budget} budget. Best Match highlighted below.</Text>
             </View>
           ) : null}
-          {companionActionText && !showCompletedSummary && (
-            <CompanionCard
-              stage={companionStage}
-              actionText={companionActionText}
-              tipIndex={companionTipIndex}
-              actionIndex={companionActionIndex}
-              completionReason={companionCompletionReason}
-              onStart={handleCompanionStart}
-              onComplete={handleCompanionComplete}
-              onSharePhoto={handleCompanionSharePhoto}
-              onFinishedForToday={handleCompanionFinishedForToday}
-              onUpgrade={handleCompanionUpgradeRequest}
-              onChooseFinish={handleCompanionChooseFinish}
-              onChooseContinue={handleCompanionChooseContinue}
-              onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
-            />
+          {batchItems.length > 0 && !showCompletedSummary && (
+            companionStage === "batch-active" ? (
+              <BatchChecklist
+                items={batchItems}
+                batchIndex={companionBatchIndex}
+                onToggleItem={toggleBatchItem}
+                onContinue={handleBatchContinueTapped}
+                onPause={handleBatchPauseTapped}
+              />
+            ) : (
+              <CompanionCard
+                stage={companionStage}
+                tipIndex={companionTipIndex}
+                batchIndex={companionBatchIndex}
+                completionReason={companionCompletionReason}
+                onUpgrade={handleCompanionUpgradeRequest}
+                onChooseFinish={handleCompanionChooseFinish}
+                onChooseContinue={handleCompanionChooseContinue}
+                onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
+              />
+            )
           )}
           {showCompletedSummary && (
             <CompanionCompletedSummary
@@ -2756,13 +2917,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           )}
           <CompanionRevealModal
             visible={companionStage === "reveal"}
-            actionIndex={companionActionIndex}
+            batchIndex={companionBatchIndex}
             beforeUri={companionRevealBefore}
             afterUri={companionRevealAfter}
             visibleChangeText={companionVisibleChange}
             revealReady={companionRevealReady}
+            isPause={batchPauseRef.current}
             onDismiss={handleCompanionRevealContinue}
           />
+          {unresolvedReview && (
+            <UnresolvedItemsReview
+              mode={unresolvedReview.mode}
+              items={unresolvedReview.items}
+              onResolve={handleUnresolvedReviewResolve}
+              onCancel={() => setUnresolvedReview(null)}
+            />
+          )}
           {results.tiers?.map(t => {
             const m = meta(t.id);
             const isSelectedTier = t.id === tier;
@@ -3339,6 +3509,17 @@ const s = StyleSheet.create({
   companionProgressTrack: { height: 4, backgroundColor: BRAND.offWhite, borderRadius: 2, overflow: "hidden" },
   companionProgressFill: { height: 4, backgroundColor: BRAND.green, borderRadius: 2 },
   companionVisibleChangeText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, lineHeight: 20, marginBottom: 16, textAlign: "center" },
+  batchItemRow: { flexDirection: "row", alignItems: "flex-start", paddingVertical: 10 },
+  batchItemCheckbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: BRAND.greenMid, alignItems: "center", justifyContent: "center", marginRight: 12, marginTop: 1 },
+  batchItemCheckboxChecked: { backgroundColor: BRAND.green, borderColor: BRAND.green },
+  batchItemText: { flex: 1, fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.ink, lineHeight: 21 },
+  batchItemTextChecked: { color: BRAND.slate, textDecorationLine: "line-through" },
+  reviewModalBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", alignItems: "center", justifyContent: "center", padding: 24 },
+  reviewModalCard: { width: "100%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20 },
+  reviewItemBlock: { marginTop: 14 },
+  reviewItemText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, marginBottom: 8 },
+  reviewItemBtn: { flex: 1, backgroundColor: BRAND.offWhite, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
+  reviewItemBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink, textAlign: "center" },
   beforeAfterContainer: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
   beforeAfterImage: { position: "absolute", top: 0, left: 0 },
   beforeAfterClip: { position: "absolute", top: 0, left: 0, overflow: "hidden" },
