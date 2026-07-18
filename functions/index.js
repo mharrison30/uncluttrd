@@ -216,9 +216,11 @@ exports.generateNextAction = onCall(
     try {
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
-        // Bumped from 500: every call now also returns a completion judgment,
-        // not just occasionally.
-        max_tokens: 650,
+        // Bumped from 650 (itself bumped from 500 for the completion
+        // judgment): the batch workflow (DecisionLog.md 2026-07-18) returns
+        // a balanced session's worth of items, not one action, so the
+        // response needs comparable headroom to analyzePhoto's own 1500.
+        max_tokens: 1500,
         messages: [
           {
             role: "user",
