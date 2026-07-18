@@ -3359,13 +3359,26 @@ function AppRoot() {
         // hasSeenTutorial: Firestore is the source of truth (DecisionLog.md
         // 2026-07-18 - reverses the earlier "intentionally device-scoped"
         // decision now that reinstalls/new devices for an existing account
-        // are a real scenario), AsyncStorage stays a fast local cache. Only
-        // backfill AsyncStorage when Firestore says true but the local cache
-        // didn't already - never write false here, since OnboardingScreen's
-        // onDone is the only place onboarding is ever actually completed.
-        if (data.hasSeenTutorial === true) {
+        // are a real scenario), AsyncStorage stays a fast local cache.
+        // One-time backfill (DecisionLog.md 2026-07-18): accounts that
+        // existed before hasSeenTutorial was introduced never had the field
+        // written at all, so the field-based check alone would wrongly
+        // treat them as never onboarded. analysisCount/isPro are both
+        // already loaded right here, no extra read - and both are
+        // structurally impossible for a genuinely new user to have at their
+        // very first onAuthStateChanged, since reaching MainApp (where an
+        // analysis or a purchase could happen) requires completing
+        // onboarding first. Known, accepted gap: an existing user who never
+        // ran an analysis and isn't Pro still sees onboarding once more -
+        // narrow and low-stakes enough not to solve.
+        const looksLikeExistingUser = (data.analysisCount || 0) > 0 || data.isPro === true;
+        if (data.hasSeenTutorial === true || looksLikeExistingUser) {
           setSkipPref(true);
           await AsyncStorage.setItem("skipOnboarding", "true");
+          if (data.hasSeenTutorial !== true) {
+            updateDoc(doc(db, "users", u.uid), { hasSeenTutorial: true })
+              .catch(e => console.log("Backfill hasSeenTutorial error:", e.message));
+          }
         }
       } catch (e) {
         console.log("Load analysisCount error:", e.message);
