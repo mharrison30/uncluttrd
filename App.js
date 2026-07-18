@@ -17,7 +17,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, Eye, EyeOff } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, getDocs, query, orderBy, limit, serverTimestamp, arrayUnion } from "firebase/firestore";
@@ -1067,6 +1067,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
+  // Results/Companion screen split (DecisionLog.md 2026-07-18). `results`
+  // truthy still gates "we're viewing a plan at all" - this just selects
+  // which of the two screens to render within that context. Pure view
+  // toggle, no data reload: `results` stays populated switching either way.
+  const [showCompanion, setShowCompanion] = useState(false);
   const [showPaywall, setShowPaywall] = useState(false);
   const [paywallPlan, setPaywallPlan] = useState("yearly");
   // Tags which entry point opened the (single, shared) paywall screen, for the
@@ -2241,6 +2246,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const resumeCompanionSession = (item) => {
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
     setResults(item);
+    setShowCompanion(true);
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
@@ -2253,8 +2259,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2271,13 +2277,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (showHistory) { setShowHistory(false); setShowMenu(true); return true; }
       if (showFaq) { setShowFaq(false); setShowMenu(true); return true; }
       if (showAccount) { setShowAccount(false); setShowMenu(true); return true; }
+      // Checked before the plain `results` branch below - otherwise back
+      // from Companion would skip Results entirely and exit straight to
+      // Home, instead of stepping back one screen like every other back
+      // arrow here does.
+      if (results && showCompanion) { setShowCompanion(false); return true; }
       if (results) { goHome(); return true; }
       return false;
     };
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, results]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, results, showCompanion]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -2618,7 +2629,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(item.spaceType, "What would you like to do?", [
-                  { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
+                  { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(true); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
                   // Gated the same way as the main results-screen share button
                   // (isPro ? "How would you like to share?" : "Upgrade to Pro
                   // for a beautiful branded PDF") - now that free plans are
@@ -2831,27 +2842,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     );
   }
 
-  // RESULTS SCREEN
-  if (results) {
-    dlog(`[COMPANION DEBUG 5] render gate, batchItems: ${batchItems.length} | stage: ${companionStage}`);
-    // companionCompletedProject (set the instant the user finishes, this
-    // session) takes priority over results.companionComplete (the persisted
-    // field, read back on a later resume) since it's always the freshest.
-    // Data being ready is not the same as it being time to show the summary -
-    // the celebratory "project-complete" stage still needs to play first;
-    // the summary only replaces CompanionCard once the user acknowledges it
-    // (companionStage becomes "finished") or the plan is reopened already
-    // complete (the [results] effect sets "finished" directly in that case).
-    const projectCompleteData = companionCompletedProject || results.companionComplete || null;
-    const showCompletedSummary = companionStage === "finished" && !!projectCompleteData;
-    const completedAtValue = projectCompleteData?.completedAt ?? null;
-    const completedReasonValue = projectCompleteData?.reason ?? null;
-    // Prefer the persisted Storage URLs (always correct for a resumed plan);
-    // fall back to the live session's local refs for the instant right after
-    // finishing, before those URLs exist on `results` yet.
-    const lastProgressPhotoUrl = results.progressPhotos?.length ? results.progressPhotos[results.progressPhotos.length - 1].url : null;
-    const completedBeforeUri = results.photoUrl || companionOriginalPhotoRef.current || null;
-    const completedCurrentUri = lastProgressPhotoUrl || companionBasePhotoRef.current || null;
+  // RESULTS SCREEN (photo, visualization, tiers - "inspiration/vision mode",
+  // see DecisionLog.md 2026-07-18 for the split from the Companion screen)
+  if (results && !showCompanion) {
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
@@ -2902,54 +2895,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               <Text style={s.budgetBannerText}>💰 Based on your ${budget} budget. Best Match highlighted below.</Text>
             </View>
           ) : null}
-          {batchItems.length > 0 && !showCompletedSummary && (
-            companionStage === "batch-active" ? (
-              <BatchChecklist
-                items={batchItems}
-                batchIndex={companionBatchIndex}
-                onToggleItem={toggleBatchItem}
-                onContinue={handleBatchContinueTapped}
-                onPause={handleBatchPauseTapped}
-              />
-            ) : (
-              <CompanionCard
-                stage={companionStage}
-                tipIndex={companionTipIndex}
-                batchIndex={companionBatchIndex}
-                completionReason={companionCompletionReason}
-                onUpgrade={handleCompanionUpgradeRequest}
-                onChooseFinish={handleCompanionChooseFinish}
-                onChooseContinue={handleCompanionChooseContinue}
-                onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
-              />
-            )
-          )}
-          {showCompletedSummary && (
-            <CompanionCompletedSummary
-              completedAt={completedAtValue}
-              reason={completedReasonValue}
-              beforeUri={completedBeforeUri}
-              currentUri={completedCurrentUri}
-            />
-          )}
-          <CompanionRevealModal
-            visible={companionStage === "reveal"}
-            batchIndex={companionBatchIndex}
-            beforeUri={companionRevealBefore}
-            afterUri={companionRevealAfter}
-            visibleChangeText={companionVisibleChange}
-            revealReady={companionRevealReady}
-            isPause={batchPauseRef.current}
-            onDismiss={handleCompanionRevealContinue}
-          />
-          {unresolvedReview && (
-            <UnresolvedItemsReview
-              mode={unresolvedReview.mode}
-              items={unresolvedReview.items}
-              onResolve={handleUnresolvedReviewResolve}
-              onCancel={() => setUnresolvedReview(null)}
-            />
-          )}
           {results.tiers?.map(t => {
             const m = meta(t.id);
             const isSelectedTier = t.id === tier;
@@ -3060,9 +3005,110 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               </View>
             </View>
           )}
+          {batchItems.length > 0 && (
+            <TouchableOpacity style={[s.companionBtn, { marginTop: 20 }]} onPress={() => setShowCompanion(true)}>
+              <Text style={s.companionBtnText}>Let's Get Started</Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity style={s.startOverBtn} onPress={reset}>
             <Text style={s.startOverText}>Analyze a New Space</Text>
           </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // COMPANION SCREEN (checklist, batch loop - "execution mode", split from
+  // Results per DecisionLog.md 2026-07-18)
+  if (results && showCompanion) {
+    dlog(`[COMPANION DEBUG 5] render gate, batchItems: ${batchItems.length} | stage: ${companionStage}`);
+    // companionCompletedProject (set the instant the user finishes, this
+    // session) takes priority over results.companionComplete (the persisted
+    // field, read back on a later resume) since it's always the freshest.
+    // Data being ready is not the same as it being time to show the summary -
+    // the celebratory "project-complete" stage still needs to play first;
+    // the summary only replaces CompanionCard once the user acknowledges it
+    // (companionStage becomes "finished") or the plan is reopened already
+    // complete (the [results] effect sets "finished" directly in that case).
+    const projectCompleteData = companionCompletedProject || results.companionComplete || null;
+    const showCompletedSummary = companionStage === "finished" && !!projectCompleteData;
+    const completedAtValue = projectCompleteData?.completedAt ?? null;
+    const completedReasonValue = projectCompleteData?.reason ?? null;
+    // Prefer the persisted Storage URLs (always correct for a resumed plan);
+    // fall back to the live session's local refs for the instant right after
+    // finishing, before those URLs exist on `results` yet.
+    const lastProgressPhotoUrl = results.progressPhotos?.length ? results.progressPhotos[results.progressPhotos.length - 1].url : null;
+    const completedBeforeUri = results.photoUrl || companionOriginalPhotoRef.current || null;
+    const completedCurrentUri = lastProgressPhotoUrl || companionBasePhotoRef.current || null;
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          {/* Back to Results, not Home - standard back arrow, one screen at a
+              time (see the Android BackHandler branch below for hardware back
+              parity). TEMP DEBUG: long-press exports the [COMPANION DEBUG]
+              log via the share sheet - remove with the rest of the debug
+              instrumentation once the bug is found. */}
+          <TouchableOpacity onPress={() => setShowCompanion(false)} onLongPress={debugShareLog} style={{ padding: 8 }} accessibilityLabel="Back to your plan" accessibilityRole="button">
+            <ChevronLeft size={26} color="rgba(255,255,255,0.9)" strokeWidth={2.25} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Plans Remaining`}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
+            <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
+          </TouchableOpacity>
+        </View>
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          {batchItems.length > 0 && !showCompletedSummary && (
+            companionStage === "batch-active" ? (
+              <BatchChecklist
+                items={batchItems}
+                batchIndex={companionBatchIndex}
+                onToggleItem={toggleBatchItem}
+                onContinue={handleBatchContinueTapped}
+                onPause={handleBatchPauseTapped}
+              />
+            ) : (
+              <CompanionCard
+                stage={companionStage}
+                tipIndex={companionTipIndex}
+                batchIndex={companionBatchIndex}
+                completionReason={companionCompletionReason}
+                onUpgrade={handleCompanionUpgradeRequest}
+                onChooseFinish={handleCompanionChooseFinish}
+                onChooseContinue={handleCompanionChooseContinue}
+                onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
+              />
+            )
+          )}
+          {showCompletedSummary && (
+            <CompanionCompletedSummary
+              completedAt={completedAtValue}
+              reason={completedReasonValue}
+              beforeUri={completedBeforeUri}
+              currentUri={completedCurrentUri}
+            />
+          )}
+          <CompanionRevealModal
+            visible={companionStage === "reveal"}
+            batchIndex={companionBatchIndex}
+            beforeUri={companionRevealBefore}
+            afterUri={companionRevealAfter}
+            visibleChangeText={companionVisibleChange}
+            revealReady={companionRevealReady}
+            isPause={batchPauseRef.current}
+            onDismiss={handleCompanionRevealContinue}
+          />
+          {unresolvedReview && (
+            <UnresolvedItemsReview
+              mode={unresolvedReview.mode}
+              items={unresolvedReview.items}
+              onResolve={handleUnresolvedReviewResolve}
+              onCancel={() => setUnresolvedReview(null)}
+            />
+          )}
         </ScrollView>
       </SafeAreaView>
     );
