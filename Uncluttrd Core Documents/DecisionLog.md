@@ -69,6 +69,33 @@ A separate, orthogonal prerequisite surfaced during the same investigation: `clu
 
 ---
 
+### 2026-07-18 — Companion batch workflow: deliberate exception to Principles 1 and 7
+**Decision:** The Companion loop shifts from single-step generation (one action at a time via `generateNextAction`) to session-based batches — `analyzePhoto`/`generateNextAction` return a balanced session's worth of checklist items instead of one action, worked through and resolved together before the next photo-grounded generation. This is an explicit, acknowledged exception to two of `CompanionDesignPrinciples.md`'s principles, not a silent departure:
+
+- **Principle 1** ("show one decision at a time") — a batch surfaces several items at once, not one.
+- **Principle 7** ("avoid checklist/backlog framing" among its explicit "Avoid" examples) — the batch UI is, unavoidably, a checklist.
+
+Per that document's own closing instruction — "if a feature only survives by treating one of these as optional, that's a decision to surface and discuss explicitly, not to route around silently" — this entry is that surfacing. A corresponding amendment note is added directly to `CompanionDesignPrinciples.md`.
+
+**Reason:** Single-step generation breaks down for large projects — a messy basement could represent dozens of distinct sub-tasks, and one-action-per-photo-round-trip is too slow for a real organizing session, while a full upfront plan (all steps generated once) is too rigid and loses the adaptive, photo-grounded accuracy that makes suggestions trustworthy. The batch model keeps the exact same photo-grounded architecture, just chunked to session size instead of a single action — a deliberate identity shift from "one tiny win" toward "one productive session" as the product matures beyond first-action onboarding.
+
+Mitigations that keep this in the spirit of both principles, even while bending their letter:
+- No numeric progress counters ("3 of 5") anywhere in the batch UI — avoids exactly the project-management framing Principle 7 warns against.
+- No AI time/duration estimation of any kind — batches are sized qualitatively ("a balanced session's worth"), never against a promised time bound.
+- An intro framing line ("Let's make a little more progress. Start wherever you'd like — you don't need to finish everything today.") precedes the checklist every time a new batch is shown, carrying the low-pressure tone Principle 1 protects even though the screen itself surfaces multiple items at once.
+- The checklist is never treated as the progress metric — the photo is. Completion is acknowledged with specific, photo-grounded language ("I can see you've cleared the bookshelf and grouped the games"), never a completion count.
+- Items are toggled freely, in any order, with no forced sequencing or per-item start/stop ceremony — closer to "mark what's true against the photo" than "choose your next task from a list," which keeps the interaction itself simpler than a literal to-do app even though the visual surface resembles one.
+
+**Alternatives considered:**
+- Leave single-step generation as-is and address large-project slowness some other way (faster generation, a separate "big project" mode). Rejected — doesn't solve the actual mismatch between real session pace and one-action-per-photo-round-trip; a messy basement genuinely needs several things addressed in one sitting, not one.
+- A full upfront plan, generated once with no re-grounding per session. Rejected — this is exactly the rigidity Companion's photo-grounded architecture exists to avoid; it can't adapt to what a progress photo actually shows.
+
+**Outcome:** Approved as a deliberate, scoped exception — not a redefinition of the principles themselves. `CompanionDesignPrinciples.md` is amended with a corresponding note rather than rewritten, so the North Star Principle and every other principle continue to apply at full strength everywhere else in the product, including everywhere else in Companion. Implementation plan for Session 2 to follow, pending approval.
+
+**Impact:** Architecture, Product/UX, Companion Design Principles
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 

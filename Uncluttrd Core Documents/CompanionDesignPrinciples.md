@@ -53,6 +53,20 @@ The voice is warm, specific, and never anxious. It sounds like someone who has h
 
 ---
 
+## Acknowledged Exceptions
+
+Principles are the default, not an absolute rule with no escape valve — the "How to apply this document" section below requires that any feature overriding one be surfaced explicitly here, not routed around silently. This section is that record.
+
+**Companion batch workflow (July 2026)** — the session-based batch redesign (multiple checklist items generated and shown together, worked through in one session before the next photo-grounded generation) is an acknowledged exception to:
+- **Principle 1** (show one decision at a time) — a batch surfaces several items at once, not one.
+- **Principle 7** (avoid checklist/backlog framing, among its explicit "Avoid" examples) — the batch UI is a checklist by necessity.
+
+Mitigations keeping this in the spirit of both: no numeric progress counters, no AI time/duration estimates, an intro framing line preceding every batch, and the photo — never the checklist — remains the real progress signal. See DecisionLog.md, 2026-07-18, for the full reasoning and alternatives considered.
+
+This exception applies specifically to the batch checklist surface. Every other Companion screen, and every principle not named above, is unaffected.
+
+---
+
 ## How to apply this document
 
 Before building a new Companion feature, or any feature that touches the post-analysis experience, run it against the North Star Principle first, then the seven principles above. If a feature only survives by treating one of these as optional, that's a decision to surface and discuss explicitly — not to route around silently. This is the same discipline Architecture.md's guiding principles already apply to structural decisions; this document is that same kind of filter, scoped to how the product feels rather than how it's built.
