@@ -2409,14 +2409,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // pointing at now-missing images would show broken thumbnails in the list.
   const deletePlan = async (planId) => {
     const uid = user.uid;
+    // TEMP DEBUG (remove once the on-device delete failure is diagnosed):
+    // step is tagged into the dlog line so we know which call actually threw
+    // - console.log alone is invisible on a preview/OTA build with no
+    // attached Metro session, so this uses the same debugLogBuffer/
+    // debugShareLog mechanism (long-press the header logo) as the rest of
+    // the app's on-device debugging.
+    let step = "deleteDoc";
     try {
       await deleteDoc(doc(db, "users", uid, "plans", planId));
 
+      step = "listAll";
       const prefixes = [
         storageRef(storage, `plans/${uid}/${planId}`),
         storageRef(storage, `viz/${uid}/${planId}`),
       ];
       const items = (await Promise.all(prefixes.map(p => listAll(p)))).flatMap(r => r.items);
+
+      step = "deleteObject";
       await Promise.all(items.map(async item => {
         try {
           await deleteObject(item);
@@ -2429,7 +2439,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setHistory(prev => prev.filter(h => h.id !== planId));
       if (currentPlanId === planId) goHome();
     } catch (e) {
-      console.log("Delete plan error:", e.message);
+      dlog(`[PLAN DELETE] step=${step} planId=${planId} code=${e.code} message=${e.message}`);
       Alert.alert("Something went wrong", "Couldn't delete this plan. Please try again.");
     }
   };
