@@ -40,6 +40,19 @@ module.exports = {
       googleServicesFile: IS_PRODUCTION ? "./google-services.json" : "./google-services.staging.json",
       permissions: ["android.permission.CAMERA"],
     },
+    // EAS Update (DecisionLog.md 2026-07-18). Fingerprint policy, not
+    // appVersion - runtimeVersion is derived from the actual resolved
+    // native project (which already differs between staging/production via
+    // APP_ENV above), so an incompatible update is never even offered to a
+    // build, rather than depending on someone remembering to bump `version`.
+    // Channel routing (staging vs production) lives in eas.json per build
+    // profile, not here.
+    updates: {
+      url: "https://u.expo.dev/8574a4f2-a2f9-4cac-82ee-f951d37fbb3a",
+    },
+    runtimeVersion: {
+      policy: "fingerprint",
+    },
     web: {
       favicon: "./assets/favicon.png",
     },

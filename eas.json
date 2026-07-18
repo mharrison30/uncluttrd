@@ -7,12 +7,14 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "channel": "staging",
       "env": {
         "APP_ENV": "staging"
       }
     },
     "preview": {
       "distribution": "internal",
+      "channel": "staging",
       "ios": {
         "autoIncrement": true
       },
@@ -22,6 +24,7 @@
     },
     "production": {
       "autoIncrement": true,
+      "channel": "production",
       "env": {
         "APP_ENV": "production"
       }
