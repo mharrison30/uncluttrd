@@ -845,7 +845,9 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
 
   // Reason capture is a lightweight, optional tap-through (never a text
   // field) - framed as helping the AI plan better next time, never a
-  // scolding. "Skip" with no reason is always available alongside it.
+  // scolding. A no-reason option is always available alongside it, labeled
+  // to avoid repeating "Skip" right after the "Skip it" button that opened
+  // this alert - back to back "Skip" / "Skip" read as broken/redundant.
   const skipItem = (itemId) => {
     Alert.alert(
       "Skip this one?",
@@ -854,7 +856,7 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
         { text: "Not applicable", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "not applicable" } }) },
         { text: "Changed my mind", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "changed my mind" } }) },
         { text: "Too hard", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "too hard" } }) },
-        { text: "Skip", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: null } }) },
+        { text: "No specific reason", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: null } }) },
         { text: "Cancel", style: "cancel" },
       ]
     );
@@ -866,9 +868,16 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
     onResolve(next);
   };
 
+  // Single-item heading is a short question on its own, never the item text
+  // concatenated into the sentence - that was both a punctuation bug (item
+  // text already ends in a period, then a "?" got appended on top) and hard
+  // to read as one long bolded sentence. The item itself renders separately
+  // below, in its own box - see reviewSingleItemBox. The 2+ case already
+  // separates heading from item text (each item lists on its own line), so
+  // it doesn't have either problem and is left as-is.
   let title, subtitle;
   if (single) {
-    title = isPause ? "Anything you'd like me to remember for next time?" : `Still working on: ${items[0].text}?`;
+    title = isPause ? "Anything you'd like me to remember for next time?" : "Still working on this?";
   } else {
     title = isPause ? "Before we wrap up, what should I remember for next time?" : "Looks like these are still unchecked. What should I do with them?";
     subtitle = isPause && items.length <= 2 ? "Anything you'd like me to remember for next time?" : null;
@@ -880,8 +889,16 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
     <Modal visible animationType="fade" transparent onRequestClose={onCancel}>
       <View style={s.reviewModalBackdrop}>
         <View style={s.reviewModalCard}>
-          <Text style={s.companionTitle}>{title}</Text>
+          <TouchableOpacity style={s.reviewModalCloseBtn} onPress={onCancel} accessibilityLabel="Close" accessibilityRole="button">
+            <X size={16} color={BRAND.slate} strokeWidth={2.25} />
+          </TouchableOpacity>
+          <Text style={single ? s.reviewSingleHeading : s.companionTitle}>{title}</Text>
           {subtitle && <Text style={[s.companionBody, { marginBottom: 8 }]}>{subtitle}</Text>}
+          {single && pending[0] && (
+            <View style={s.reviewSingleItemBox}>
+              <Text style={s.reviewSingleItemText}>{pending[0].text}</Text>
+            </View>
+          )}
           {pending.map(item => (
             <View key={item.id} style={s.reviewItemBlock}>
               {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
@@ -3515,7 +3532,11 @@ const s = StyleSheet.create({
   batchItemText: { flex: 1, fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.ink, lineHeight: 21 },
   batchItemTextChecked: { color: BRAND.slate, textDecorationLine: "line-through" },
   reviewModalBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", alignItems: "center", justifyContent: "center", padding: 24 },
-  reviewModalCard: { width: "100%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20 },
+  reviewModalCard: { width: "100%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20, position: "relative" },
+  reviewModalCloseBtn: { position: "absolute", top: 14, right: 14, width: 28, height: 28, borderRadius: 14, backgroundColor: BRAND.offWhite, alignItems: "center", justifyContent: "center", zIndex: 1 },
+  reviewSingleHeading: { fontSize: 16, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 10, paddingRight: 30 },
+  reviewSingleItemBox: { backgroundColor: BRAND.offWhite, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 10, padding: 12, marginBottom: 4 },
+  reviewSingleItemText: { fontSize: 14, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 20 },
   reviewItemBlock: { marginTop: 14 },
   reviewItemText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, marginBottom: 8 },
   reviewItemBtn: { flex: 1, backgroundColor: BRAND.offWhite, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
