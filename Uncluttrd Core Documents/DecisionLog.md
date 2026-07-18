@@ -129,6 +129,23 @@ Mitigations that keep this in the spirit of both principles, even while bending 
 
 ---
 
+### 2026-07-18 — My Plans: whole-plan deletion, no soft-delete
+**Decision:** Users can delete a saved plan from My Plans. Deletion is whole-plan only (Firestore doc + every Storage object under `plans/{uid}/{planId}/` and `viz/{uid}/{planId}/`, deleted permanently) — no per-session/per-batch deletion within a project, no soft-delete/trash/undo. Entry point is a "Delete Plan" (destructive) option added to the existing My Plans row action sheet (alongside "View Full Plan"/"Share as PDF"), behind a second confirm alert. List-only for v1 — no delete affordance on the Results/Companion detail screens.
+
+**Reason:** Free-tier history is uncapped and only ever grows (the 3-plans/month limit caps creation, not retention), and these are photos of people's actual homes — cluttered closets, messy garages — that a user may reasonably want removed once a project is done and organized. Per-session deletion inside an active project (`currentBatch`/`batchHistory`) was considered and rejected for v1: it raises real complexity (does deleting one archived batch orphan a later batch's carried-forward items?) for a use case far rarer than "I'm done with this project entirely." No soft-delete for the same reason — added complexity for a recovery need not yet demonstrated; revisit only if users actually ask for it.
+
+**Storage cleanup is list-based, not doc-based:** `vizImages` on the plan doc is a map of only the 3 *current* tier URLs, but regenerating a visualization never deletes the previous file — every regeneration mints a new timestamped object (App.js `generateVisualization`). Deleting only the 3 URLs on the doc would leave stale regenerations orphaned in Storage, so `deletePlan` lists and deletes everything under the `viz/{uid}/{planId}/` prefix instead of walking the doc's own fields. Same reasoning applies to `plans/{uid}/{planId}/progress/`, which grows via timestamped filenames with no fixed count on the doc.
+
+**Delete order:** Firestore doc first, then Storage. Opposite tradeoff from account deletion's Storage-before-Auth ordering (which exists because Auth deletion ends the session `firestore.rules` needs) — here there's no such constraint, so the order is chosen for user-visible failure safety instead: if Storage cleanup fails partway after the doc is gone, the result is an orphaned-but-harmless Storage object; if the doc were deleted last and *that* failed, the plan would still show in the list pointing at now-missing images (broken thumbnails).
+
+**Rules:** no `firestore.rules` change needed. `users/{userId}/plans/{planId}` already grants `allow read, write` scoped to `auth.uid == userId`, and Firestore's `write` already covers `delete` — confirmed via discovery before implementing, not assumed.
+
+**Known gap, deliberately out of scope:** account deletion's existing Storage cleanup only walks `viz/{uid}/**` and has never cleaned `plans/{uid}/**` — a pre-existing orphaned-Storage gap this feature doesn't fix, since it's bigger scope (whole-account) than plan-level delete requires. Logged as a separate item in `BACKLOG.md`.
+
+**Impact:** Product/UX, Architecture
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 

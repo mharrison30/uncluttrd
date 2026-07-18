@@ -27,6 +27,7 @@ Status: Living document — contract, not a changelog.
 | `referral_source` | Measures which channel (Instagram, Facebook, etc.) a user reports as how they found the app | — | `source` | NO | NO |
 | `room_selected` | Measures which room types users organize most, to prioritize product/content decisions | — | `room` | NO | NO |
 | `budget_selected` | Measures which budget tier users engage with most, to validate pricing/tier design | — | `budget` | NO | NO |
+| `plan_deleted` | Measures how often users delete a saved plan from My Plans | How many saved plans get deleted, and does deletion rate correlate with project completion (a "done, don't need this anymore" signal) vs. early abandonment? | `planId` | YES | NO |
 
 ### Companion — Free Funnel (RETIRED 2026-07-18)
 
