@@ -1212,8 +1212,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // was left, not from scratch.
   useEffect(() => {
     if (!results) return;
+    // TEMP DEBUG (completion-flow investigation, remove once diagnosed).
+    dlog(`[COMPLETION DEBUG] [results] effect entry | planId=${results.id || currentPlanId} | currentBatch.items.length=${results.currentBatch?.items?.length ?? "n/a"} | firstActionBatch isArray=${Array.isArray(results.firstActionBatch)} | companionComplete=${!!results.companionComplete}`);
     setUnresolvedReview(null);
     if (results.currentBatch?.items?.length) {
+      dlog(`[COMPLETION DEBUG] [results] effect branch: currentBatch.items -> stage=batch-active, batchItems=${results.currentBatch.items.length}`);
       setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
       setBatchItems(results.currentBatch.items);
       setCompanionStage("batch-active");
@@ -1222,6 +1225,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // analyze() itself). This is a resumed view, not a freshly generated one.
       logEvent(getAnalytics(), "batch_shown", { planId: currentPlanId, batchIndex: results.currentBatch.batchIndex || 1 });
     } else if (Array.isArray(results.firstActionBatch)) {
+      dlog(`[COMPLETION DEBUG] [results] effect branch: firstActionBatch -> stage=batch-active, items=${results.firstActionBatch.length}`);
       const items = results.firstActionBatch
         .filter(t => typeof t === "string" && t.trim())
         .map(text => ({ id: makeItemId(), text, status: "pending" }));
@@ -1229,6 +1233,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setBatchItems(items);
       setCompanionStage("batch-active");
     } else {
+      dlog(`[COMPLETION DEBUG] [results] effect branch: else -> batchItems=[], companionStage NOT explicitly set here (retains prior in-memory value)`);
       setBatchItems([]);
     }
     // A resumed plan that was already finished should land straight on the
@@ -1236,6 +1241,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // checklist render nothing, and CompanionCompletedSummary (gated on
     // results.companionComplete / companionCompletedProject) takes its place.
     if (results.companionComplete) {
+      dlog(`[COMPLETION DEBUG] [results] effect: companionComplete truthy -> stage=finished`);
       setCompanionStage("finished");
     }
     setCompanionCompletionRecommended(false);
@@ -1325,14 +1331,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   const handleCompanionRevealContinue = () => {
+    // TEMP DEBUG (completion-flow investigation, remove once diagnosed).
+    dlog(`[COMPLETION DEBUG] handleCompanionRevealContinue called | companionCompletionRecommended=${companionCompletionRecommended} | batchItems.length=${batchItems.length} | planId=${currentPlanId}`);
     if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
     // The AI can recommend finishing, never decide it - see
     // CompanionDesignPrinciples.md principle 8. This just routes to the
     // choice; the outcome is entirely up to the two buttons there.
     if (companionCompletionRecommended) {
+      dlog(`[COMPLETION DEBUG] -> stage=completion-choice | batchItems.length=${batchItems.length} (CompanionCard render is gated on batchItems.length > 0 - if this is 0, nothing renders)`);
       logEvent(getAnalytics(), "companion_completion_prompt_viewed", { planId: currentPlanId, batchIndex: companionBatchIndex });
       setCompanionStage("completion-choice");
     } else {
+      dlog(`[COMPLETION DEBUG] -> stage=batch-active`);
       setCompanionStage("batch-active");
     }
   };
@@ -1347,6 +1357,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   };
 
   const handleCompanionChooseFinish = () => {
+    // TEMP DEBUG (completion-flow investigation, remove once diagnosed).
+    dlog(`[COMPLETION DEBUG] handleCompanionChooseFinish called | planId=${currentPlanId} | batchIndex=${companionBatchIndex}`);
     // Local timestamp for the immediate UI - CompanionCompletedSummary can
     // render right away without waiting on the serverTimestamp() write below
     // to round-trip back into `results`.
@@ -1359,7 +1371,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         companionComplete: { completedAt: serverTimestamp(), reason: companionCompletionReason },
-      }).catch(e => console.log("Save companion complete error:", e.message));
+      }).then(() => {
+        dlog(`[COMPLETION DEBUG] companionComplete write succeeded | planId=${currentPlanId}`);
+      }).catch(e => {
+        dlog(`[COMPLETION DEBUG] companionComplete write FAILED | planId=${currentPlanId} | code=${e.code} | message=${e.message}`);
+      });
+    } else {
+      dlog(`[COMPLETION DEBUG] currentPlanId falsy, companionComplete write SKIPPED entirely`);
     }
   };
 
@@ -2668,7 +2686,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(item.spaceType, "What would you like to do?", [
-                  { text: "View Full Plan", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(true); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
+                  { text: "View Full Plan", onPress: () => { dlog(`[COMPLETION DEBUG] View Full Plan tapped | planId=${item.id} | currentBatch.items.length=${item.currentBatch?.items?.length ?? "n/a"} | companionComplete=${!!item.companionComplete} | isCompanionResumable=${isCompanionResumable(item)}`); console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(true); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
                   // Gated the same way as the main results-screen share button
                   // (isPro ? "How would you like to share?" : "Upgrade to Pro
                   // for a beautiful branded PDF") - now that free plans are
