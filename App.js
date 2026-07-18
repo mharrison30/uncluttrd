@@ -890,25 +890,30 @@ function UnresolvedItemsReview({ items, onResolve, onCancel }) {
           <TouchableOpacity style={s.reviewModalCloseBtn} onPress={onCancel} accessibilityLabel="Close" accessibilityRole="button">
             <X size={16} color={BRAND.slate} strokeWidth={2.25} />
           </TouchableOpacity>
+          {/* Title and the "keep all" shortcut stay pinned outside the scroll
+              area - only the item list itself scrolls, so both remain
+              reachable regardless of how many unresolved items there are. */}
           <Text style={single ? s.reviewSingleHeading : s.companionTitle}>{title}</Text>
-          {single && pending[0] && (
-            <View style={s.reviewSingleItemBox}>
-              <Text style={s.reviewSingleItemText}>{pending[0].text}</Text>
-            </View>
-          )}
-          {pending.map(item => (
-            <View key={item.id} style={s.reviewItemBlock}>
-              {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
-              <View style={{ flexDirection: "row", gap: 10 }}>
-                <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
-                  <Text style={s.reviewItemBtnText}>Keep it for next time</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={s.reviewItemBtn} onPress={() => skipItem(item.id)}>
-                  <Text style={s.reviewItemBtnText}>Skip it</Text>
-                </TouchableOpacity>
+          <ScrollView style={s.reviewModalScroll} showsVerticalScrollIndicator={false}>
+            {single && pending[0] && (
+              <View style={s.reviewSingleItemBox}>
+                <Text style={s.reviewSingleItemText}>{pending[0].text}</Text>
               </View>
-            </View>
-          ))}
+            )}
+            {pending.map(item => (
+              <View key={item.id} style={s.reviewItemBlock}>
+                {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                  <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
+                    <Text style={s.reviewItemBtnText}>Keep it for next time</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.reviewItemBtn} onPress={() => skipItem(item.id)}>
+                    <Text style={s.reviewItemBtnText}>Skip it</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))}
+          </ScrollView>
           {!single && pending.length > 1 && (
             <TouchableOpacity style={[s.companionSecondaryBtn, { marginTop: 6 }]} onPress={keepAllForNextTime}>
               <Text style={s.companionSecondaryBtnText}>Keep all of these for next time</Text>
@@ -3599,7 +3604,8 @@ const s = StyleSheet.create({
   batchItemText: { flex: 1, fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.ink, lineHeight: 21 },
   batchItemTextChecked: { color: BRAND.slate, textDecorationLine: "line-through" },
   reviewModalBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", alignItems: "center", justifyContent: "center", padding: 24 },
-  reviewModalCard: { width: "100%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20, position: "relative" },
+  reviewModalCard: { width: "100%", maxHeight: "80%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20, position: "relative" },
+  reviewModalScroll: { flexShrink: 1 },
   reviewModalCloseBtn: { position: "absolute", top: 14, right: 14, width: 28, height: 28, borderRadius: 14, backgroundColor: BRAND.offWhite, alignItems: "center", justifyContent: "center", zIndex: 1 },
   reviewSingleHeading: { fontSize: 16, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 10, paddingRight: 30 },
   reviewSingleItemBox: { backgroundColor: BRAND.offWhite, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 10, padding: 12, marginBottom: 4 },
