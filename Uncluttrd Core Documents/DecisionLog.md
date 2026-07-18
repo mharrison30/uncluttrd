@@ -96,6 +96,13 @@ Mitigations that keep this in the spirit of both principles, even while bending 
 
 ---
 
+### 2026-07-18 — Onboarding-completion (`hasSeenTutorial`) becomes account-scoped, not device-scoped
+**Decision:** `hasSeenTutorial` moves to the Firestore `users/{uid}` doc as the source of truth (checked in `onAuthStateChanged`, alongside `isPro`/`analysisCount`), with the existing `AsyncStorage` flag kept as a fast local cache only, backfilled from Firestore when they disagree. This reverses the earlier design decision that `skipOnboarding` should be "intentionally device-scoped, not account-scoped" — a reinstall or new device for an existing account is now a real, tested scenario (surfaced by build-10/11 staging testing), and showing the full tutorial again to an established Pro user reads as broken, not as a fresh-install courtesy.
+
+**Impact:** Architecture, Product/UX
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 
