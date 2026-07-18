@@ -1008,8 +1008,11 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
         </View>
       )}
       <BeforeAfterInspector visible={!!inspectTab} beforeUri={beforeUri} afterUri={currentUri} initialTab={inspectTab} onClose={() => setInspectTab(null)} />
+      {/* explosionSpeed/fallSpeed doubled from the library's defaults
+          (350/3000) - the default reads as a quick flash rather than a
+          celebration moment worth lingering on. */}
       {justCompletedThisSession && (
-        <ConfettiCannon count={100} origin={{ x: Dimensions.get("window").width / 2, y: 0 }} fadeOut autoStart />
+        <ConfettiCannon count={100} origin={{ x: Dimensions.get("window").width / 2, y: 0 }} explosionSpeed={700} fallSpeed={6000} fadeOut autoStart />
       )}
     </View>
   );
