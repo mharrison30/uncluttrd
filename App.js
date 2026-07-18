@@ -3356,6 +3356,17 @@ function AppRoot() {
         const effectiveCount = data.analysisCountMonth === currentMonth ? (data.analysisCount || 0) : 0;
         setAnalyses(effectiveCount);
         await AsyncStorage.setItem("analysisCount", effectiveCount.toString());
+        // hasSeenTutorial: Firestore is the source of truth (DecisionLog.md
+        // 2026-07-18 - reverses the earlier "intentionally device-scoped"
+        // decision now that reinstalls/new devices for an existing account
+        // are a real scenario), AsyncStorage stays a fast local cache. Only
+        // backfill AsyncStorage when Firestore says true but the local cache
+        // didn't already - never write false here, since OnboardingScreen's
+        // onDone is the only place onboarding is ever actually completed.
+        if (data.hasSeenTutorial === true) {
+          setSkipPref(true);
+          await AsyncStorage.setItem("skipOnboarding", "true");
+        }
       } catch (e) {
         console.log("Load analysisCount error:", e.message);
       }
@@ -3412,9 +3423,14 @@ function AppRoot() {
       if (skip) {
         setSkipPref(true);
         await AsyncStorage.setItem("skipOnboarding", "true");
+        // Firestore is the source of truth (DecisionLog.md 2026-07-18) so
+        // this syncs to other devices/reinstalls - AsyncStorage above is
+        // just the fast local cache for this device's next launch.
+        updateDoc(doc(db, "users", user.uid), { hasSeenTutorial: true })
+          .catch(e => console.log("Save hasSeenTutorial error:", e.message));
       }
       setShowOnboard(false);
-    }} onSkip={() => setShowOnboard(false)} />;
+    }} />;
   }
 
   // Logged in and onboarding done, show main app
