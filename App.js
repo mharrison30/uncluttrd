@@ -2696,6 +2696,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                     <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{item.spaceType}</Text>
                     <Text style={[s.historyDate, { flexShrink: 0 }]}>{item.date}</Text>
                   </View>
+                  {item.companionComplete && (
+                    <View style={s.historyCompleteBadge}>
+                      <Text style={s.historyCompleteBadgeText}>Completed</Text>
+                    </View>
+                  )}
                   <Text style={s.historyOverview} numberOfLines={2}>{item.overview}</Text>
                 </View>
               </TouchableOpacity>
@@ -3731,6 +3736,8 @@ const s = StyleSheet.create({
   historySpace: { fontSize: 14, fontFamily: "Inter_700Bold", color: BRAND.ink },
   historyDate: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
   historyOverview: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 18 },
+  historyCompleteBadge: { backgroundColor: BRAND.greenLight, borderRadius: 20, paddingHorizontal: 8, paddingVertical: 3, alignSelf: "flex-start", marginBottom: 4 },
+  historyCompleteBadgeText: { fontSize: 10, fontFamily: "Inter_700Bold", color: BRAND.green, letterSpacing: 0.3 },
   paywallHeader: { alignItems: "center", paddingTop: 20, paddingBottom: 24 },
   paywallIcon: { fontSize: 48, marginBottom: 12 },
   paywallTitle: { fontSize: 30, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8, textAlign: "center" },
