@@ -1131,7 +1131,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     } else {
       logEvent(getAnalytics(), "companion_action_started", { planId: currentPlanId, actionIndex: companionActionIndex });
     }
-    if (isPro && currentPlanId) {
+    if (currentPlanId) {
       const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         [`${field}.status`]: "started",
@@ -1150,7 +1150,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     } else {
       logEvent(getAnalytics(), "companion_action_completed", { planId: currentPlanId, actionIndex: companionActionIndex, secondsSinceStarted: secondsSince(companionStartedAt) });
     }
-    if (isPro && currentPlanId) {
+    if (currentPlanId) {
       const field = companionActionIndex === 1 ? "firstAction" : "companionAction";
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         [`${field}.status`]: "completed",
@@ -1193,7 +1193,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionCompletedProject({ completedAt: new Date().toISOString(), reason: companionCompletionReason });
     logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, actionIndex: companionActionIndex });
     setCompanionStage("project-complete");
-    if (isPro && currentPlanId) {
+    if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         companionComplete: { completedAt: serverTimestamp(), reason: companionCompletionReason },
       }).catch(e => console.log("Save companion complete error:", e.message));
