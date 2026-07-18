@@ -12,11 +12,13 @@ service cloud.firestore {
         && !('analysisCountMonth' in request.resource.data);
 
       // Client updates may only ever touch isPro (temporary, pending the
-      // RevenueCat-webhook migration in BACKLOG.md) - this alone guarantees
-      // analysisCount/analysisCountMonth can't be touched by any client write,
-      // no separate equality check needed.
+      // RevenueCat-webhook migration in BACKLOG.md) or hasSeenTutorial
+      // (DecisionLog.md 2026-07-18 - Firestore is now the source of truth
+      // for onboarding-completion, AsyncStorage is just a local cache) -
+      // this alone guarantees analysisCount/analysisCountMonth can't be
+      // touched by any client write, no separate equality check needed.
       allow update: if request.auth != null && request.auth.uid == userId
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPro']);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPro', 'hasSeenTutorial']);
 
       // NOT tightened per the flagged conflict: blocking delete here would
       // break the existing client-side account deletion flow (deleteDoc while
