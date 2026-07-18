@@ -116,6 +116,19 @@ Mitigations that keep this in the spirit of both principles, even while bending 
 
 ---
 
+### 2026-07-18 — Pause reversed to a single-tap action, no photo/review required
+**Decision:** "That's enough for today" (Pause) no longer requires a progress photo or the unresolved-items review. It's now a single tap: log `batch_session_paused`, write the current checklist's checked/unchecked state to `currentBatch.items` (nothing else — no `generateNextAction` call, no batch archival, no new batch generated), then navigate straight to Home. This reverses the original batch-workflow design (DecisionLog.md 2026-07-18, "Companion batch workflow" entry above), where Pause went through the same review-then-photo-then-generate flow as Continue, just with different framing copy.
+
+**Reason:** Both entry points back into an existing plan (the Home resume banner and My Plans) already route directly to the Companion screen, showing whatever is currently persisted in `currentBatch.items`. Continue already carries the review and a required photo, which is what actually grounds the *next* session against a real photo. Requiring the same grounding at the moment the user is *leaving* was solving a problem Continue already solves when they come back — the checklist state itself is what needs to survive a pause, and a single lightweight `updateDoc` accomplishes that without asking for a photo the user has no reason to take right when they're stepping away. Nothing is lost; the session-grounding photo simply happens on return (via Continue) rather than preemptively on exit.
+
+**Verified before implementing, not assumed:** confirmed `toggleBatchItem` was purely local React state with no Firestore write at all - meaning a literal "zero writes" Pause would have actually lost mid-session checkbox progress, contradicting the "nothing is lost" reasoning above. The single `currentBatch.items` write closes that gap; without it the claim wouldn't have held.
+
+**Cleanup:** the `isPause`/`batchPauseRef` plumbing threaded through `submitCompanionProgressPhoto`, `CompanionRevealModal`, `handleCompanionRevealContinue`, `openBatchPhotoSheet`, and the photo-capture functions was removed rather than left in place unreachable - Pause no longer calls any of that code, so keeping the parameter/branches around would have been dead code, not generality. `UnresolvedItemsReview` similarly dropped its `mode` prop and pause-specific copy branches, since only Continue opens it now.
+
+**Impact:** Product/UX, Architecture
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 
