@@ -826,14 +826,18 @@ function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause }
 // more than one screen listing them together. Continue and Pause share this
 // exact component and mechanics; only the framing copy differs, matching the
 // "plan my next session" vs. "remember where I left off" mental model.
-function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
+// Pause ("that's enough for today") no longer goes through this review at
+// all - it's a single-tap action straight to Home (DecisionLog.md
+// 2026-07-18). Only Continue reaches this component now, so the earlier
+// pause-vs-continue copy branching (mode prop) was removed rather than left
+// as dead code with only one path ever actually taken.
+function UnresolvedItemsReview({ items, onResolve, onCancel }) {
   // itemId -> { action, reason } as each item gets resolved. Once every item
   // has an entry, onResolve fires automatically with the complete map -
   // resolving one item at a time, not one combined submit button, since a
   // partially-filled-out combined screen shouldn't need a separate confirm
   // step once nothing is left ambiguous.
   const [resolved, setResolved] = useState({});
-  const isPause = mode === "pause";
   const single = items.length === 1;
 
   const finalizeIfComplete = (next) => {
@@ -875,13 +879,7 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
   // below, in its own box - see reviewSingleItemBox. The 2+ case already
   // separates heading from item text (each item lists on its own line), so
   // it doesn't have either problem and is left as-is.
-  let title, subtitle;
-  if (single) {
-    title = isPause ? "Anything you'd like me to remember for next time?" : "Still working on this?";
-  } else {
-    title = isPause ? "Before we wrap up, what should I remember for next time?" : "Looks like these are still unchecked. What should I do with them?";
-    subtitle = isPause && items.length <= 2 ? "Anything you'd like me to remember for next time?" : null;
-  }
+  const title = single ? "Still working on this?" : "Looks like these are still unchecked. What should I do with them?";
 
   const pending = items.filter(item => !resolved[item.id]);
 
@@ -893,7 +891,6 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
             <X size={16} color={BRAND.slate} strokeWidth={2.25} />
           </TouchableOpacity>
           <Text style={single ? s.reviewSingleHeading : s.companionTitle}>{title}</Text>
-          {subtitle && <Text style={[s.companionBody, { marginBottom: 8 }]}>{subtitle}</Text>}
           {single && pending[0] && (
             <View style={s.reviewSingleItemBox}>
               <Text style={s.reviewSingleItemText}>{pending[0].text}</Text>
@@ -904,7 +901,7 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
               {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
               <View style={{ flexDirection: "row", gap: 10 }}>
                 <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
-                  <Text style={s.reviewItemBtnText}>{isPause ? "Still working on it" : "Keep it for next time"}</Text>
+                  <Text style={s.reviewItemBtnText}>Keep it for next time</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={s.reviewItemBtn} onPress={() => skipItem(item.id)}>
                   <Text style={s.reviewItemBtnText}>Skip it</Text>
@@ -930,7 +927,7 @@ function UnresolvedItemsReview({ mode, items, onResolve, onCancel }) {
 // how much room it gets. onDismiss is used by both the close affordance and
 // the continue button - closing and continuing are the same transition here,
 // there's nothing to "cancel back" to once the progress photo is already in.
-function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibleChangeText, revealReady, isPause, onDismiss }) {
+function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibleChangeText, revealReady, onDismiss }) {
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onDismiss}>
       <SafeAreaView style={s.revealModalSafe}>
@@ -950,7 +947,7 @@ function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibl
           <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
           {revealReady ? (
             <TouchableOpacity style={s.companionBtn} onPress={onDismiss}>
-              <Text style={s.companionBtnText}>{isPause ? "Finished for today" : "Ready to keep going?"}</Text>
+              <Text style={s.companionBtnText}>Ready to keep going?</Text>
             </TouchableOpacity>
           ) : (
             <View style={{ height: 51 }} />
@@ -1084,6 +1081,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   const [purchaseInProgress, setPurchaseInProgress] = useState(false); // tap-guard: a slow native Apple ID prompt shouldn't read as "nothing happened, tap again"
   const [selectedRoom, setSelectedRoom] = useState(null);
   const resultsScrollRef = useRef(null);
+  const companionScrollRef = useRef(null);
   const [loadMsg, setLoadMsg] = useState(0);
   const loadTimer = useRef(null);
 
@@ -1155,14 +1153,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   }, [batchItems]);
   const [companionBatchIndex, setCompanionBatchIndex] = useState(1); // 1 = first batch, 2+ = later batches
   const [progressPhoto, setProgressPhoto] = useState(null);
-  // Distinguishes a Pause-triggered photo submission from a Continue-triggered
-  // one, consulted once generation succeeds (batch_session_paused, and
-  // reveal's continue button routes to "finished" instead of the new batch).
-  // A ref, not state, since it's read synchronously inside a callback set up
-  // moments earlier in the same interaction, not across a render.
-  const batchPauseRef = useRef(false);
   // Holds the unresolved-items review's data while it's showing: null when
-  // hidden, otherwise { mode: "continue" | "pause", items: [...unchecked] }.
+  // hidden, otherwise { items: [...unchecked] }. Only Continue ever opens
+  // this now - Pause is a single-tap action straight to Home, no review
+  // (DecisionLog.md 2026-07-18).
   const [unresolvedReview, setUnresolvedReview] = useState(null);
   const [companionTipIndex, setCompanionTipIndex] = useState(0);
   const companionTipTimer = useRef(null);
@@ -1213,7 +1207,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   useEffect(() => {
     if (!results) return;
     setUnresolvedReview(null);
-    batchPauseRef.current = false;
     if (results.currentBatch?.items?.length) {
       setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
       setBatchItems(results.currentBatch.items);
@@ -1270,40 +1263,47 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }));
   };
 
-  const openBatchPhotoSheet = (isPause) => {
+  const openBatchPhotoSheet = () => {
     Alert.alert(
-      isPause ? "Show me where things stand" : "Show me what you got done",
+      "Show me what you got done",
       "How would you like to share your progress?",
       [
-        { text: "Take Photo", onPress: () => captureCompanionPhoto(isPause) },
-        { text: "Choose from Camera Roll", onPress: () => pickCompanionPhoto(isPause) },
+        { text: "Take Photo", onPress: () => captureCompanionPhoto() },
+        { text: "Choose from Camera Roll", onPress: () => pickCompanionPhoto() },
         { text: "Cancel", style: "cancel" },
       ]
     );
   };
 
-  // Shared entry point for both Continue and Pause - same mechanics, only the
-  // mode (used purely for copy in the review, see UnresolvedItemsReview)
-  // differs. Pause skips the review entirely when everything is checked.
-  const openUnresolvedReviewOrPhoto = (mode) => {
+  const handleBatchContinueTapped = () => {
     const unchecked = batchItems.filter(i => i.status !== "checked");
-    if (mode === "continue") {
-      logEvent(getAnalytics(), "batch_continue_tapped", { planId: currentPlanId, batchIndex: companionBatchIndex, checkedCount: batchItems.length - unchecked.length, uncheckedCount: unchecked.length });
-    }
+    logEvent(getAnalytics(), "batch_continue_tapped", { planId: currentPlanId, batchIndex: companionBatchIndex, checkedCount: batchItems.length - unchecked.length, uncheckedCount: unchecked.length });
     if (unchecked.length === 0) {
-      openBatchPhotoSheet(mode === "pause");
+      openBatchPhotoSheet();
       return;
     }
     logEvent(getAnalytics(), "batch_item_skip_popup_shown", { planId: currentPlanId, batchIndex: companionBatchIndex, uncheckedCount: unchecked.length });
-    setUnresolvedReview({ mode, items: unchecked });
+    setUnresolvedReview({ items: unchecked });
   };
 
-  const handleBatchContinueTapped = () => openUnresolvedReviewOrPhoto("continue");
-  const handleBatchPauseTapped = () => openUnresolvedReviewOrPhoto("pause");
+  // Single-tap action straight to Home - no review, no required photo, no
+  // generateNextAction call (DecisionLog.md 2026-07-18, reversing the
+  // earlier photo-required design). The one thing it does write is the
+  // current checkbox state itself - reopening the plan later (Home banner
+  // and My Plans both route straight to Companion) shows checkboxes exactly
+  // where they were left, without needing a full session-grounding call at
+  // the moment the user walks away instead of when they actually come back.
+  const handleBatchPauseTapped = () => {
+    logEvent(getAnalytics(), "batch_session_paused", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    if (currentPlanId) {
+      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": batchItems })
+        .catch(e => console.log("Save paused batch state error:", e.message));
+    }
+    goHome();
+  };
 
   // resolutions: { [itemId]: { action: "carried" | "skipped", reason?: string } }
   const handleUnresolvedReviewResolve = (resolutions) => {
-    const mode = unresolvedReview?.mode || "continue";
     setBatchItems(prev => prev.map(item => {
       const resolution = resolutions[item.id];
       if (!resolution) return item;
@@ -1315,7 +1315,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       return { ...item, status: "skipped", skipReason: resolution.reason || null };
     }));
     setUnresolvedReview(null);
-    openBatchPhotoSheet(mode === "pause");
+    openBatchPhotoSheet();
   };
 
   const handleCompanionRevealContinue = () => {
@@ -1326,14 +1326,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     if (companionCompletionRecommended) {
       logEvent(getAnalytics(), "companion_completion_prompt_viewed", { planId: currentPlanId, batchIndex: companionBatchIndex });
       setCompanionStage("completion-choice");
-    } else if (batchPauseRef.current) {
-      // Paused: the new batch is already generated and saved, waiting for
-      // whenever the user actually resumes - see isCompanionResumable.
-      setCompanionStage("finished");
     } else {
       setCompanionStage("batch-active");
     }
-    batchPauseRef.current = false;
   };
 
   const handleCompanionChooseContinue = () => {
@@ -1378,18 +1373,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setShowPaywall(true);
   };
 
-  const submitCompanionProgressPhoto = async (progressUri, progressBase64, planIdOverride = null, isPause = false) => {
+  const submitCompanionProgressPhoto = async (progressUri, progressBase64, planIdOverride = null) => {
     // planIdOverride lets the isPro-mid-session effect re-invoke this exact
     // function once a plan has just been retroactively saved, before
     // currentPlanId state has actually re-rendered with the new value.
     const effectivePlanId = planIdOverride || currentPlanId;
-    dlog(`[PHOTO DEBUG] submitCompanionProgressPhoto called | batchIndex=${companionBatchIndex} | isPause=${isPause} | progressUri=${progressUri} | progressBase64Len=${progressBase64?.length ?? "null"} | companionBasePhotoRef.current=${companionBasePhotoRef.current} | t=${Date.now()}`);
+    dlog(`[PHOTO DEBUG] submitCompanionProgressPhoto called | batchIndex=${companionBatchIndex} | progressUri=${progressUri} | progressBase64Len=${progressBase64?.length ?? "null"} | companionBasePhotoRef.current=${companionBasePhotoRef.current} | t=${Date.now()}`);
     // Restored on any failure below - the stage is only ever allowed to move
     // forward (into "generating" and then "reveal") after a valid server
     // response. Never a hardcoded fallback destination.
     const stageBeforeSubmit = companionStage;
     setProgressPhoto({ uri: progressUri, base64: progressBase64 });
-    batchPauseRef.current = isPause;
     if (!isPro) {
       setCompanionStage("paywall-prompt");
       logEvent(getAnalytics(), "companion_paywall_viewed", { planId: effectivePlanId });
@@ -1519,9 +1513,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
 
       logEvent(getAnalytics(), "batch_photo_submitted", { planId: effectivePlanId, batchIndex: companionBatchIndex, checkedCount: checkedItems.length, carriedCount: carriedItems.length, skippedCount: skippedItems.length });
-      if (isPause) {
-        logEvent(getAnalytics(), "batch_session_paused", { planId: effectivePlanId, batchIndex: companionBatchIndex });
-      }
       if (newBatchIndex === 2) {
         // Pro north star (replaces companion_session_started - see
         // DecisionLog.md 2026-07-18): measures engagement into a second
@@ -1558,14 +1549,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // after a valid server response. Revert to wherever the user actually
       // was, so the button that got them here is still there and tappable.
       setCompanionStage(stageBeforeSubmit);
-      batchPauseRef.current = false;
       Alert.alert("Something went wrong", "We couldn't review your progress. Please try again.");
     } finally {
       stopCompanionTips();
     }
   };
 
-  const captureCompanionPhoto = async (isPause = false) => {
+  const captureCompanionPhoto = async () => {
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== "granted") {
@@ -1575,14 +1565,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const result = await ImagePicker.launchCameraAsync({ allowsEditing: true, quality: 0.2, base64: true });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];
-        submitCompanionProgressPhoto(a.uri, a.base64, null, isPause);
+        submitCompanionProgressPhoto(a.uri, a.base64);
       }
     } catch (e) {
       Alert.alert("Could not open camera", "Please try again.");
     }
   };
 
-  const pickCompanionPhoto = async (isPause = false) => {
+  const pickCompanionPhoto = async () => {
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== "granted") {
@@ -1592,7 +1582,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], allowsEditing: true, quality: 0.2, base64: true });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];
-        submitCompanionProgressPhoto(a.uri, a.base64, null, isPause);
+        submitCompanionProgressPhoto(a.uri, a.base64);
       }
     } catch (e) {
       Alert.alert("We couldn't open your photos", "Please try again.");
@@ -1765,12 +1755,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // paywall-prompt specifically means a progress photo was already
       // submitted while free and the AI call was skipped - now that isPro is
       // true, actually run the deferred generation instead of just
-      // correcting the stage cosmetically. batchPauseRef.current still holds
-      // whatever it was set to by that original attempt (a ref, so it
-      // survives across this render), which is why it's read directly here
-      // rather than re-derived.
+      // correcting the stage cosmetically.
       if (isPaywallContinuation) {
-        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, planId, batchPauseRef.current);
+        submitCompanionProgressPhoto(progressPhoto.uri, progressPhoto.base64, planId);
       }
     })();
   }, [isPro]);
@@ -2259,8 +2246,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); batchPauseRef.current = false; setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -3006,7 +2993,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             </View>
           )}
           {batchItems.length > 0 && (
-            <TouchableOpacity style={[s.companionBtn, { marginTop: 20 }]} onPress={() => setShowCompanion(true)}>
+            <TouchableOpacity style={[s.companionBtn, { marginTop: 20 }]} onPress={() => {
+              setShowCompanion(true);
+              // Companion's ScrollView doesn't exist yet at the moment of this
+              // tap (it mounts fresh once showCompanion flips) - same deferred
+              // pattern already used for analyze()'s scroll-to-top via
+              // resultsScrollRef, not a workaround unique to this button.
+              setTimeout(() => companionScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+            }}>
               <Text style={s.companionBtnText}>Let's Get Started</Text>
             </TouchableOpacity>
           )}
@@ -3060,7 +3054,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
           {batchItems.length > 0 && !showCompletedSummary && (
             companionStage === "batch-active" ? (
               <BatchChecklist
@@ -3098,12 +3092,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             afterUri={companionRevealAfter}
             visibleChangeText={companionVisibleChange}
             revealReady={companionRevealReady}
-            isPause={batchPauseRef.current}
             onDismiss={handleCompanionRevealContinue}
           />
           {unresolvedReview && (
             <UnresolvedItemsReview
-              mode={unresolvedReview.mode}
               items={unresolvedReview.items}
               onResolve={handleUnresolvedReviewResolve}
               onCancel={() => setUnresolvedReview(null)}
