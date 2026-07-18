@@ -789,7 +789,7 @@ function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause }
     <View style={s.companionCard}>
       <CompanionProgressBar batchIndex={batchIndex} />
       <Text style={s.companionTitle}>Let's Work On These</Text>
-      <Text style={s.companionBody}>[OTA TEST] Welcome back! Pick up wherever feels right - no need to finish it all today.</Text>
+      <Text style={s.companionBody}>Let's make a little more progress. Start wherever you'd like - you don't need to finish everything today.</Text>
       <View style={{ marginTop: 4, marginBottom: 4 }}>
         {items.map(item => {
           const checked = item.status === "checked";
