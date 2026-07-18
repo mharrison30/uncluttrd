@@ -3138,15 +3138,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           </TouchableOpacity>
         </View>
         <ScrollView ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
-          {batchItems.length > 0 && !showCompletedSummary && (
+          {!showCompletedSummary && (
             companionStage === "batch-active" ? (
-              <BatchChecklist
-                items={batchItems}
-                batchIndex={companionBatchIndex}
-                onToggleItem={toggleBatchItem}
-                onContinue={handleBatchContinueTapped}
-                onPause={handleBatchPauseTapped}
-              />
+              // Only the checklist stage genuinely needs items to render -
+              // every other stage (generating/paywall-prompt/completion-choice/
+              // project-complete) is driven by companionStage alone.
+              // completion-choice in particular can legitimately be reached
+              // with an empty batchItems: the AI returning no next-batch items
+              // is itself the completion signal, not an error state - gating
+              // CompanionCard on batchItems.length here silently dropped that
+              // stage's UI (and with it, the only path to
+              // handleCompanionChooseFinish) whenever that happened.
+              batchItems.length > 0 && (
+                <BatchChecklist
+                  items={batchItems}
+                  batchIndex={companionBatchIndex}
+                  onToggleItem={toggleBatchItem}
+                  onContinue={handleBatchContinueTapped}
+                  onPause={handleBatchPauseTapped}
+                />
+              )
             ) : (
               <CompanionCard
                 stage={companionStage}
