@@ -191,6 +191,17 @@ Firebase Admin SDK
 
 ---
 
+### 🟡 analyzePhoto grounding accuracy - initial suggestions referencing items not actually present
+**Context:** Reported Jul 2026: a user took a fresh photo of a counter they'd already mostly cleared, and the initial `firstActionBatch`/tier suggestions referenced items that weren't actually visible/present in that photo. Distinct from the skip-accumulation bug above - this is (allegedly) a fresh `analyzePhoto` call, not a `generateNextAction` comparison call, so it's a single-photo grounding accuracy issue, not a photo-comparison or exclusion-list issue.
+
+**Checked, not yet fixed:** the `analyzePhoto` prompt (built client-side in App.js's `analyze()`) already has grounding language for `firstActionBatch` - "Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo." So this isn't a total-absence-of-grounding gap like the skip issue was - if the AI still hallucinated past that instruction, the fix (if any) is less obvious and needs a real repro to diagnose properly (the actual photo + actual raw response), not a guess at stronger wording.
+
+**Also unconfirmed:** whether this was genuinely a fresh `analyzePhoto` call at all, versus something else (e.g. a resumed session or a `generateNextAction` round mischaracterized). No debug logging currently distinguishes "which call path produced this specific response" after the fact - would need to be reproduced with logging in place to know for sure.
+
+**Action:** Needs a dedicated investigation session with a live repro (not fixable from code review alone) - capture the actual photo, the actual prompt sent, and the actual raw AI response via debug logging, to confirm both which call path it was and whether it's a real grounding failure vs. something else entirely.
+
+---
+
 ### 🟡 Analysis Prompt Optimization
 **Context:** Claude is currently generating `searchQuery` and `icon` fields for every product recommendation. These fields will eventually be handled by the Commerce Service, not the AI. Every extra field costs tokens and adds latency.
 
