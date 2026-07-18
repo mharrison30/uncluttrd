@@ -32,6 +32,7 @@
     "lucide-react-native": "^1.21.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-confetti-cannon": "^1.5.2",
     "react-native-gesture-handler": "~2.28.0",
     "react-native-purchases": "^10.4.0",
     "react-native-reanimated": "~4.1.1",

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, PanResponder, Animated
+  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -26,17 +26,18 @@ import { getFunctions, httpsCallable } from "firebase/functions";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
+import ConfettiCannon from "react-native-confetti-cannon";
 
 // TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
-// outside MainApp's closure - BeforeAfterSlider in particular, for the
-// touch-event instrumentation below - can log into the same buffer without
+// outside MainApp's closure can log into the same buffer without
 // prop-drilling a logger through CompanionRevealModal/CompanionCompletedSummary.
 // Declared before Firebase init (below) so early init-time logging can use it
 // too, without hitting the temporal-dead-zone crash a later declaration would
 // cause at module-evaluation time. Retrieved via the existing
 // long-press-to-share mechanism on the header logo (see debugShareLog in
-// MainApp). Remove once the photo-pipeline, slider, and staging-isolation
-// investigations are closed.
+// MainApp). The slider investigation this originally covered is closed (the
+// slider itself was deleted, DecisionLog.md 2026-07-18) - remove once the
+// remaining photo-pipeline/staging-isolation investigations are closed too.
 const debugLogBuffer = [];
 function dlog(line) {
   console.log(line);
@@ -577,124 +578,76 @@ function CompanionProgressBar({ batchIndex, complete }) {
   );
 }
 
-// Drag-to-compare before/after slider. Plain PanResponder + useState (no new
-// dependency, no Animated). Width/clip can't use the native driver anyway,
-// and a single drag gesture with no competing animation doesn't need one.
-// Fills whatever size its parent gives it (measured via onLayout) rather than
-// a fixed height, so the same component works full-screen in a modal.
-function BeforeAfterSlider({ beforeUri, afterUri, debugLabel }) {
-  const [size, setSize] = useState({ width: 0, height: 0 });
-  const [sliderPos, setSliderPos] = useState(0);
-  const startPos = useRef(0);
-  // The PanResponder below is built once - useRef(PanResponder.create(...))
-  // only ever keeps the closures from the component's very first render, and
-  // discards every PanResponder.create(...) call on later renders. Reading
-  // `size`/`sliderPos` directly inside those callbacks meant they were
-  // permanently frozen at size={0,0} and sliderPos=0 - whatever they were
-  // before onLayout ever measured anything - so onPanResponderMove's clamp
-  // (Math.min(size.width, ...)) could never exceed 0, forcing every drag to
-  // compute exactly 0 regardless of how far the touch moved. These refs
-  // mirror the state and are updated everywhere the state is, so the frozen
-  // callbacks read the live value via .current instead of the stale closure.
-  const sizeRef = useRef(size);
-  const sliderPosRef = useRef(sliderPos);
-  const updateSliderPos = (value) => {
-    sliderPosRef.current = value;
-    setSliderPos(value);
-  };
-  // TEMP DEBUG. Throttles onPanResponderMove logging (which fires many times
-  // per drag) to every Nth event, so a single drag doesn't flood the shared
-  // log buffer while still showing the gesture is continuing to fire.
-  const moveLogCounter = useRef(0);
+// Default side-by-side before/after view (DecisionLog.md 2026-07-18, retiring
+// the drag-to-compare slider). No gesture handling at all - two plain Images,
+// tappable to open BeforeAfterInspector for a closer look. This is the entire
+// reliability win over the old PanResponder slider: there's no continuous
+// touch tracking left to get wrong.
+function BeforeAfterStack({ beforeUri, afterUri, height = 160, onPress }) {
+  if (!beforeUri || !afterUri) return null;
+  return (
+    <View style={{ flexDirection: "row", gap: 8 }}>
+      <TouchableOpacity style={{ flex: 1 }} activeOpacity={0.85} onPress={() => onPress?.("before")}>
+        <View style={[s.beforeAfterStackWrap, { height }]}>
+          <Image source={{ uri: beforeUri }} style={s.beforeAfterStackImage} resizeMode="cover" />
+          <Text style={s.beforeAfterStackLabel}>BEFORE</Text>
+        </View>
+      </TouchableOpacity>
+      <TouchableOpacity style={{ flex: 1 }} activeOpacity={0.85} onPress={() => onPress?.("after")}>
+        <View style={[s.beforeAfterStackWrap, { height }]}>
+          <Image source={{ uri: afterUri }} style={s.beforeAfterStackImage} resizeMode="cover" />
+          <Text style={s.beforeAfterStackLabel}>AFTER</Text>
+        </View>
+      </TouchableOpacity>
+    </View>
+  );
+}
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => {
-        dlog(`[SLIDER DEBUG] onStartShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPosRef.current}`);
-        return true;
-      },
-      onMoveShouldSetPanResponder: () => {
-        dlog(`[SLIDER DEBUG] onMoveShouldSetPanResponder | label=${debugLabel} | sliderPos=${sliderPosRef.current}`);
-        return true;
-      },
-      onPanResponderGrant: () => {
-        dlog(`[SLIDER DEBUG] onPanResponderGrant fired | label=${debugLabel} | sliderPos=${sliderPosRef.current} | size=${JSON.stringify(sizeRef.current)}`);
-        startPos.current = sliderPosRef.current;
-      },
-      onPanResponderMove: (evt, gestureState) => {
-        moveLogCounter.current += 1;
-        const nextPos = Math.max(0, Math.min(sizeRef.current.width, startPos.current + gestureState.dx));
-        if (moveLogCounter.current % 10 === 1) {
-          dlog(`[SLIDER DEBUG] onPanResponderMove #${moveLogCounter.current} | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | startPos=${startPos.current} | sizeWidth=${sizeRef.current.width} | nextPos=${nextPos.toFixed(1)}`);
-        }
-        updateSliderPos(nextPos);
-      },
-      onPanResponderRelease: (evt, gestureState) => {
-        dlog(`[SLIDER DEBUG] onPanResponderRelease | label=${debugLabel} | finalDx=${gestureState.dx.toFixed(1)} | moveEvents=${moveLogCounter.current}`);
-        moveLogCounter.current = 0;
-      },
-      onPanResponderTerminate: (evt, gestureState) => {
-        // Not previously handled at all - if this fires, something else in
-        // the view tree (e.g. a ScrollView) is claiming the gesture away
-        // mid-drag, a different failure mode than the edge-clipping bug
-        // fixed in 81ef78b.
-        dlog(`[SLIDER DEBUG] onPanResponderTerminate (gesture stolen) | label=${debugLabel} | dx=${gestureState.dx.toFixed(1)} | moveEvents=${moveLogCounter.current}`);
-        moveLogCounter.current = 0;
-      },
-      onPanResponderTerminationRequest: () => {
-        // Confirmed root cause (not a hypothesis): the completedSummary
-        // usage lives inside the results ScrollView, which was requesting
-        // (and, with the old implicit-true default, winning) the gesture
-        // mid-drag - onPanResponderGrant had already fired, the drag was
-        // already underway, and the ScrollView tore it away anyway. Once
-        // this handle owns the gesture, it now refuses to give it back, so
-        // a drag that's already started can't be stolen. The reveal-modal
-        // usage isn't inside any ScrollView, so this never even gets called
-        // there - same fix, harmless where it isn't needed.
-        dlog(`[SLIDER DEBUG] onPanResponderTerminationRequest received | label=${debugLabel} | refusing`);
-        return false;
-      },
-    })
-  ).current;
+// Fullscreen "look closer" view, opened by tapping either image in
+// BeforeAfterStack. Purely discrete state (which segment is selected) plus an
+// Animated.timing opacity crossfade - no PanResponder/gesture-handler
+// anywhere, so it doesn't inherit the old slider's frozen-closure or
+// gesture-stealing-parent bug class. Opacity-only means this can run on the
+// native driver too, unlike the old slider's width/position animation.
+function BeforeAfterInspector({ visible, beforeUri, afterUri, initialTab, onClose }) {
+  const [tab, setTab] = useState(initialTab || "after");
+  const fade = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (!visible) return;
+    const startTab = initialTab || "after";
+    setTab(startTab);
+    fade.setValue(startTab === "after" ? 1 : 0);
+  }, [visible, initialTab]);
+
+  const selectTab = (next) => {
+    if (next === tab) return;
+    setTab(next);
+    Animated.timing(fade, { toValue: next === "after" ? 1 : 0, duration: 220, useNativeDriver: true }).start();
+  };
 
   if (!beforeUri || !afterUri) return null;
 
   return (
-    <View
-      style={{ width: "100%", height: "100%", position: "relative" }}
-      onLayout={(e) => {
-        const { width, height } = e.nativeEvent.layout;
-        sizeRef.current = { width, height };
-        setSize({ width, height });
-        updateSliderPos(width / 2);
-      }}
-    >
-      {/* Only the two image layers need overflow:hidden, for the rounded
-          corners. The handle used to be a child of this same clipped view -
-          dragging it to a full edge (sliderPos near 0 or size.width) pushed
-          half its touch target outside these bounds, so the clip silently
-          ate the tap and the drag looked "stuck." It's now a sibling below,
-          in an unclipped wrapper, so its full hit area is always available. */}
-      <View style={[s.beforeAfterContainer, { width: "100%", height: "100%" }]}>
-        <Image source={{ uri: afterUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
-        <View style={[s.beforeAfterClip, { width: sliderPos, height: size.height }]}>
-          <Image source={{ uri: beforeUri }} style={[s.beforeAfterImage, { width: size.width, height: size.height }]} resizeMode="cover" />
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <View style={s.inspectorBackdrop}>
+        <TouchableOpacity style={s.inspectorClose} onPress={onClose} accessibilityLabel="Close" accessibilityRole="button">
+          <X size={20} color="white" strokeWidth={2.25} />
+        </TouchableOpacity>
+        <View style={s.inspectorImageArea}>
+          <Image source={{ uri: beforeUri }} style={s.inspectorImage} resizeMode="contain" />
+          <Animated.Image source={{ uri: afterUri }} style={[s.inspectorImage, s.inspectorImageOverlay, { opacity: fade }]} resizeMode="contain" />
+        </View>
+        <View style={s.inspectorSegmentRow}>
+          <TouchableOpacity style={[s.inspectorSegment, tab === "before" && s.inspectorSegmentActive]} onPress={() => selectTab("before")}>
+            <Text style={[s.inspectorSegmentText, tab === "before" && s.inspectorSegmentTextActive]}>Before</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[s.inspectorSegment, tab === "after" && s.inspectorSegmentActive]} onPress={() => selectTab("after")}>
+            <Text style={[s.inspectorSegmentText, tab === "after" && s.inspectorSegmentTextActive]}>After</Text>
+          </TouchableOpacity>
         </View>
       </View>
-      <Text style={[s.beforeAfterLabel, { left: 10 }]}>BEFORE</Text>
-      <Text style={[s.beforeAfterLabel, { right: 10 }]}>AFTER</Text>
-      <View
-        style={[s.beforeAfterHandle, { left: sliderPos - 20 }]}
-        hitSlop={{ top: 20, bottom: 20, left: 20, right: 20 }}
-        {...panResponder.panHandlers}
-      >
-        <View style={s.beforeAfterHandleLine} />
-        <View style={s.beforeAfterHandleKnob}>
-          <ChevronRight size={12} color={BRAND.ink} strokeWidth={2.5} style={{ marginRight: 2 }} />
-          <ChevronRight size={12} color={BRAND.ink} strokeWidth={2.5} style={{ marginLeft: -8, transform: [{ rotate: "180deg" }] }} />
-        </View>
-      </View>
-    </View>
+    </Modal>
   );
 }
 
@@ -704,11 +657,11 @@ function CompanionCard({
 }) {
   // "reveal" is its own full-screen CompanionRevealModal, and "batch-active"
   // is its own BatchChecklist component - neither renders here (see the
-  // results screen render for why: not enough room in a scrolling card for a
-  // before/after slider worth dragging, and a checklist needs its own layout
-  // rhythm, not this card's single-title-single-body shape). Once the whole
-  // project is finished, the results screen renders CompanionCompletedSummary
-  // in this card's place instead - see there.
+  // results screen render for why: the reveal's before/after comparison
+  // deserves more room than this card's single-title-single-body shape, and
+  // a checklist needs its own layout rhythm). Once the whole project is
+  // finished, the results screen renders CompanionCompletedSummary in this
+  // card's place instead - see there.
   if (stage === "finished" || stage === "reveal" || stage === "batch-active") return null;
 
   const GENERATING_TIPS = [
@@ -933,6 +886,11 @@ function UnresolvedItemsReview({ items, onResolve, onCancel }) {
 // the continue button - closing and continuing are the same transition here,
 // there's nothing to "cancel back" to once the progress photo is already in.
 function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibleChangeText, revealReady, onDismiss }) {
+  // Per-batch reveal only - copy/framing here is intentionally unchanged by
+  // the completion redesign (DecisionLog.md 2026-07-18). This fires after
+  // every batch, not just the one that leads to project completion, so it
+  // stays scoped to "here's what changed this session," not a celebration.
+  const [inspectTab, setInspectTab] = useState(null);
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onDismiss}>
       <SafeAreaView style={s.revealModalSafe}>
@@ -945,10 +903,10 @@ function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibl
           <CompanionProgressBar batchIndex={batchIndex} />
         </View>
         <View style={s.revealModalImageArea}>
-          <BeforeAfterSlider beforeUri={beforeUri} afterUri={afterUri} debugLabel="revealModal" />
+          <BeforeAfterStack beforeUri={beforeUri} afterUri={afterUri} height={260} onPress={setInspectTab} />
         </View>
         <View style={s.revealModalFooter}>
-          <Text style={s.revealModalDragHint}>Drag to compare</Text>
+          <Text style={s.revealModalHint}>Tap a photo to look closer</Text>
           <Text style={s.companionVisibleChangeText}>{visibleChangeText}</Text>
           {revealReady ? (
             <TouchableOpacity style={s.companionBtn} onPress={onDismiss}>
@@ -958,6 +916,7 @@ function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibl
             <View style={{ height: 51 }} />
           )}
         </View>
+        <BeforeAfterInspector visible={!!inspectTab} beforeUri={beforeUri} afterUri={afterUri} initialTab={inspectTab} onClose={() => setInspectTab(null)} />
       </SafeAreaView>
     </Modal>
   );
@@ -1005,9 +964,14 @@ function formatCompletedDate(value) {
 // finished, replacing CompanionCard in its place (see the results screen
 // render). Not full-screen like CompanionRevealModal - that's a one-time
 // "come look at this" moment; this is a persistent section on an
-// already-scrolling page, so it stays compact.
-function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri }) {
+// already-scrolling page, so it stays compact. This is the actual
+// "celebrate the accomplishment" screen the completion redesign is about
+// (DecisionLog.md 2026-07-18) - headline + accomplishments list are new,
+// task count is demoted to small supporting text, no elapsed time anywhere.
+function CompanionCompletedSummary({ completedAt, reason, headline, accomplishments, taskCount, beforeUri, currentUri, justCompletedThisSession }) {
   const dateText = formatCompletedDate(completedAt);
+  const [inspectTab, setInspectTab] = useState(null);
+  const hasAccomplishments = Array.isArray(accomplishments) && accomplishments.length > 0;
   return (
     <View style={s.companionCard}>
       <CompanionProgressBar batchIndex={1} complete />
@@ -1018,11 +982,34 @@ function CompanionCompletedSummary({ completedAt, reason, beforeUri, currentUri 
         </View>
         {dateText && <Text style={s.completedDateText}>{dateText}</Text>}
       </View>
-      {reason ? <Text style={s.companionBody}>{reason}</Text> : null}
+      {headline ? (
+        <Text style={s.completedHeadline}>{headline}</Text>
+      ) : (
+        // Fallback for plans finished before this redesign shipped - no
+        // headline/accomplishments were ever generated/persisted for them.
+        reason ? <Text style={s.companionBody}>{reason}</Text> : null
+      )}
+      {hasAccomplishments && (
+        <View style={s.completedAccomplishmentsList}>
+          {accomplishments.map((item, i) => (
+            <View key={i} style={s.completedAccomplishmentRow}>
+              <Check size={13} color={BRAND.green} strokeWidth={2.5} />
+              <Text style={s.completedAccomplishmentText}>{item}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+      {typeof taskCount === "number" && taskCount > 0 && (
+        <Text style={s.completedTaskCountText}>{taskCount} {taskCount === 1 ? "task" : "tasks"} completed</Text>
+      )}
       {beforeUri && currentUri && (
         <View style={s.completedSliderArea}>
-          <BeforeAfterSlider beforeUri={beforeUri} afterUri={currentUri} debugLabel="completedSummary" />
+          <BeforeAfterStack beforeUri={beforeUri} afterUri={currentUri} height={200} onPress={setInspectTab} />
         </View>
+      )}
+      <BeforeAfterInspector visible={!!inspectTab} beforeUri={beforeUri} afterUri={currentUri} initialTab={inspectTab} onClose={() => setInspectTab(null)} />
+      {justCompletedThisSession && (
+        <ConfettiCannon count={100} origin={{ x: Dimensions.get("window").width / 2, y: 0 }} fadeOut autoStart />
       )}
     </View>
   );
@@ -1182,6 +1169,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // defaults whenever a new action starts, including "one more improvement."
   const [companionCompletionRecommended, setCompanionCompletionRecommended] = useState(false);
   const [companionCompletionReason, setCompanionCompletionReason] = useState(null);
+  // Whole-project celebration copy (DecisionLog.md 2026-07-18) - generated
+  // alongside completionReason on every round-trip (cheap, harmless when
+  // unused), not a separate AI call at finish time. Distinct from
+  // completionReason: that's the AI's judgment of *why* it's recommending
+  // finishing (still used by the completion-choice screen), these are
+  // triumphant, itemized accomplishments for the post-finish celebration.
+  const [companionCompletionHeadline, setCompanionCompletionHeadline] = useState(null);
+  const [companionCompletionAccomplishments, setCompanionCompletionAccomplishments] = useState([]);
+  // Running total of checked items across the whole project, not read from
+  // results.batchHistory at finish time - that array only reflects whatever
+  // was persisted when `results` was last set (fresh analysis or reopen) and
+  // goes stale the moment a batch is archived mid-session (results is never
+  // locally patched after that Firestore write). Seeded from
+  // results.batchHistory in the [results] effect, incremented by
+  // checkedItems.length each time a batch is actually archived below.
+  const completedTaskCountRef = useRef(0);
   // Set locally the instant the user chooses to finish, so the completed
   // summary can render immediately without waiting on the Firestore
   // serverTimestamp() write to round-trip back into `results`.
@@ -1240,6 +1243,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }
     setCompanionCompletionRecommended(false);
     setCompanionCompletionReason(null);
+    setCompanionCompletionHeadline(null);
+    setCompanionCompletionAccomplishments([]);
+    completedTaskCountRef.current = Array.isArray(results.batchHistory)
+      ? results.batchHistory.reduce((sum, batch) => sum + (batch.items || []).filter(i => i.status === "checked").length, 0)
+      : 0;
     setCompanionCompletedProject(null);
     setProgressPhoto(null);
     dlog(`[PHOTO DEBUG] [results] effect: companionBasePhotoRef ${companionBasePhotoRef.current} -> ${photo?.uri || null}`);
@@ -1343,6 +1351,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // generateNextAction call will judge completion fresh, on its own terms.
     setCompanionCompletionRecommended(false);
     setCompanionCompletionReason(null);
+    setCompanionCompletionHeadline(null);
+    setCompanionCompletionAccomplishments([]);
     setCompanionStage("batch-active");
   };
 
@@ -1350,7 +1360,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // Local timestamp for the immediate UI - CompanionCompletedSummary can
     // render right away without waiting on the serverTimestamp() write below
     // to round-trip back into `results`.
-    const completedLocal = { completedAt: new Date().toISOString(), reason: companionCompletionReason };
+    const completedLocal = {
+      completedAt: new Date().toISOString(),
+      reason: companionCompletionReason,
+      celebrationHeadline: companionCompletionHeadline,
+      accomplishments: companionCompletionAccomplishments,
+      taskCount: completedTaskCountRef.current,
+    };
     setCompanionCompletedProject(completedLocal);
     logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, batchIndex: companionBatchIndex });
     // Absence of this event after a batch_completion_recommended implies the
@@ -1359,7 +1375,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionStage("project-complete");
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
-        companionComplete: { completedAt: serverTimestamp(), reason: companionCompletionReason },
+        companionComplete: {
+          completedAt: serverTimestamp(),
+          reason: companionCompletionReason,
+          celebrationHeadline: companionCompletionHeadline,
+          accomplishments: companionCompletionAccomplishments,
+          taskCount: completedTaskCountRef.current,
+        },
       }).then(() => {
         // history is a one-time getDocs load, not onSnapshot (same gap
         // Session 1 discovery flagged for plan delete) - without this, My
@@ -1449,7 +1471,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         return `- "${item.text}" - ${label}`;
       }).join("\n");
 
-      const nextPrompt = `You are a warm, encouraging professional organizer helping with an ongoing organizing session. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state at the start of this session, (3) the state right now, after this session's work.\n\nThis session's checklist, and what the user reported for each item:\n${checklistLines}\n\nTrust photo 3 over what the user reported. The checklist reflects intent, not verified fact - if an item was marked done but photo 3 shows it clearly wasn't addressed, don't call out the discrepancy or tell the user they're wrong. Just generate the next batch naturally around what photo 3 actually shows, prioritizing what's genuinely still needed there.\n\nFirst, compare photo 2 and photo 3. In one short sentence, describe the overall visible progress made this session - specific and photo-grounded (name what got cleared or organized), not a generic compliment and not a count of items checked off. If you cannot identify confident, specific visible progress, respond with exactly this sentence instead: "You made progress this session and moved the space forward."\n\nThen generate the next balanced session's worth of steps (a small checklist, not one item and not an exhaustive plan), based only on what is visible in photo 3 right now, accounting for any items above reported as "still working on this, not done yet" - those will be carried into the next session automatically, so do not repeat or rephrase them; only return additional NEW steps needed to round out a well-sized session given what's already carried over. Same qualitative sizing rules as before: don't return several trivial items, don't disguise one overwhelming task as one item, prefer a genuine mix suited to what this space actually needs. Never estimate or state how long any step will take. Before suggesting each new step, verify the problem is genuinely visible and unaddressed in photo 3, not a common decluttering trope you're defaulting to. If no new steps are needed, return an empty list - that combined with nothing carried over is itself a meaningful signal the space may be substantially complete, and should inform completionRecommended below.\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall project progress. Using only what you can actually see: has clutter decreased, are related items grouped, is the intended surface or area usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Judge only the original-vs-now comparison, not whether this specific session went well.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence describing this session's visible progress, or the exact fallback sentence if none is confident","nextBatch":["one or two warm sentences describing one new step","..."],"completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos."}`;
+      const nextPrompt = `You are a warm, encouraging professional organizer helping with an ongoing organizing session. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state at the start of this session, (3) the state right now, after this session's work.\n\nThis session's checklist, and what the user reported for each item:\n${checklistLines}\n\nTrust photo 3 over what the user reported. The checklist reflects intent, not verified fact - if an item was marked done but photo 3 shows it clearly wasn't addressed, don't call out the discrepancy or tell the user they're wrong. Just generate the next batch naturally around what photo 3 actually shows, prioritizing what's genuinely still needed there.\n\nFirst, compare photo 2 and photo 3. In one short sentence, describe the overall visible progress made this session - specific and photo-grounded (name what got cleared or organized), not a generic compliment and not a count of items checked off. If you cannot identify confident, specific visible progress, respond with exactly this sentence instead: "You made progress this session and moved the space forward."\n\nThen generate the next balanced session's worth of steps (a small checklist, not one item and not an exhaustive plan), based only on what is visible in photo 3 right now, accounting for any items above reported as "still working on this, not done yet" - those will be carried into the next session automatically, so do not repeat or rephrase them; only return additional NEW steps needed to round out a well-sized session given what's already carried over. Same qualitative sizing rules as before: don't return several trivial items, don't disguise one overwhelming task as one item, prefer a genuine mix suited to what this space actually needs. Never estimate or state how long any step will take. Before suggesting each new step, verify the problem is genuinely visible and unaddressed in photo 3, not a common decluttering trope you're defaulting to. If no new steps are needed, return an empty list - that combined with nothing carried over is itself a meaningful signal the space may be substantially complete, and should inform completionRecommended below.\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall project progress. Using only what you can actually see: has clutter decreased, are related items grouped, is the intended surface or area usable, is there an obvious next improvement still visible? "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Judge only the original-vs-now comparison, not whether this specific session went well.\n\nIf completionRecommended is true, also write a short, punchy celebratory headline naming the specific space and transformation (e.g. "You reclaimed your kitchen"), based only on the photo 1 vs photo 3 comparison, plus a short list of 2 to 4 specific, photo-grounded accomplishments as brief phrases, not full sentences (e.g. "Counter cleared", "Pantry organized", "Recycling removed") - nothing you can't verify by looking at the photos, no percentages, no generic praise. If completionRecommended is false, return an empty string for celebrationHeadline and an empty list for accomplishments.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence describing this session's visible progress, or the exact fallback sentence if none is confident","nextBatch":["one or two warm sentences describing one new step","..."],"completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos.","celebrationHeadline":"short celebratory headline if completionRecommended is true, else empty string","accomplishments":["short accomplishment phrase","..."]}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({
         originalImageBase64: compressedOriginal.base64,
@@ -1470,6 +1492,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // non-critical field.
       const completionRecommended = typeof parsed.completionRecommended === "boolean" ? parsed.completionRecommended : false;
       const completionReasonText = typeof parsed.completionReason === "string" && parsed.completionReason.trim() ? parsed.completionReason.trim() : null;
+      // Celebration copy (DecisionLog.md 2026-07-18) - same "malformed defaults
+      // safely, doesn't break the loop" treatment as completionReason above.
+      const celebrationHeadlineText = typeof parsed.celebrationHeadline === "string" && parsed.celebrationHeadline.trim() ? parsed.celebrationHeadline.trim() : null;
+      const accomplishmentsList = Array.isArray(parsed.accomplishments) ? parsed.accomplishments.filter(t => typeof t === "string" && t.trim()) : [];
 
       // Client composes the final next batch, not the AI response - carried
       // items are kept verbatim (their own text/identity), the AI's response
@@ -1545,6 +1571,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       setCompanionBatchIndex(newBatchIndex);
       setCompanionCompletionRecommended(completionRecommended);
       setCompanionCompletionReason(completionReasonText);
+      setCompanionCompletionHeadline(celebrationHeadlineText);
+      setCompanionCompletionAccomplishments(accomplishmentsList);
+      // The batch that's ending here is archived into batchHistory above -
+      // its checked count is authoritative now, not something to re-derive
+      // from results.batchHistory later (see completedTaskCountRef's own
+      // comment for why that's stale mid-session).
+      completedTaskCountRef.current += checkedItems.length;
 
       // Before/after reveal: show the comparison and the visible-change
       // reaction before the next batch appears, not instead of it.
@@ -3100,6 +3133,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     const showCompletedSummary = companionStage === "finished" && !!projectCompleteData;
     const completedAtValue = projectCompleteData?.completedAt ?? null;
     const completedReasonValue = projectCompleteData?.reason ?? null;
+    const completedHeadlineValue = projectCompleteData?.celebrationHeadline ?? null;
+    const completedAccomplishmentsValue = projectCompleteData?.accomplishments ?? [];
+    const completedTaskCountValue = typeof projectCompleteData?.taskCount === "number" ? projectCompleteData.taskCount : null;
+    // Confetti is a one-time "you just did this" moment, not something a
+    // returning visit to an already-finished plan should replay -
+    // companionCompletedProject only exists for the session that actually
+    // just finished; results.companionComplete alone (a reopen) never sets it.
+    const justCompletedThisSession = !!companionCompletedProject;
     // Prefer the persisted Storage URLs (always correct for a resumed plan);
     // fall back to the live session's local refs for the instant right after
     // finishing, before those URLs exist on `results` yet.
@@ -3164,8 +3205,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             <CompanionCompletedSummary
               completedAt={completedAtValue}
               reason={completedReasonValue}
+              headline={completedHeadlineValue}
+              accomplishments={completedAccomplishmentsValue}
+              taskCount={completedTaskCountValue}
               beforeUri={completedBeforeUri}
               currentUri={completedCurrentUri}
+              justCompletedThisSession={justCompletedThisSession}
             />
           )}
           <CompanionRevealModal
@@ -3692,24 +3737,35 @@ const s = StyleSheet.create({
   reviewItemText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, marginBottom: 8 },
   reviewItemBtn: { flex: 1, backgroundColor: BRAND.offWhite, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
   reviewItemBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink, textAlign: "center" },
-  beforeAfterContainer: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
-  beforeAfterImage: { position: "absolute", top: 0, left: 0 },
-  beforeAfterClip: { position: "absolute", top: 0, left: 0, overflow: "hidden" },
-  beforeAfterLabel: { position: "absolute", top: 10, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
-  beforeAfterHandle: { position: "absolute", top: 0, bottom: 0, width: 40, alignItems: "center", justifyContent: "center" },
-  beforeAfterHandleLine: { position: "absolute", width: 2, top: 0, bottom: 0, backgroundColor: "white" },
-  beforeAfterHandleKnob: { width: 32, height: 32, borderRadius: 16, backgroundColor: "white", flexDirection: "row", alignItems: "center", justifyContent: "center", shadowColor: "#000", shadowOpacity: 0.3, shadowRadius: 4, shadowOffset: { width: 0, height: 1 }, elevation: 4 },
+  beforeAfterStackWrap: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
+  beforeAfterStackImage: { width: "100%", height: "100%" },
+  beforeAfterStackLabel: { position: "absolute", top: 8, left: 8, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
+  inspectorBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", alignItems: "center", justifyContent: "center" },
+  inspectorClose: { position: "absolute", top: 50, right: 16, width: 36, height: 36, borderRadius: 18, backgroundColor: "rgba(255,255,255,0.15)", alignItems: "center", justifyContent: "center", zIndex: 1 },
+  inspectorImageArea: { width: "100%", flex: 1, position: "relative" },
+  inspectorImage: { width: "100%", height: "100%", position: "absolute", top: 0, left: 0 },
+  inspectorImageOverlay: { position: "absolute" },
+  inspectorSegmentRow: { flexDirection: "row", backgroundColor: "rgba(255,255,255,0.1)", borderRadius: 20, padding: 4, marginBottom: 30, marginTop: 16 },
+  inspectorSegment: { paddingHorizontal: 20, paddingVertical: 8, borderRadius: 16 },
+  inspectorSegmentActive: { backgroundColor: "white" },
+  inspectorSegmentText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: "rgba(255,255,255,0.7)" },
+  inspectorSegmentTextActive: { color: BRAND.ink },
   revealModalSafe: { flex: 1, backgroundColor: BRAND.white },
   revealModalHeader: { flexDirection: "row", justifyContent: "flex-end", paddingHorizontal: 16, paddingTop: 8 },
   revealModalClose: { width: 36, height: 36, borderRadius: 18, backgroundColor: BRAND.offWhite, alignItems: "center", justifyContent: "center" },
   revealModalProgressWrap: { paddingHorizontal: 18, paddingTop: 4 },
-  revealModalImageArea: { flex: 1, paddingHorizontal: 12, paddingTop: 8 },
+  revealModalImageArea: { flex: 1, paddingHorizontal: 12, paddingTop: 8, justifyContent: "center" },
   revealModalFooter: { paddingHorizontal: 18, paddingTop: 10, paddingBottom: 18 },
-  revealModalDragHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 },
+  revealModalHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center", marginTop: 8, marginBottom: 4 },
   completedBadgeRow: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
   completedBadge: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.green, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4, marginRight: 8 },
   completedBadgeText: { color: "white", fontSize: 12, fontFamily: "Inter_600SemiBold", marginLeft: 4 },
   completedDateText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate },
+  completedHeadline: { fontSize: 19, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 10, lineHeight: 25 },
+  completedAccomplishmentsList: { marginBottom: 12 },
+  completedAccomplishmentRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 6 },
+  completedAccomplishmentText: { fontSize: 14, fontFamily: "Inter_400Regular", color: BRAND.slate, flex: 1 },
+  completedTaskCountText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist, marginBottom: 12 },
   completedSliderArea: { height: 220, borderRadius: 12, overflow: "hidden", marginTop: 4 },
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
