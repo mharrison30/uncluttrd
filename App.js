@@ -20,8 +20,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
-import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, getDocs, query, orderBy, limit, serverTimestamp, arrayUnion } from "firebase/firestore";
-import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, orderBy, limit, serverTimestamp, arrayUnion } from "firebase/firestore";
+import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
@@ -2398,6 +2398,42 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     }
   };
 
+  // Whole-plan delete from My Plans (DecisionLog.md 2026-07-18). Deletes the
+  // Firestore doc first, then every Storage object under both prefixes tied
+  // to this plan - plans/{uid}/{planId}/ (original + progress photos) and
+  // viz/{uid}/{planId}/ (every AI visualization, including stale
+  // regenerations no longer referenced by the current vizImages map, so this
+  // has to list the folder rather than walk the doc's own URLs). Firestore
+  // first, same ordering reasoning as account deletion: if Storage cleanup
+  // fails partway, a leftover orphaned image is harmless, but a doc left
+  // pointing at now-missing images would show broken thumbnails in the list.
+  const deletePlan = async (planId) => {
+    const uid = user.uid;
+    try {
+      await deleteDoc(doc(db, "users", uid, "plans", planId));
+
+      const prefixes = [
+        storageRef(storage, `plans/${uid}/${planId}`),
+        storageRef(storage, `viz/${uid}/${planId}`),
+      ];
+      const items = (await Promise.all(prefixes.map(p => listAll(p)))).flatMap(r => r.items);
+      await Promise.all(items.map(async item => {
+        try {
+          await deleteObject(item);
+        } catch (itemErr) {
+          if (itemErr.code !== "storage/object-not-found") throw itemErr;
+        }
+      }));
+
+      logEvent(getAnalytics(), "plan_deleted", { planId });
+      setHistory(prev => prev.filter(h => h.id !== planId));
+      if (currentPlanId === planId) goHome();
+    } catch (e) {
+      console.log("Delete plan error:", e.message);
+      Alert.alert("Something went wrong", "Couldn't delete this plan. Please try again.");
+    }
+  };
+
   // PAYWALL SCREEN
   if (showPaywall) {
     return (
@@ -2631,6 +2667,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                   isPro
                     ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
                     : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
+                  {
+                    text: "Delete Plan", style: "destructive", onPress: () => {
+                      Alert.alert("Delete this plan?", "This can't be undone.", [
+                        { text: "Cancel", style: "cancel" },
+                        { text: "Delete", style: "destructive", onPress: () => deletePlan(item.id) },
+                      ]);
+                    },
+                  },
                   { text: "Cancel", style: "cancel" },
                 ]);
               }}>
