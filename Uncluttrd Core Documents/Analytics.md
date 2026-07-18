@@ -28,36 +28,52 @@ Status: Living document — contract, not a changelog.
 | `room_selected` | Measures which room types users organize most, to prioritize product/content decisions | — | `room` | NO | NO |
 | `budget_selected` | Measures which budget tier users engage with most, to validate pricing/tier design | — | `budget` | NO | NO |
 
-### Companion — Free Funnel
+### Companion — Free Funnel (RETIRED 2026-07-18)
 
-Correlated via `analysisId`, a client-generated, analytics-only identifier (never persisted to Firestore) minted once per analysis and threaded through every event below, since free-tier plans are never saved and therefore never get a `planId` to join against.
+**Retired, not deleted, per this document's own discipline of recording history.** Superseded entirely by "Companion — Batch Workflow" below, per the batch workflow redesign (DecisionLog.md 2026-07-18). These events depended on the single-step first-action model and the `analysisId`/`planId` dual-correlator split that existed specifically because free-tier plans were never saved. Both of those are now gone: the whole loop is batch-based from the first analysis onward, and free plans save immediately with real `planId`s (see the free-tier History persistence work, also this session) — so every batch event below uses `planId` uniformly, free and Pro alike.
+
+| Event | Properties |
+|---|---|
+| `first_action_viewed` / `first_action_started` / `first_action_completed` / `first_action_failed` | `analysisId`, ... |
+| `progress_photo_prompted` / `progress_photo_started` | `analysisId` |
+
+### Companion — Pro Continuation (RETIRED 2026-07-18)
+
+**Retired, not deleted** — same reason as above. The first-action-vs-continuing-loop distinction these events were built around no longer exists; every batch, including the first, uses the same mechanism.
+
+| Event | Properties |
+|---|---|
+| `companion_session_started` | `planId` |
+| `companion_action_viewed` / `companion_action_started` / `companion_action_completed` / `companion_action_failed` | `planId`, `actionIndex`, ... |
+| `companion_progress_photo_uploaded` / `companion_next_action_generated` | `planId`, `actionIndex` |
+| `companion_session_completed` | `planId` |
+
+`companion_session_resumed` is **not** retired — see the Batch Workflow section below, unchanged in behavior.
+
+### Companion — Batch Workflow
+
+Session-based batches replace single-step generation (`analyzePhoto`/`generateNextAction` now return a balanced session's worth of checklist items, not one action at a time) — see DecisionLog.md, 2026-07-18, for the full redesign, including the acknowledged exception to CompanionDesignPrinciples.md Principles 1 and 7. Every event here is correlated via `planId` alone, for free and Pro users alike.
 
 | Event | Purpose | Business Question | Properties | Implemented? | Dashboard? |
 |---|---|---|---|---|---|
-| `first_action_viewed` | Measures how many completed analyses reach the Companion's first personalized action | Of completed analyses, what share of users actually see their personalized first action? | `analysisId` | NO | NO |
-| `first_action_started` | Measures how many viewed first actions the user actually begins | Of users who see it, what share begin it — does a single action actually prompt action? | `analysisId` | NO | NO |
-| `first_action_completed` | Measures how many started first actions the user finishes | Of users who start it, what share finish, and how long does it take? | `analysisId`, `secondsSinceStarted` | NO | NO |
-| `first_action_failed` | Measures how often the first-action experience fails | How often does the AI return a usable plan but fail to produce a usable first action, and why? | `analysisId`, `reason` | NO | NO |
-| `progress_photo_prompted` | Measures how many completed first actions reach the photo invitation | Of users who complete their first action, what share reach the photo invitation? | `analysisId` | NO | NO |
-| `progress_photo_started` | Measures how many prompted users attempt to share a progress photo | Of users invited to share progress, what share attempt it — how much friction does this specific ask add? | `analysisId` | NO | NO |
-| `companion_paywall_viewed` | Measures how many free users reach the Companion-specific paywall | How many free users who finish a full first loop reach the Companion-specific upgrade moment? | `analysisId` | NO | NO |
-| `companion_upgrade_clicked` | Measures Companion-specific paywall engagement | Does an upgrade prompt shown after a completed experience convert better than the general paywall? | `analysisId` | NO | NO |
-
-### Companion — Pro Continuation
-
-Correlated via the existing `planId` (solid, since Pro plans are persisted synchronously right after analysis).
-
-| Event | Purpose | Business Question | Properties | Implemented? | Dashboard? |
-|---|---|---|---|---|---|
-| `companion_session_started` | Measures how many Pro users move from a single first action into an ongoing companion relationship | What share of Pro users move from one completed first action into an ongoing companion relationship? (the Pro north star for this feature) | `planId` | NO | NO |
-| `companion_action_viewed` | Measures view-through as users progress deeper into the loop | Does view-through hold steady across action 2, 3, 4…, or decay? | `planId`, `actionIndex` | NO | NO |
-| `companion_action_started` | Measures start rate across successive actions | Does start rate hold or decay across successive actions? | `planId`, `actionIndex` | NO | NO |
-| `companion_action_completed` | Measures completion rate across successive actions | Where in the ongoing loop does completion actually drop off? | `planId`, `actionIndex`, `secondsSinceStarted` | NO | NO |
-| `companion_action_failed` | Measures how often generation or action state fails mid-loop | How often does generation or action state fail once a user is mid-loop, and why? | `planId`, `actionIndex`, `reason` | NO | NO |
-| `companion_progress_photo_uploaded` | Measures how many completed actions result in a submitted photo | Of completed companion actions, what share result in a submitted photo — how many iterations actually continue? | `planId`, `actionIndex` | NO | NO |
-| `companion_next_action_generated` | Measures how many submitted photos successfully produce a new action | Of submitted photos, what share successfully produce a new action? | `planId`, `actionIndex` | NO | NO |
-| `companion_session_completed` | Measures explicit session closes | How often do users explicitly close a session ("Finished for today") vs. quietly going quiet, and does explicit closing correlate with a higher or faster return rate than silent abandonment? | `planId` | NO | NO |
-| `companion_session_resumed` | Measures how many Pro users resume a paused session | Does the Home banner (or My Plans) actually bring users back into a paused loop — which entry point works better? | `planId`, `source` | NO | NO |
+| `batch_shown` | Measures how many analyzed/submitted photos successfully produce a viewable batch | Of photos analyzed or submitted, what share successfully produce a viewable batch? | `planId`, `batchIndex` | YES | NO |
+| `batch_generation_failed` | Measures how often batch generation fails and why | How often does batch generation fail, and why — more important now than under the old single-step model, given the larger, more structurally complex AI response | `planId`, `batchIndex`, `reason` | YES | NO |
+| `batch_step_checked` / `batch_step_unchecked` | Measures which specific suggested items users actually engage with | Which specific suggested items do users actually engage with vs. ignore? | `planId`, `batchIndex`, `itemId` | YES | NO |
+| `batch_continue_tapped` | Measures how many items a user resolves before continuing | How many items does a user typically resolve per session before continuing, and does that vary by project/room type? | `planId`, `batchIndex`, `checkedCount`, `uncheckedCount` | YES | NO |
+| `batch_item_skip_popup_shown` | Measures how often users leave a batch with unresolved items | How often do users leave a batch with unresolved items rather than fully completing it? | `planId`, `batchIndex`, `uncheckedCount` | YES | NO |
+| `batch_item_skipped` | Measures which suggestions get skipped and why | Which suggestion types get skipped most, and does skip reason reveal miscalibrated AI suggestions (over-perfectionism, wrong difficulty)? | `planId`, `batchIndex`, `itemId`, `reason` | YES | NO |
+| `batch_item_marked_not_done` | Measures how often items carry forward vs. get abandoned | Does carrying items correlate with session length or engagement drop-off? | `planId`, `batchIndex`, `itemId` | YES | NO |
+| `batch_session_paused` | Measures explicit pauses ("that's enough for today"), distinct from skip | How often do users explicitly pause vs. silently going quiet, and does explicit pausing correlate with a higher or faster return rate than silent abandonment? | `planId`, `batchIndex` | YES | NO |
+| `batch_photo_submitted` | Measures how many shown batches result in a submitted progress photo | Of batches shown, what share result in a submitted photo — how many sessions actually continue? | `planId`, `batchIndex`, `checkedCount`, `carriedCount`, `skippedCount` | YES | NO |
+| `batch_second_batch_reached` | **PRO NORTH STAR METRIC** — replaces `companion_session_started`. Measures engagement into a second session, explicitly *not* conversion | What share of Pro users move from one completed batch into a second session? A free user hitting the continuing-loop paywall never reaches this event at all, so it's engagement-only by construction — a separate paywall-conversion event may be worth pairing with this later, flagged as a known gap, not solved here. | `planId` | YES | NO |
+| `batch_completion_recommended` | Measures how often the AI judges a project substantially complete | How often does the AI think a project is done? | `planId`, `batchIndex` | YES | NO |
+| `batch_completion_accepted` | Measures how often users agree with a completion recommendation and finish | How often do users agree with the AI vs. continue anyway — absence of this event after a `batch_completion_recommended` implies "continue" was chosen instead. Together, these two answer which project/room types generate disagreement, and whether the completion threshold is too conservative or too aggressive. | `planId`, `batchIndex` | YES | NO |
+| `companion_paywall_viewed` | Measures how many users reach the Companion continuing-loop paywall | How many users who finish a batch reach the Companion-specific upgrade moment? | `planId` | YES | NO |
+| `companion_upgrade_clicked` | Measures Companion-specific paywall engagement | Does an upgrade prompt shown after a completed batch convert better than the general paywall? | `planId` | YES | NO |
+| `companion_completion_prompt_viewed` | Measures how often the AI-recommended completion choice is actually surfaced | Pairs with `batch_completion_recommended`/`batch_completion_accepted` above — confirms the choice screen itself was reached, not just recommended server-side. *(Note: fires in code since the original completion-choice work; not previously documented here — closed as part of this update, not a new event.)* | `planId`, `batchIndex` | YES | NO |
+| `companion_continued_past_complete` | Measures explicit "continue" choices past a completion recommendation | Complements `batch_completion_accepted` with a direct signal of the "continue" choice, not just its absence. *(Same documentation-gap note as above.)* | `planId`, `batchIndex` | YES | NO |
+| `companion_project_finished` | Measures explicit project finishes | How often is a project actually marked finished, and after how many batches? *(Same documentation-gap note as above.)* | `planId`, `batchIndex` | YES | NO |
+| `companion_session_resumed` | Measures how many users resume a paused session | Does the Home banner (or My Plans) actually bring users back into a paused session — which entry point works better? | `planId`, `source` | YES | NO |
 
 ---
 
