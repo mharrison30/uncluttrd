@@ -103,6 +103,19 @@ Mitigations that keep this in the spirit of both principles, even while bending 
 
 ---
 
+### 2026-07-18 — EAS Update (OTA) setup: fingerprint runtimeVersion, staging/production channels
+**Decision:** `expo-updates` installed and configured for pure-JS/React Native changes to be pushable via `eas update` without a full `eas build`. `runtimeVersion` uses the **fingerprint** policy, not `appVersion` — derived from the actual resolved native project (which already differs between staging/production via the existing `APP_ENV` branching), so an incompatible update is never offered to a build rather than depending on someone remembering to bump `version` (currently shared, unbranched, across both environments). Channels mirror the existing Firebase/bundle-ID table exactly: `development`/`preview` → `staging`, `production` → `production`, set alongside each profile's existing `APP_ENV` in `eas.json` so both are always baked in together with no runtime coupling.
+
+**Mental model going forward:** any `app.config.js`/`eas.json` edit, any new native dependency, or *any* version change to an existing dependency (treated as build-required across the board, not judged per-package) requires a full build. Pure JS/component/copy/logic changes in `App.js` with no dependency diff are OTA-eligible. `functions/index.js` and `firestore.rules` are separate pipelines entirely (`firebase deploy`), not part of EAS Update either way.
+
+**Reason:** Matches the structural-guarantee-over-manual-discipline reasoning already established for the rest of this staging effort (`2026-07-16`, `2026-07-17` above) — an incompatible OTA update should be structurally incapable of reaching a build it doesn't match, not prevented by someone remembering a step.
+
+**Bootstrapping note:** no currently-installed build (including staging build 13) has `expo-updates` baked in yet, so nothing can receive an OTA push until one new full build per environment is made and reinstalled — these two builds require explicit go-ahead per the standing build rule, same as any other build.
+
+**Impact:** Architecture, Build/Release, Process
+
+---
+
 ### 2026-07-15 — analyzePhoto build-15 compatibility outage
 **Issue:** `85168f3` (2026-07-14, free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and deployed that straight to `cluttrd-3e335` — the same Firebase project the live public App Store app uses, with no staging split. Confirmed via App Store Connect that **build 15**, the live public version at the time, predates `analysisId` entirely and calls `analyzePhoto` without it. Every real production user's photo analysis was rejected outright with `invalid-argument`/`unauthenticated` for hours before this was caught, discovered via a real user report rather than any automated signal.
 
