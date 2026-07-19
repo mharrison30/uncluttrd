@@ -786,52 +786,49 @@ function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause, 
   );
 }
 
-// Unresolved-items review, shown when Continue or Pause is tapped with items
-// still unchecked (DecisionLog.md 2026-07-18). One combined screen for 2+
-// items rather than sequential popups - a chain of modals for someone with
-// several unresolved items would violate Principle 3 (never overwhelm) far
-// more than one screen listing them together. Continue and Pause share this
-// exact component and mechanics; only the framing copy differs, matching the
-// "plan my next session" vs. "remember where I left off" mental model.
-// Pause ("that's enough for today") no longer goes through this review at
-// all - it's a single-tap action straight to Home (DecisionLog.md
-// 2026-07-18). Only Continue reaches this component now, so the earlier
-// pause-vs-continue copy branching (mode prop) was removed rather than left
-// as dead code with only one path ever actually taken.
-function UnresolvedItemsReview({ items, onResolve, onCancel }) {
-  // itemId -> { action, reason } as each item gets resolved. Once every item
-  // has an entry, onResolve fires automatically with the complete map -
-  // resolving one item at a time, not one combined submit button, since a
-  // partially-filled-out combined screen shouldn't need a separate confirm
-  // step once nothing is left ambiguous.
+// Full-screen wrap-up, replacing the old UnresolvedItemsReview modal
+// (DecisionLog.md 2026-07-19 - reframed from "what should I do with
+// these?" to a natural session conclusion). Shared by both Continue and
+// Pause when something's unresolved - `source` ("continue"|"pause") only
+// changes the framing/CTA copy and what happens after resolution (photo
+// sheet vs. save+home); the underlying carried/skipped data model is
+// unchanged. Leads with what got done (celebration, unconditional) before
+// ever mentioning what's left - ordering is deliberate, not incidental.
+// No single-vs-multi-item branch anymore (the old component's bespoke
+// single-item heading/box) - the celebration-first structure reads fine
+// at any count, so that special case is gone, not preserved as dead code.
+function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
   const [resolved, setResolved] = useState({});
-  const single = items.length === 1;
+  const [reasonOpenFor, setReasonOpenFor] = useState(null);
+  const pending = items.filter(item => !resolved[item.id]);
+  const isPause = source === "pause";
 
-  const finalizeIfComplete = (next) => {
-    if (Object.keys(next).length >= items.length) onResolve(next);
-    else setResolved(next);
+  // Unlike the old modal, this doesn't auto-fire onResolve the instant every
+  // item has a decision - it's a real page now, not a quick popup, so the
+  // bottom CTA (enabled only once allResolved) is the deliberate final step
+  // rather than the screen silently advancing out from under the user.
+  const resolveItem = (next) => {
+    setReasonOpenFor(null);
+    setResolved(next);
   };
 
-  const keepForNextTime = (itemId) => finalizeIfComplete({ ...resolved, [itemId]: { action: "carried" } });
+  const keepForNextTime = (itemId) => resolveItem({ ...resolved, [itemId]: { action: "carried" } });
 
-  // Reason capture is a lightweight, optional tap-through (never a text
+  // Reason capture stays a lightweight, optional tap-through (never a text
   // field) - framed as helping the AI plan better next time, never a
-  // scolding. A no-reason option is always available alongside it, labeled
-  // to avoid repeating "Skip" right after the "Skip it" button that opened
-  // this alert - back to back "Skip" / "Skip" read as broken/redundant.
-  const skipItem = (itemId) => {
-    Alert.alert(
-      "Skip this one?",
-      "No worries - this just helps me plan better next time.",
-      [
-        { text: "Not applicable", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "not applicable" } }) },
-        { text: "Changed my mind", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "changed my mind" } }) },
-        { text: "Too hard", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: "too hard" } }) },
-        { text: "No specific reason", onPress: () => finalizeIfComplete({ ...resolved, [itemId]: { action: "skipped", reason: null } }) },
-        { text: "Cancel", style: "cancel" },
-      ]
-    );
-  };
+  // scolding. Inline expandable selector under the item now, not a native
+  // Alert.alert - a popup felt like an interruption on what's meant to read
+  // as a calm page, not a modal-over-modal. Same purpose/downstream handling
+  // as before (skipReason feeds the AI's per-item context and the
+  // whole-project exclusion list) - only the picker widget changed.
+  const REMOVE_REASONS = [
+    { label: "Already done", value: "already done" },
+    { label: "Don't want to do this", value: "don't want to do this" },
+    { label: "Not worth the effort", value: "not worth the effort" },
+    { label: "Other", value: null },
+  ];
+  const toggleReasonPicker = (itemId) => setReasonOpenFor(prev => (prev === itemId ? null : itemId));
+  const chooseReason = (itemId, reason) => resolveItem({ ...resolved, [itemId]: { action: "skipped", reason } });
 
   const keepAllForNextTime = () => {
     const next = {};
@@ -839,66 +836,85 @@ function UnresolvedItemsReview({ items, onResolve, onCancel }) {
     onResolve(next);
   };
 
-  // Single-item heading is a short question on its own, never the item text
-  // concatenated into the sentence - that was both a punctuation bug (item
-  // text already ends in a period, then a "?" got appended on top) and hard
-  // to read as one long bolded sentence. The item itself renders separately
-  // below, in its own box - see reviewSingleItemBox. The 2+ case already
-  // separates heading from item text (each item lists on its own line), so
-  // it doesn't have either problem and is left as-is.
-  const title = single ? "Still working on this?" : "Looks like these are still unchecked. What should I do with them?";
-
-  const pending = items.filter(item => !resolved[item.id]);
+  const allResolved = pending.length === 0;
+  const ctaLabel = isPause ? "Save and finish for today" : "Continue";
 
   return (
-    <Modal visible animationType="fade" transparent onRequestClose={onCancel}>
-      <View style={s.reviewModalBackdrop}>
-        <View style={s.reviewModalCard}>
-          <TouchableOpacity style={s.reviewModalCloseBtn} onPress={onCancel} accessibilityLabel="Close" accessibilityRole="button">
-            <X size={16} color={BRAND.slate} strokeWidth={2.25} />
-          </TouchableOpacity>
-          {/* Title and the "keep all" shortcut stay pinned outside the scroll
-              area - only the item list itself scrolls, so both remain
-              reachable regardless of how many unresolved items there are. */}
-          <Text style={single ? s.reviewSingleHeading : s.companionTitle}>{title}</Text>
-          <ScrollView style={s.reviewModalScroll} showsVerticalScrollIndicator={false}>
-            {single && pending[0] && (
-              <View style={s.reviewSingleItemBox}>
-                <Text style={s.reviewSingleItemText}>{pending[0].text}</Text>
+    <SafeAreaView style={s.safe}>
+      <StatusBar barStyle="light-content" />
+      <View style={[s.hdr, { alignItems: "flex-start" }]}>
+        <TouchableOpacity onPress={onCancel} style={{ padding: 8 }} accessibilityLabel="Back to checklist" accessibilityRole="button">
+          <ChevronLeft size={26} color="rgba(255,255,255,0.9)" strokeWidth={2.25} />
+        </TouchableOpacity>
+        <View style={{ flex: 1 }} />
+      </View>
+      <ScrollView contentContainerStyle={s.scrollContent}>
+        <View style={s.companionCard}>
+          {/* Celebration renders first, always, regardless of source or how
+              many items are pending - the win comes before the ask. */}
+          <Text style={s.wrapUpCelebrationTitle}>Nice work today!</Text>
+          <View style={s.wrapUpCelebrationRow}>
+            <Check size={16} color={BRAND.green} strokeWidth={3} />
+            <Text style={s.wrapUpCelebrationText}>{checkedCount} {checkedCount === 1 ? "task" : "tasks"} completed</Text>
+          </View>
+          <Text style={s.companionBody}>You made meaningful progress.</Text>
+          <Text style={[s.companionTitle, { marginTop: 6 }]}>
+            {allResolved
+              ? "All set."
+              : `Now let's decide what to do with the remaining ${pending.length} ${pending.length === 1 ? "item" : "items"}.`}
+          </Text>
+          {pending.map(item => (
+            <View key={item.id} style={s.reviewItemBlock}>
+              <Text style={s.reviewItemText}>{item.text}</Text>
+              <View style={{ flexDirection: "row", gap: 10 }}>
+                <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
+                  <Text style={s.reviewItemBtnText}>Keep</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.reviewItemBtn} onPress={() => toggleReasonPicker(item.id)}>
+                  <Text style={s.reviewItemBtnText}>Remove</Text>
+                </TouchableOpacity>
               </View>
-            )}
-            {pending.map(item => (
-              <View key={item.id} style={s.reviewItemBlock}>
-                {!single && <Text style={s.reviewItemText}>{item.text}</Text>}
-                <View style={{ flexDirection: "row", gap: 10 }}>
-                  <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
-                    <Text style={s.reviewItemBtnText}>Keep it for next time</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={s.reviewItemBtn} onPress={() => skipItem(item.id)}>
-                    <Text style={s.reviewItemBtnText}>Skip it</Text>
-                  </TouchableOpacity>
+              {reasonOpenFor === item.id && (
+                <View style={s.wrapUpReasonBox}>
+                  <Text style={s.wrapUpReasonLabel}>Why?</Text>
+                  {REMOVE_REASONS.map(r => (
+                    <TouchableOpacity key={r.label} style={s.wrapUpReasonRow} onPress={() => chooseReason(item.id, r.value)}>
+                      <View style={s.wrapUpReasonDot} />
+                      <Text style={s.wrapUpReasonText}>{r.label}</Text>
+                    </TouchableOpacity>
+                  ))}
                 </View>
-              </View>
-            ))}
-          </ScrollView>
-          {!single && pending.length > 1 && (
+              )}
+            </View>
+          ))}
+          {pending.length > 1 && (
             <TouchableOpacity style={[s.companionSecondaryBtn, { marginTop: 6 }]} onPress={keepAllForNextTime}>
-              <Text style={s.companionSecondaryBtnText}>Keep all of these for next time</Text>
+              <Text style={s.companionSecondaryBtnText}>Keep everything for next time</Text>
             </TouchableOpacity>
           )}
         </View>
+      </ScrollView>
+      <View style={s.wrapUpFooter}>
+        <TouchableOpacity
+          style={[s.companionBtn, !allResolved && s.companionBtnDisabled]}
+          disabled={!allResolved}
+          onPress={() => onResolve(resolved)}
+        >
+          <Text style={s.companionBtnText}>{ctaLabel}</Text>
+        </TouchableOpacity>
       </View>
-    </Modal>
+    </SafeAreaView>
   );
 }
 
 // Full-screen reveal, replacing the old inline card so the before/after
-// slider gets real screen space to drag across instead of a cramped 260px
-// strip inside a scrolling card. Same drag-to-compare interaction and
-// BEFORE/AFTER labels as before - this only changes where it's presented and
-// how much room it gets. onDismiss is used by both the close affordance and
-// the continue button - closing and continuing are the same transition here,
-// there's nothing to "cancel back" to once the progress photo is already in.
+// comparison gets real screen space instead of a cramped 260px strip inside
+// a scrolling card. Uses BeforeAfterStack/BeforeAfterInspector (DecisionLog.md
+// 2026-07-18, retiring the old drag-to-compare slider) - tap either image to
+// look closer, no gesture handling. onDismiss is used by both the close
+// affordance and the continue button - closing and continuing are the same
+// transition here, there's nothing to "cancel back" to once the progress
+// photo is already in.
 function CompanionRevealModal({ visible, batchIndex, beforeUri, afterUri, visibleChangeText, revealReady, onDismiss }) {
   // Per-batch reveal only - copy/framing here is intentionally unchanged by
   // the completion redesign (DecisionLog.md 2026-07-18). This fires after
@@ -1017,7 +1033,7 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
         <Text style={s.completedTaskCountText}>{taskCount} {taskCount === 1 ? "task" : "tasks"} completed</Text>
       )}
       {beforeUri && currentUri && (
-        <View style={s.completedSliderArea}>
+        <View style={s.completedBeforeAfterArea}>
           <BeforeAfterStack beforeUri={beforeUri} afterUri={currentUri} height={200} onPress={setInspectTab} />
         </View>
       )}
@@ -1146,7 +1162,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // established pattern as companionBasePhotoRef/companionOriginalPhotoRef -
   // DecisionLog.md 2026-07-18). Needed because openBatchPhotoSheet is called
   // synchronously right after setBatchItems whenever Continue resolves
-  // skip/carry decisions via UnresolvedItemsReview, and that native
+  // skip/carry decisions via the wrap-up screen (CompanionWrapUp), and that
+  // photo-sheet's native
   // Alert.alert's callbacks (captureCompanionPhoto/pickCompanionPhoto ->
   // submitCompanionProgressPhoto) are permanently bound to that same
   // render's closures - by the time the user actually takes/picks a photo
@@ -1353,17 +1370,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       return;
     }
     logEvent(getAnalytics(), "batch_item_skip_popup_shown", { planId: currentPlanId, batchIndex: companionBatchIndex, uncheckedCount: unchecked.length });
-    setUnresolvedReview({ items: unchecked });
+    setUnresolvedReview({ items: unchecked, source: "continue" });
   };
 
-  // Single-tap action straight to Home - no review, no required photo, no
-  // generateNextAction call (DecisionLog.md 2026-07-18, reversing the
-  // earlier photo-required design). The one thing it does write is the
-  // current checkbox state itself - reopening the plan later (Home banner
-  // and My Plans both route straight to Companion) shows checkboxes exactly
-  // where they were left, without needing a full session-grounding call at
-  // the moment the user walks away instead of when they actually come back.
+  // Single-tap action straight to Home when nothing's unresolved - no
+  // review, no required photo (DecisionLog.md 2026-07-18, reversing the
+  // earlier photo-required design). When there IS something unresolved,
+  // Pause now enters the same wrap-up screen Continue uses (DecisionLog.md
+  // 2026-07-19, a deliberate scoped update to the 2026-07-18 "Pause is
+  // always single-tap" decision) - still never requires a photo either way,
+  // that part of the original decision holds.
   const handleBatchPauseTapped = () => {
+    const unchecked = batchItems.filter(i => i.status !== "checked");
+    if (unchecked.length > 0) {
+      setUnresolvedReview({ items: unchecked, source: "pause" });
+      return;
+    }
     logEvent(getAnalytics(), "batch_session_paused", { planId: currentPlanId, batchIndex: companionBatchIndex });
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": batchItems })
@@ -1372,9 +1394,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     goHome();
   };
 
-  // resolutions: { [itemId]: { action: "carried" | "skipped", reason?: string } }
-  const handleUnresolvedReviewResolve = (resolutions) => {
-    setBatchItems(prev => prev.map(item => {
+  // resolutions: { [itemId]: { action: "carried" | "skipped", reason?: string } }.
+  // Post-resolution behavior branches on unresolvedReview.source
+  // (DecisionLog.md 2026-07-19): Continue proceeds to the progress-photo
+  // sheet as before; Pause now saves currentBatch.items (with these
+  // resolutions applied) and goes home, same write handleBatchPauseTapped's
+  // zero-unresolved-items shortcut already does, just reached via the
+  // wrap-up screen instead of immediately. nextItems is computed explicitly
+  // rather than trusting `batchItems` right after setBatchItems - same
+  // stale-closure reasoning as batchItemsRef elsewhere, cheap to apply here
+  // too since we need the resolved array as a value regardless.
+  const handleWrapUpResolve = (resolutions) => {
+    const source = unresolvedReview?.source;
+    const nextItems = batchItems.map(item => {
       const resolution = resolutions[item.id];
       if (!resolution) return item;
       if (resolution.action === "carried") {
@@ -1383,9 +1415,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       }
       logEvent(getAnalytics(), "batch_item_skipped", { planId: currentPlanId, batchIndex: companionBatchIndex, itemId: item.id, reason: resolution.reason || null });
       return { ...item, status: "skipped", skipReason: resolution.reason || null };
-    }));
+    });
+    setBatchItems(nextItems);
     setUnresolvedReview(null);
-    openBatchPhotoSheet();
+    if (source === "pause") {
+      logEvent(getAnalytics(), "batch_session_paused", { planId: currentPlanId, batchIndex: companionBatchIndex });
+      if (currentPlanId) {
+        updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": nextItems })
+          .catch(e => console.log("Save paused batch state error:", e.message));
+      }
+      goHome();
+    } else {
+      openBatchPhotoSheet();
+    }
   };
 
   const handleCompanionRevealContinue = () => {
@@ -2435,6 +2477,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (showHistory) { setShowHistory(false); setShowMenu(true); return true; }
       if (showFaq) { setShowFaq(false); setShowMenu(true); return true; }
       if (showAccount) { setShowAccount(false); setShowMenu(true); return true; }
+      // Checked before the Companion branch below, same reasoning as
+      // History/FAQ/Account above it - the wrap-up screen (DecisionLog.md
+      // 2026-07-19) is a step within Companion, not its own destination, so
+      // back from it returns to the checklist rather than skipping past
+      // Companion entirely.
+      if (results && showCompanion && unresolvedReview) { setUnresolvedReview(null); return true; }
       // Checked before the plain `results` branch below - otherwise back
       // from Companion would skip Results entirely and exit straight to
       // Home, instead of stepping back one screen like every other back
@@ -2446,7 +2494,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, results, showCompanion]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, results, showCompanion, unresolvedReview]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -3245,6 +3293,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // COMPANION SCREEN (checklist, batch loop - "execution mode", split from
   // Results per DecisionLog.md 2026-07-18)
   if (results && showCompanion) {
+    // Wrap-up is its own full screen now, not a Modal nested in the
+    // Companion ScrollView (DecisionLog.md 2026-07-19) - checked first,
+    // same "more specific screen before its parent" pattern already used
+    // elsewhere in this file (e.g. History checked before Menu).
+    if (unresolvedReview) {
+      return (
+        <CompanionWrapUp
+          items={unresolvedReview.items}
+          checkedCount={batchItems.filter(i => i.status === "checked").length}
+          source={unresolvedReview.source}
+          onResolve={handleWrapUpResolve}
+          onCancel={() => setUnresolvedReview(null)}
+        />
+      );
+    }
     dlog(`[COMPANION DEBUG 5] render gate, batchItems: ${batchItems.length} | stage: ${companionStage}`);
     // companionCompletedProject (set the instant the user finishes, this
     // session) takes priority over results.companionComplete (the persisted
@@ -3348,13 +3411,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             revealReady={companionRevealReady}
             onDismiss={handleCompanionRevealContinue}
           />
-          {unresolvedReview && (
-            <UnresolvedItemsReview
-              items={unresolvedReview.items}
-              onResolve={handleUnresolvedReviewResolve}
-              onCancel={() => setUnresolvedReview(null)}
-            />
-          )}
         </ScrollView>
       </SafeAreaView>
     );
@@ -3854,17 +3910,20 @@ const s = StyleSheet.create({
   batchItemCheckboxChecked: { backgroundColor: BRAND.green, borderColor: BRAND.green },
   batchItemText: { flex: 1, fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.ink, lineHeight: 21 },
   batchItemTextChecked: { color: BRAND.slate, textDecorationLine: "line-through" },
-  reviewModalBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", alignItems: "center", justifyContent: "center", padding: 24 },
-  reviewModalCard: { width: "100%", maxHeight: "80%", backgroundColor: BRAND.white, borderRadius: 16, padding: 20, position: "relative" },
-  reviewModalScroll: { flexShrink: 1 },
-  reviewModalCloseBtn: { position: "absolute", top: 14, right: 14, width: 28, height: 28, borderRadius: 14, backgroundColor: BRAND.offWhite, alignItems: "center", justifyContent: "center", zIndex: 1 },
-  reviewSingleHeading: { fontSize: 16, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 10, paddingRight: 30 },
-  reviewSingleItemBox: { backgroundColor: BRAND.offWhite, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 10, padding: 12, marginBottom: 4 },
-  reviewSingleItemText: { fontSize: 14, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 20 },
   reviewItemBlock: { marginTop: 14 },
   reviewItemText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, marginBottom: 8 },
   reviewItemBtn: { flex: 1, backgroundColor: BRAND.offWhite, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
   reviewItemBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink, textAlign: "center" },
+  wrapUpCelebrationTitle: { fontSize: 20, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8 },
+  wrapUpCelebrationRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
+  wrapUpCelebrationText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.green },
+  wrapUpReasonBox: { marginTop: 10, backgroundColor: BRAND.offWhite, borderRadius: 10, padding: 12 },
+  wrapUpReasonLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate, marginBottom: 8 },
+  wrapUpReasonRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 7 },
+  wrapUpReasonDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 1.5, borderColor: BRAND.mist },
+  wrapUpReasonText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.ink },
+  wrapUpFooter: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 18, backgroundColor: BRAND.white },
+  companionBtnDisabled: { backgroundColor: BRAND.stone },
   beforeAfterStackWrap: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
   beforeAfterStackImage: { width: "100%", height: "100%" },
   beforeAfterStackLabel: { position: "absolute", top: 8, left: 8, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
@@ -3894,7 +3953,7 @@ const s = StyleSheet.create({
   completedAccomplishmentRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 6 },
   completedAccomplishmentText: { fontSize: 14, fontFamily: "Inter_400Regular", color: BRAND.slate, flex: 1 },
   completedTaskCountText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist, marginBottom: 12 },
-  completedSliderArea: { height: 220, borderRadius: 12, overflow: "hidden", marginTop: 4 },
+  completedBeforeAfterArea: { height: 220, borderRadius: 12, overflow: "hidden", marginTop: 4 },
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
