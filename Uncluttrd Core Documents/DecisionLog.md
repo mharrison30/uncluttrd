@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-19 — Unresolved-items wrap-up: full-screen redesign, Pause rejoins the flow
+**Decision:** Retires `UnresolvedItemsReview`'s `Modal` in favor of `CompanionWrapUp`, a full-screen page reusing the existing `unresolvedReview` state as its render gate (early-return inside the Companion screen, matching how every other screen transition in this file works - no router in this app, so "new screen" means "new conditional branch," not a new route). Reframed tonally and structurally: leads with an unconditional celebration ("Nice work today! X tasks completed - You made meaningful progress.") before any mention of what's unresolved, replacing "What should I do with these?" / "these are unchecked" framing and dropping the old single-vs-multi-item special case (the celebration-first structure reads fine at any count). "Keep it for next time"/"Skip it" become "Keep"/"Remove" - same underlying `carried`/`skipped` data model, presentation only. Reason capture moves from a native `Alert.alert` to an inline expandable selector under the item, with relabeled reasons (Already done / Don't want to do this / Not worth the effort / Other) - same downstream purpose (feeds the AI's per-item context and the whole-project skip-exclusion list), avoids a popup-on-a-page feel. The bottom CTA is now a deliberate final tap (enabled only once every item is resolved) rather than auto-advancing the instant the last decision lands, befitting a real page instead of a quick popup.
+
+**Pause rejoins this flow - a deliberate, scoped update, not a silent revert.** The 2026-07-18 entry below made Pause a single tap with no review and no required photo. This adds the review step back for Pause specifically when something's unresolved (mirrors Continue's existing "skip the screen if nothing's unresolved" shortcut when there's nothing to review) - but the "no required photo" half of the original decision holds regardless: Pause's post-resolution path is still just a `currentBatch.items` save and `goHome()`, never the photo sheet. `unresolvedReview.source` (`"continue"|"pause"`) carries this distinction through, branching only the CTA copy and what happens after resolution.
+
+**Stale references cleaned up from the earlier slider retirement** (2026-07-18, below): `CompanionRevealModal`'s leading comment still described "drag to compare"/dragging a slider across the screen, and the `completedSliderArea` style name still implied a slider, despite both wrapping `BeforeAfterStack` since that redesign shipped. Neither was ever updated when the underlying code changed - fixed alongside this work since it's exactly the class of thing that caused genuine confusion about what was actually live before this session's Task 1 discovery pass.
+
+**Outcome:** Approved and implemented.
+
+**Impact:** Product/UX, Companion Design Principles
+
+---
+
 ### 2026-07-18 — "I like it as-is": explicit user override for project completion
 **Decision:** Adds a permanent, always-available override on the batch-active screen - a quiet tertiary text link ("I like it as-is", `BRAND.mist`, no underline, no confirmation step) below Pause, visually subordinate to both Continue (primary) and Pause (secondary/common-case) so it doesn't read as a third competing primary action. Calls the same `handleCompanionChooseFinish` the existing `completion-choice` "This feels finished" button uses, now taking a `source` parameter (`"completion_choice"` default, `"user_override"` for this new path) so both share the same Firestore write / celebration-screen logic without duplicating it.
 
