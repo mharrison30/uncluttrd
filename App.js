@@ -1638,7 +1638,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         logEvent(getAnalytics(), "batch_completion_recommended", { planId: effectivePlanId, batchIndex: newBatchIndex });
       }
 
-      dlog(`[PHOTO DEBUG] generateNextAction response received | batchIndex ${companionBatchIndex} -> ${newBatchIndex} | composedItems=${composedItems.length} | completionRecommended=${completionRecommended} | t=${Date.now()}`);
+      // completionReasonText/visibleChangeText included here permanently, not
+      // just for this investigation - "why didn't the AI recommend
+      // completion" had been unanswerable after the fact all session, since
+      // neither field was persisted anywhere (not in batchHistory, not in
+      // analytics, not previously in this log) and companionCompletionReason
+      // is in-memory only, gone once the app closes.
+      dlog(`[PHOTO DEBUG] generateNextAction response received | batchIndex ${companionBatchIndex} -> ${newBatchIndex} | composedItems=${composedItems.length} | completionRecommended=${completionRecommended} | completionReason=${completionReasonText} | visibleChange=${visibleChangeText} | t=${Date.now()}`);
       dlog(`[PHOTO DEBUG] companionBasePhotoRef updating | from=${companionBasePhotoRef.current} | to=${progressUri}`);
       companionBasePhotoRef.current = progressUri;
       setBatchItems(composedItems);
