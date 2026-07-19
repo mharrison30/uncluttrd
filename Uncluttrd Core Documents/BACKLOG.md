@@ -21,6 +21,17 @@ Priority levels:
 
 ## Open Items
 
+### 🟡 Batch item cards: title + explanation restructuring
+**Context:** Task-card polish (Jul 19, 2026) - restructure each checklist item's text from one long sentence into a short bold title + a smaller explanatory sentence (e.g. "Organize your writing tools" / "Place your pens and markers into a single container or drawer to keep the surface clear."), instead of "Route the visible cables behind the desk to keep the surface clear." as one line. Explicitly held out of that polish round for its own discovery/scoping session.
+
+**Investigated, not built:** requires an AI-prompt schema change, not client-side derivation - a title+detail pair isn't a mechanical split of one AI-generated sentence (different registers: short imperative phrase vs. a fuller instructional sentence), so no string-manipulation heuristic reliably produces it. Both `analyzePhoto`'s `firstActionBatch` field and `generateNextAction`'s `nextBatch` field currently emit plain strings and would need to emit `{title, detail}` objects instead.
+
+**Real scope, not a quick prompt tweak:** item shape (currently a plain string) threads through at least: 3 separate construction sites that convert AI response arrays into `batchItems`-shaped objects (the `[results]` effect, `submitCompanionProgressPhoto`'s `composedItems`, and the initial plan-save path), the `checklistLines`/`skippedItemTextsRef` prompt-context builders (both currently build strings from `item.text` directly), and both render sites (`BatchChecklist`, `CompanionWrapUp`). Also raises a real backward-compatibility question: any plan already persisted in Firestore (or mid-session on a device) has plain-string item text, not `{title, detail}` - old and new shapes need to coexist, either via a rendering-time fallback or a data migration.
+
+**Action:** Needs its own discovery pass (Session 1 style) before implementation - not a same-night addition alongside other polish items.
+
+---
+
 ### 🔴 analyzePhoto compatibility shim for build 15 (live App Store version)
 **Context:** `85168f3` (Jul 14, 2026 free-plan server-enforcement work) made `analyzePhoto` require `request.auth` and a client-sent `analysisId` as hard preconditions, and was deployed straight to `cluttrd-3e335` - the same Firebase project the live public App Store app (confirmed via App Store Connect to be **build 15**, which predates `analysisId` entirely) also uses. There is no staging/production project split (`.firebaserc` has one alias) and no separate EAS build profile for internal testing (every build this whole session, including TestFlight ones, used the `production` profile). Every real production user's photo analysis was being rejected outright with `invalid-argument`/`unauthenticated` - a live outage on core functionality, not a single-user report.
 
