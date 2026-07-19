@@ -654,15 +654,17 @@ function BeforeAfterInspector({ visible, beforeUri, afterUri, initialTab, onClos
 
 function CompanionCard({
   stage, tipIndex, batchIndex, completionReason,
-  onUpgrade, onChooseFinish, onChooseContinue, onAcknowledgeComplete,
+  onUpgrade, onChooseFinish, onChooseContinue,
 }) {
   // "reveal" is its own full-screen CompanionRevealModal, and "batch-active"
   // is its own BatchChecklist component - neither renders here (see the
   // results screen render for why: the reveal's before/after comparison
   // deserves more room than this card's single-title-single-body shape, and
-  // a checklist needs its own layout rhythm). Once the whole project is
-  // finished, the results screen renders CompanionCompletedSummary in this
-  // card's place instead - see there.
+  // a checklist needs its own layout rhythm). "finished" goes straight to
+  // CompanionCompletedSummary in this card's place - no "project-complete"
+  // transitional stage anymore (DecisionLog.md 2026-07-19; "This feels
+  // finished" now leads directly into the full celebration, not a second
+  // tap first).
   if (stage === "finished" || stage === "reveal" || stage === "batch-active") return null;
 
   const GENERATING_TIPS = [
@@ -714,19 +716,6 @@ function CompanionCard({
         </TouchableOpacity>
         <TouchableOpacity style={[s.companionBtn, { marginTop: 10 }]} onPress={onChooseContinue}>
           <Text style={s.companionBtnText}>Make one more improvement</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  if (stage === "project-complete") {
-    return (
-      <View style={s.companionCard}>
-        <CompanionProgressBar batchIndex={batchIndex} complete />
-        <Text style={s.companionTitle}>You did it</Text>
-        <Text style={s.companionBody}>You turned this space into something that works better for you.</Text>
-        <TouchableOpacity style={s.companionBtn} onPress={onAcknowledgeComplete}>
-          <Text style={s.companionBtnText}>See your finished plan</Text>
         </TouchableOpacity>
       </View>
     );
@@ -1155,7 +1144,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // replay the old cached result) and in reset()/goHome().
   const lastFailedAnalysisRef = useRef(null);
 
-  const [companionStage, setCompanionStage] = useState("batch-active"); // batch-active | generating | reveal | paywall-prompt | completion-choice | project-complete | finished
+  const [companionStage, setCompanionStage] = useState("batch-active"); // batch-active | generating | reveal | paywall-prompt | completion-choice | finished
   // The live, in-progress checklist: [{id, text, status}], status one of
   // "pending" | "checked" | "carried" | "skipped" - carried/skipped are only
   // ever set by the unresolved-items review, never by direct toggling.
@@ -1478,7 +1467,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     const completedLocal = {
       completedAt: new Date().toISOString(),
       reason: isOverride ? null : companionCompletionReason,
-      celebrationHeadline: isOverride ? null : companionCompletionHeadline,
+      // Static, not AI-generated - the override path has no real AI
+      // completion judgment behind it, so there's nothing to summarize
+      // specifically (DecisionLog.md 2026-07-19). No accomplishment bullets
+      // either - simple beats fabricated specifics.
+      celebrationHeadline: isOverride ? "You created a space that works better for you." : companionCompletionHeadline,
       accomplishments: isOverride ? [] : companionCompletionAccomplishments,
       taskCount: completedTaskCountRef.current,
     };
@@ -1495,7 +1488,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // user chose "Make one more improvement" instead - see Analytics.md.
       logEvent(getAnalytics(), "batch_completion_accepted", { planId: currentPlanId, batchIndex: companionBatchIndex });
     }
-    setCompanionStage("project-complete");
+    // Straight to "finished" - no intermediate "project-complete" tap
+    // (DecisionLog.md 2026-07-19). Reaching the full celebration in one
+    // motion, not two.
+    setCompanionStage("finished");
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         companionComplete: {
@@ -1513,14 +1509,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
         setHistory(prev => prev.map(h => h.id === currentPlanId ? { ...h, companionComplete: completedLocal } : h));
       }).catch(e => console.log("Save companion complete error:", e.message));
     }
-  };
-
-  const handleCompanionAcknowledgeComplete = () => {
-    // Routes to Your Plan in its completed state, not a blank screen -
-    // "finished" is what makes the checklist render nothing; the results
-    // screen renders CompanionCompletedSummary in its place whenever
-    // companionCompletedProject / results.companionComplete is set.
-    setCompanionStage("finished");
   };
 
   const handleCompanionUpgradeRequest = () => {
@@ -3314,11 +3302,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     // companionCompletedProject (set the instant the user finishes, this
     // session) takes priority over results.companionComplete (the persisted
     // field, read back on a later resume) since it's always the freshest.
-    // Data being ready is not the same as it being time to show the summary -
-    // the celebratory "project-complete" stage still needs to play first;
-    // the summary only replaces CompanionCard once the user acknowledges it
-    // (companionStage becomes "finished") or the plan is reopened already
-    // complete (the [results] effect sets "finished" directly in that case).
+    // The summary replaces CompanionCard the instant companionStage becomes
+    // "finished" - handleCompanionChooseFinish sets that directly now
+    // (DecisionLog.md 2026-07-19, no intermediate tap) - or the plan is
+    // reopened already complete (the [results] effect sets "finished"
+    // directly in that case too).
     const projectCompleteData = companionCompletedProject || results.companionComplete || null;
     const showCompletedSummary = companionStage === "finished" && !!projectCompleteData;
     const completedAtValue = projectCompleteData?.completedAt ?? null;
@@ -3361,8 +3349,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
           {!showCompletedSummary && (
             companionStage === "batch-active" ? (
               // Only the checklist stage genuinely needs items to render -
-              // every other stage (generating/paywall-prompt/completion-choice/
-              // project-complete) is driven by companionStage alone.
+              // every other stage (generating/paywall-prompt/completion-choice)
+              // is driven by companionStage alone.
               // completion-choice in particular can legitimately be reached
               // with an empty batchItems: the AI returning no next-batch items
               // is itself the completion signal, not an error state - gating
@@ -3388,7 +3376,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                 onUpgrade={handleCompanionUpgradeRequest}
                 onChooseFinish={handleCompanionChooseFinish}
                 onChooseContinue={handleCompanionChooseContinue}
-                onAcknowledgeComplete={handleCompanionAcknowledgeComplete}
               />
             )
           )}
