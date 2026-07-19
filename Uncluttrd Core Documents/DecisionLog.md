@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-19 — Completion celebration collapsed to one screen, override gets a static headline
+**Decision:** Removes the "project-complete" transitional stage (the brief "You did it" / "See your finished plan" card) entirely. `handleCompanionChooseFinish` now sets `companionStage` directly to `"finished"`, so tapping "This feels finished" (or the "I like it as-is" override) leads in one motion straight into the full celebration - progress bar at 100%, badge, headline/accomplishments, before/after, confetti - rather than requiring a second tap to get there. Per Companion Design Principles #2 ("celebrate progress... before it asks for anything else"), the extra tap was itself a small piece of friction between the user's decision and the actual celebratory payoff.
+
+Manual-override completions (no real AI completion judgment behind them) now get a static, non-AI-generated headline - "You created a space that works better for you." - instead of no headline at all. Still zero accomplishment bullets for this path: simple beats fabricating specifics the app can't actually verify.
+
+**Verified before removing, not assumed:** traced every reference to `"project-complete"` and `handleCompanionAcknowledgeComplete` first - the stage was set in exactly one place (this handler) and read in exactly one place (the now-deleted `CompanionCard` branch), and the reopen-from-History path (the `[results]` effect) already set `"finished"` directly for an already-completed plan, never routing through `"project-complete"` - confirming the removal has no effect on that path or on `justCompletedThisSession`'s confetti gating (which depends only on `companionCompletedProject` being set, not on which stage follows it).
+
+**Outcome:** Approved and implemented.
+
+**Impact:** Product/UX, Companion Design Principles
+
+---
+
 ### 2026-07-19 — Unresolved-items wrap-up: full-screen redesign, Pause rejoins the flow
 **Decision:** Retires `UnresolvedItemsReview`'s `Modal` in favor of `CompanionWrapUp`, a full-screen page reusing the existing `unresolvedReview` state as its render gate (early-return inside the Companion screen, matching how every other screen transition in this file works - no router in this app, so "new screen" means "new conditional branch," not a new route). Reframed tonally and structurally: leads with an unconditional celebration ("Nice work today! X tasks completed - You made meaningful progress.") before any mention of what's unresolved, replacing "What should I do with these?" / "these are unchecked" framing and dropping the old single-vs-multi-item special case (the celebration-first structure reads fine at any count). "Keep it for next time"/"Skip it" become "Keep"/"Remove" - same underlying `carried`/`skipped` data model, presentation only. Reason capture moves from a native `Alert.alert` to an inline expandable selector under the item, with relabeled reasons (Already done / Don't want to do this / Not worth the effort / Other) - same downstream purpose (feeds the AI's per-item context and the whole-project skip-exclusion list), avoids a popup-on-a-page feel. The bottom CTA is now a deliberate final tap (enabled only once every item is resolved) rather than auto-advancing the instant the last decision lands, befitting a real page instead of a quick popup.
 
