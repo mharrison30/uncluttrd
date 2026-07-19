@@ -27,6 +27,7 @@ import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
 import ConfettiCannon from "react-native-confetti-cannon";
+import * as Updates from "expo-updates";
 
 // TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
 // outside MainApp's closure can log into the same buffer without
@@ -1136,11 +1137,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       Alert.alert("Share failed", e.message);
     }
   };
-  // Fires once per mount so a shared log can be matched to the exact build
-  // that produced it - confirms whether a given device is actually running
-  // the code containing a given fix, not a stale/cached build.
+  // Fires once per mount so a shared log can be matched to the exact OTA
+  // update that produced it - confirms whether a given device is actually
+  // running the code containing a given fix, not a stale/cached bundle.
+  // Updates.updateId/createdAt reflect the actual running bundle (no manual
+  // upkeep needed, unlike a hardcoded marker string) - added after a debug
+  // session where an expected log line was entirely absent and the running
+  // update's identity couldn't be confirmed from the log alone.
   useEffect(() => {
-    dlog("[BUILD DEBUG] MainApp mounted | marker: batch-workflow-v1");
+    dlog(`[BUILD DEBUG] MainApp mounted | updateId=${Updates.updateId || "embedded (no OTA update loaded)"} | channel=${Updates.channel || "n/a"} | createdAt=${Updates.createdAt ? Updates.createdAt.toISOString() : "n/a"}`);
   }, []);
   // Fires whenever this state actually settles (not when the setter is called),
   // since setState is async. This is the true post-update value.
