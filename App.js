@@ -1142,6 +1142,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
   // "pending" | "checked" | "carried" | "skipped" - carried/skipped are only
   // ever set by the unresolved-items review, never by direct toggling.
   const [batchItems, setBatchItems] = useState([]);
+  // Mirrors batchItems for submitCompanionProgressPhoto to read (same
+  // established pattern as companionBasePhotoRef/companionOriginalPhotoRef -
+  // DecisionLog.md 2026-07-18). Needed because openBatchPhotoSheet is called
+  // synchronously right after setBatchItems whenever Continue resolves
+  // skip/carry decisions via UnresolvedItemsReview, and that native
+  // Alert.alert's callbacks (captureCompanionPhoto/pickCompanionPhoto ->
+  // submitCompanionProgressPhoto) are permanently bound to that same
+  // render's closures - by the time the user actually takes/picks a photo
+  // (a real, multi-second delay), reading `batchItems` directly would still
+  // return the pre-resolution value, silently dropping whatever was just
+  // skipped or carried from that round's own context and from the
+  // whole-project skip-exclusion list.
+  const batchItemsRef = useRef(batchItems);
+  useEffect(() => {
+    batchItemsRef.current = batchItems;
+  }, [batchItems]);
   const debugShareLog = async () => {
     const text = debugLogBuffer.length ? debugLogBuffer.join("\n\n") : "(no debug log entries captured yet)";
     try {
@@ -1523,10 +1539,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       // signal, the checklist is intent, and any disagreement is never
       // surfaced to the user as a correction - the next batch is just
       // generated naturally around what the photo actually shows.
-      const checkedItems = batchItems.filter(i => i.status === "checked");
-      const carriedItems = batchItems.filter(i => i.status === "carried");
-      const skippedItems = batchItems.filter(i => i.status === "skipped");
-      const checklistLines = batchItems.map(item => {
+      // batchItemsRef, not batchItems directly - see its declaration for why
+      // (stale-closure fix, DecisionLog.md 2026-07-18).
+      const currentBatchItems = batchItemsRef.current;
+      const checkedItems = currentBatchItems.filter(i => i.status === "checked");
+      const carriedItems = currentBatchItems.filter(i => i.status === "carried");
+      const skippedItems = currentBatchItems.filter(i => i.status === "skipped");
+      const checklistLines = currentBatchItems.map(item => {
         const label = item.status === "checked" ? "the user marked this done"
           : item.status === "carried" ? "the user is still working on this, not done yet"
           : item.status === "skipped" ? `the user skipped this${item.skipReason ? ` (reason: ${item.skipReason})` : ""}`
@@ -1611,7 +1630,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
       if (effectivePlanId) {
         const archivedBatch = {
           batchIndex: companionBatchIndex,
-          items: batchItems,
+          items: currentBatchItems,
           completedAt: new Date().toISOString(),
         };
         updateDoc(doc(db, "users", user.uid, "plans", effectivePlanId), {
