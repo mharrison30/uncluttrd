@@ -842,27 +842,37 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
       <ScrollView contentContainerStyle={s.scrollContent}>
         <View style={s.companionCard}>
           {/* Celebration renders first, always, regardless of source or how
-              many items are pending - the win comes before the ask. */}
+              many items are pending - the win comes before the ask. "Nice
+              work today!" heading stays; everything below it is the leaner
+              structure (DecisionLog.md 2026-07-19) - "You made meaningful
+              progress" dropped as redundant now that the remaining-count
+              line and the global explanation carry that weight instead. */}
           <Text style={s.wrapUpCelebrationTitle}>Nice work today!</Text>
           <View style={s.wrapUpCelebrationRow}>
             <Check size={16} color={BRAND.green} strokeWidth={3} />
             <Text style={s.wrapUpCelebrationText}>{checkedCount} {checkedCount === 1 ? "task" : "tasks"} completed</Text>
           </View>
-          <Text style={s.companionBody}>You made meaningful progress.</Text>
           <Text style={[s.companionTitle, { marginTop: 6 }]}>
             {allResolved
               ? "All set."
-              : `Now let's decide what to do with the remaining ${pending.length} ${pending.length === 1 ? "item" : "items"}.`}
+              : (pending.length === 1 ? "One thing left. No rush." : `${pending.length} things left. No rush.`)}
           </Text>
+          {/* One global line, not repeated per item. */}
+          {!allResolved && (
+            <Text style={s.companionBody}>We'll include anything you keep in a future organizing session.</Text>
+          )}
           {pending.map(item => (
             <View key={item.id} style={s.reviewItemBlock}>
               <Text style={s.reviewItemText}>{item.text}</Text>
               <View style={{ flexDirection: "row", gap: 10 }}>
-                <TouchableOpacity style={s.reviewItemBtn} onPress={() => keepForNextTime(item.id)}>
-                  <Text style={s.reviewItemBtnText}>Keep</Text>
+                {/* Keep is the expected default (filled/primary); Remove
+                    stays easily available but visually secondary
+                    (outlined) - DecisionLog.md 2026-07-19. */}
+                <TouchableOpacity style={s.reviewItemBtnPrimary} onPress={() => keepForNextTime(item.id)}>
+                  <Text style={s.reviewItemBtnPrimaryText}>Keep</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={s.reviewItemBtn} onPress={() => toggleReasonPicker(item.id)}>
-                  <Text style={s.reviewItemBtnText}>Remove</Text>
+                <TouchableOpacity style={s.reviewItemBtnOutline} onPress={() => toggleReasonPicker(item.id)}>
+                  <Text style={s.reviewItemBtnOutlineText}>Remove</Text>
                 </TouchableOpacity>
               </View>
               {reasonOpenFor === item.id && (
@@ -3901,8 +3911,10 @@ const s = StyleSheet.create({
   batchItemTextChecked: { color: BRAND.slate, textDecorationLine: "line-through" },
   reviewItemBlock: { marginTop: 14 },
   reviewItemText: { fontSize: 14, fontFamily: "Inter_500Medium", color: BRAND.ink, marginBottom: 8 },
-  reviewItemBtn: { flex: 1, backgroundColor: BRAND.offWhite, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
-  reviewItemBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink, textAlign: "center" },
+  reviewItemBtnPrimary: { flex: 1, backgroundColor: BRAND.green, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
+  reviewItemBtnPrimaryText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: "white", textAlign: "center" },
+  reviewItemBtnOutline: { flex: 1, backgroundColor: "transparent", borderWidth: 1.5, borderColor: BRAND.green, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
+  reviewItemBtnOutlineText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green, textAlign: "center" },
   wrapUpCelebrationTitle: { fontSize: 20, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8 },
   wrapUpCelebrationRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
   wrapUpCelebrationText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.green },
