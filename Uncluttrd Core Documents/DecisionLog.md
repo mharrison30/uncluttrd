@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-19 — Wrap-up screen polish: leaner summary, Keep/Remove visual distinction
+**Decision:** Simplifies the wrap-up screen's post-heading copy. "Nice work today!" stays as the heading; "You made meaningful progress" is dropped as redundant now that a remaining-count line and a new global explanation line carry that weight instead. "Now let's decide what to do with the remaining N items" becomes "One thing left. No rush." (singular) / "{count} things left. No rush." (plural) - warmer, matches Companion Design Principles #7's calm voice better than the old project-management-adjacent "decide what to do with" framing. A new global line - "We'll include anything you keep in a future organizing session." - renders once beneath the summary, not per item, only while something's still pending.
+
+Keep and Remove buttons are now visually distinct: Keep is filled `BRAND.green` (the expected default action), Remove is outlined (transparent background, green border/text) - reusing the existing `changeBtn`/`changeBtnText` outline convention already established elsewhere in the app rather than inventing a new visual language. Remove stays equally easy to tap, just visually secondary to Keep.
+
+**Held for a separate session, not built here:** restructuring each item's text into a bold title + smaller explanatory sentence. Investigated first - this needs either an AI-prompt schema change (both `analyzePhoto`'s `firstActionBatch` and `generateNextAction`'s `nextBatch` currently emit single strings, not `{title, detail}`) or a client-side derivation, and client-side splitting can't reliably produce a well-formed short title + full sentence from an arbitrary AI-generated sentence - it needs real generation, not string manipulation. The AI-prompt route is the right one, but it's a genuinely bigger change than anything else in this polish round: the item shape threads through 3 separate construction sites converting AI responses into `batchItems`, the exclusion-list/prompt-context builders, both render sites, and raises a real backward-compatibility question for plans already persisted with plain-string items. Deliberately scoped out of tonight's work for its own discovery pass.
+
+**Outcome:** Approved and implemented (items 1/2/4/5 of the approved scope).
+
+**Impact:** Product/UX, Companion Design Principles
+
+---
+
 ### 2026-07-19 — Completion celebration collapsed to one screen, override gets a static headline
 **Decision:** Removes the "project-complete" transitional stage (the brief "You did it" / "See your finished plan" card) entirely. `handleCompanionChooseFinish` now sets `companionStage` directly to `"finished"`, so tapping "This feels finished" (or the "I like it as-is" override) leads in one motion straight into the full celebration - progress bar at 100%, badge, headline/accomplishments, before/after, confetti - rather than requiring a second tap to get there. Per Companion Design Principles #2 ("celebrate progress... before it asks for anything else"), the extra tap was itself a small piece of friction between the user's decision and the actual celebratory payoff.
 
