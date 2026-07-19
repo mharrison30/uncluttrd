@@ -818,13 +818,15 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
   // field) - framed as helping the AI plan better next time, never a
   // scolding. Inline expandable selector under the item now, not a native
   // Alert.alert - a popup felt like an interruption on what's meant to read
-  // as a calm page, not a modal-over-modal. Same purpose/downstream handling
-  // as before (skipReason feeds the AI's per-item context and the
-  // whole-project exclusion list) - only the picker widget changed.
+  // as a calm page, not a modal-over-modal. Presentation only - `value`
+  // stays the original stored/logged string (batch_item_skipped's `reason`
+  // analytics property depends on it; changing it would split that
+  // dimension's historical data between old and new wording for the same
+  // underlying concept). Only `label`, what the user actually sees, is new.
   const REMOVE_REASONS = [
-    { label: "Already done", value: "already done" },
-    { label: "Don't want to do this", value: "don't want to do this" },
-    { label: "Not worth the effort", value: "not worth the effort" },
+    { label: "Already done", value: "not applicable" },
+    { label: "Don't want to do this", value: "changed my mind" },
+    { label: "Not worth the effort", value: "too hard" },
     { label: "Other", value: null },
   ];
   const toggleReasonPicker = (itemId) => setReasonOpenFor(prev => (prev === itemId ? null : itemId));
