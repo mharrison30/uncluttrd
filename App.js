@@ -704,7 +704,12 @@ function CompanionCard({
         <CompanionProgressBar batchIndex={batchIndex} />
         <Text style={s.companionTitle}>This is looking good</Text>
         <Text style={s.companionBody}>{completionReason}</Text>
-        <TouchableOpacity style={s.companionBtn} onPress={onChooseFinish}>
+        {/* Explicit no-arg call, not onPress={onChooseFinish} directly -
+            TouchableOpacity's onPress passes a GestureResponderEvent as the
+            first argument, which would otherwise land in
+            handleCompanionChooseFinish's `source` parameter instead of its
+            "completion_choice" default. */}
+        <TouchableOpacity style={s.companionBtn} onPress={() => onChooseFinish()}>
           <Text style={s.companionBtnText}>This feels finished</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[s.companionBtn, { marginTop: 10 }]} onPress={onChooseContinue}>
@@ -738,7 +743,7 @@ function CompanionCard({
 // they mean different things - "plan my next session" vs. "remember where
 // I left off" - even though the underlying mechanics converge on the same
 // review + photo flow.
-function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause }) {
+function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause, onLikeItAsIs }) {
   return (
     <View style={s.companionCard}>
       <CompanionProgressBar batchIndex={batchIndex} />
@@ -768,6 +773,14 @@ function BatchChecklist({ items, batchIndex, onToggleItem, onContinue, onPause }
       </TouchableOpacity>
       <TouchableOpacity style={s.companionSecondaryBtn} onPress={onPause}>
         <Text style={s.companionSecondaryBtnText}>That's enough for today</Text>
+      </TouchableOpacity>
+      {/* Tertiary, deliberately quieter than Pause - permanent completion
+          override, not the common/expected action Pause is (DecisionLog.md
+          2026-07-18). Bypasses the AI's completion recommendation entirely,
+          matching this project's "completion is a user decision, informed
+          by AI, not imposed" philosophy actually reaching the UI. */}
+      <TouchableOpacity style={s.companionTertiaryBtn} onPress={onLikeItAsIs}>
+        <Text style={s.companionTertiaryBtnText}>I like it as-is</Text>
       </TouchableOpacity>
     </View>
   );
@@ -1383,31 +1396,54 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
     setCompanionStage("batch-active");
   };
 
-  const handleCompanionChooseFinish = () => {
+  // source: "completion_choice" (default - AI recommended, user agreed via
+  // "This feels finished") or "user_override" ("I like it as-is" on the
+  // batch-active screen, bypassing an AI recommendation entirely -
+  // DecisionLog.md 2026-07-18, the "user decides" half of the completion
+  // philosophy actually reaching the UI). companionCompletionReason/Headline/
+  // Accomplishments reflect the AI's LAST completion judgment - on the
+  // override path that judgment was completionRecommended: false (that's the
+  // whole reason the override exists), so its "reason" text explains why the
+  // space *isn't* finished. Showing that on a screen celebrating that it now
+  // IS finished would be actively contradictory, not just stale - so the
+  // override path skips it entirely rather than reusing it. The celebration
+  // screen already renders gracefully with no headline/reason (badge + task
+  // count + photos only), which reads as honest given there's no real AI
+  // judgment behind this completion.
+  const handleCompanionChooseFinish = (source = "completion_choice") => {
+    const isOverride = source === "user_override";
     // Local timestamp for the immediate UI - CompanionCompletedSummary can
     // render right away without waiting on the serverTimestamp() write below
     // to round-trip back into `results`.
     const completedLocal = {
       completedAt: new Date().toISOString(),
-      reason: companionCompletionReason,
-      celebrationHeadline: companionCompletionHeadline,
-      accomplishments: companionCompletionAccomplishments,
+      reason: isOverride ? null : companionCompletionReason,
+      celebrationHeadline: isOverride ? null : companionCompletionHeadline,
+      accomplishments: isOverride ? [] : companionCompletionAccomplishments,
       taskCount: completedTaskCountRef.current,
     };
     setCompanionCompletedProject(completedLocal);
     logEvent(getAnalytics(), "companion_project_finished", { planId: currentPlanId, batchIndex: companionBatchIndex });
-    // Absence of this event after a batch_completion_recommended implies the
-    // user chose "Make one more improvement" instead - see Analytics.md.
-    logEvent(getAnalytics(), "batch_completion_accepted", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    if (isOverride) {
+      // Distinct from batch_completion_accepted below - there was no AI
+      // recommendation to agree with, so counting this as "accepted" would
+      // corrupt that event's documented meaning (its absence is used to
+      // infer "user chose continue instead"). See Analytics.md.
+      logEvent(getAnalytics(), "batch_completion_overridden", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    } else {
+      // Absence of this event after a batch_completion_recommended implies the
+      // user chose "Make one more improvement" instead - see Analytics.md.
+      logEvent(getAnalytics(), "batch_completion_accepted", { planId: currentPlanId, batchIndex: companionBatchIndex });
+    }
     setCompanionStage("project-complete");
     if (currentPlanId) {
       updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
         companionComplete: {
           completedAt: serverTimestamp(),
-          reason: companionCompletionReason,
-          celebrationHeadline: companionCompletionHeadline,
-          accomplishments: companionCompletionAccomplishments,
-          taskCount: completedTaskCountRef.current,
+          reason: completedLocal.reason,
+          celebrationHeadline: completedLocal.celebrationHeadline,
+          accomplishments: completedLocal.accomplishments,
+          taskCount: completedLocal.taskCount,
         },
       }).then(() => {
         // history is a one-time getDocs load, not onSnapshot (same gap
@@ -3250,6 +3286,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
                   onToggleItem={toggleBatchItem}
                   onContinue={handleBatchContinueTapped}
                   onPause={handleBatchPauseTapped}
+                  onLikeItAsIs={() => handleCompanionChooseFinish("user_override")}
                 />
               )
             ) : (
@@ -3780,6 +3817,8 @@ const s = StyleSheet.create({
   companionBtnText: { color: "white", fontSize: 15, fontFamily: "Inter_600SemiBold" },
   companionSecondaryBtn: { marginTop: 12, padding: 8, alignItems: "center" },
   companionSecondaryBtnText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textDecorationLine: "underline" },
+  companionTertiaryBtn: { marginTop: 2, padding: 8, alignItems: "center" },
+  companionTertiaryBtnText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
   companionTipText: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginTop: 10 },
   companionProgressCaption: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginBottom: 6, letterSpacing: 0.3 },
   companionProgressTrack: { height: 4, backgroundColor: BRAND.offWhite, borderRadius: 2, overflow: "hidden" },
