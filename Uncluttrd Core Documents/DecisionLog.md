@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-20 — Confetti library swap: react-native-confetti-cannon to react-native-fast-confetti
+**Decision:** Swaps the completion-celebration confetti from `react-native-confetti-cannon` (plain `Animated` Views, unmaintained for ~5 years, no true physics) to `react-native-fast-confetti` (Skia Atlas API, real physics simulation, actively maintained). Investigated first (2026-07-20 investigation, not logged as its own entry): confirmed no better options exist within a pure-JS approach, confirmed no way to access iOS's actual native celebration effects (e.g. iMessage's) without either shipping undocumented `CAEmitterLayer` behaviors (explicitly flagged unsafe for production by the one detailed technical source that's achieved it) or taking on real, platform-asymmetric native-module maintenance (Android has no equivalent particle-emitter primitive) - even Shopify's own engineering team evaluated and moved away from a native `CAEmitterLayer` module toward a Reanimated-based JS approach for this exact problem. `react-native-fast-confetti` is the ceiling of the JS/Skia tier without taking on that native-maintenance burden.
+
+**Compatibility confirmed before implementing, not assumed:** checked this project's actual installed versions against the library's stated requirements (React `19.1.0` vs `>=19`, React Native `0.81.5` vs `>=0.79`, Reanimated `4.1.7` resolved vs `>=4.1.0 <5`) - all already satisfied, no upgrade needed. `react-native-worklets` was already present transitively via Reanimated 4.x; only `@shopify/react-native-skia` needed adding.
+
+**Port, not a literal 1:1 parameter copy:** `PIConfetti` (the "bursts from a point, then drifts down" component) matches the old cannon's behavior. Count (100), origin (top-center), and `fadeOutOnEnd` ported directly. `gravity` (lowered to 1.5 from the library's 3.0 default) stands in for the old library's timing-based `explosionSpeed`/`fallSpeed` to preserve the "lingers, doesn't flash by" intent from that earlier speed fix - a physics-based knob approximating a timing-based one, not an exact port, so it needs an on-device pacing check before being considered final. Flake shape/size is a genuinely new customization axis the old library never exposed - given a reasonable starting default, not a ported value.
+
+**Outcome:** Approved and implemented. Requires a native rebuild (Skia has native code) - build not triggered without separate explicit go-ahead, per the standing rule.
+
+**Impact:** Product/UX, Architecture
+
+---
+
 ### 2026-07-19 — Wrap-up screen final touches: green count, borderless card, CTA reward animation
 **Decision:** Three small styling/animation-only changes, no logic or architecture. (1) The remaining-item count ("2" in "2 things left. No rush.," or "One" in the singular case) is now colored `BRAND.green`, matching the completed-count color - reframes both numbers as parts of the same session rather than a success/problem split. (2) The wrap-up card drops its green border in favor of a plain white card with a subtle shadow (new `wrapUpCard` style, `companionCard` itself untouched since `BatchChecklist`/`CompanionCompletedSummary` still use it) - calmer now that the border was drawing more attention to the container than the content. (3) The Continue button animates to its active green state (color fade + a small scale pop) once every item is resolved, instead of an instant enabled/disabled style swap - a small reward moment for finishing the review.
 
