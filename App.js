@@ -168,6 +168,12 @@ const BRAND = {
   mist: "#B0B8BF",
 };
 
+// Module-level, not defined inside a component - Animated.createAnimatedComponent
+// called on every render would mint a new component type each time, forcing a
+// full remount instead of animating. Used for the wrap-up screen's Continue
+// button color/scale reward animation.
+const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
+
 const TIERS = [
   { id: "budget", label: "Budget", range: "Under $50", icon: Check, color: BRAND.green, bg: BRAND.greenLight, border: BRAND.greenMid },
   { id: "mid", label: "Mid-Range", range: "$50-$200", icon: Sparkles, color: BRAND.tan, bg: BRAND.tanLight, border: BRAND.tanBorder },
@@ -830,6 +836,23 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
   const allResolved = pending.length === 0;
   const ctaLabel = isPause ? "Save and finish for today" : "Continue";
 
+  // CTA reward animation - a color fade plus a small scale pop when the
+  // review finishes, not just an instant enabled/disabled style swap
+  // (DecisionLog.md 2026-07-19). Color needs useNativeDriver: false (not
+  // supported by the native driver); the scale pop runs on the native
+  // driver since transform is.
+  const ctaColorAnim = useRef(new Animated.Value(0)).current;
+  const ctaScaleAnim = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    Animated.timing(ctaColorAnim, { toValue: allResolved ? 1 : 0, duration: 400, useNativeDriver: false }).start();
+    if (allResolved) {
+      Animated.sequence([
+        Animated.timing(ctaScaleAnim, { toValue: 1.06, duration: 160, useNativeDriver: true }),
+        Animated.spring(ctaScaleAnim, { toValue: 1, friction: 4, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [allResolved]);
+
   return (
     <SafeAreaView style={s.safe}>
       <StatusBar barStyle="light-content" />
@@ -840,7 +863,7 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
         <View style={{ flex: 1 }} />
       </View>
       <ScrollView contentContainerStyle={s.scrollContent}>
-        <View style={s.companionCard}>
+        <View style={s.wrapUpCard}>
           {/* Celebration renders first, always, regardless of source or how
               many items are pending - the win comes before the ask. "Nice
               work today!" heading stays; everything below it is the leaner
@@ -852,10 +875,17 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
             <Check size={16} color={BRAND.green} strokeWidth={3} />
             <Text style={s.wrapUpCelebrationText}>{checkedCount} {checkedCount === 1 ? "task" : "tasks"} completed</Text>
           </View>
+          {/* Remaining count colored green to match the completed count -
+              reframes both numbers as parts of the same session, not a
+              success/problem split (DecisionLog.md 2026-07-19). */}
           <Text style={[s.companionTitle, { marginTop: 6 }]}>
-            {allResolved
-              ? "All set."
-              : (pending.length === 1 ? "One thing left. No rush." : `${pending.length} things left. No rush.`)}
+            {allResolved ? (
+              "All set."
+            ) : pending.length === 1 ? (
+              <><Text style={s.wrapUpRemainingCount}>One</Text> thing left. No rush.</>
+            ) : (
+              <><Text style={s.wrapUpRemainingCount}>{pending.length}</Text> things left. No rush.</>
+            )}
           </Text>
           {/* One global line, not repeated per item. */}
           {!allResolved && (
@@ -896,13 +926,19 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
         </View>
       </ScrollView>
       <View style={s.wrapUpFooter}>
-        <TouchableOpacity
-          style={[s.companionBtn, !allResolved && s.companionBtnDisabled]}
+        <AnimatedTouchable
+          style={[
+            s.companionBtn,
+            {
+              backgroundColor: ctaColorAnim.interpolate({ inputRange: [0, 1], outputRange: [BRAND.stone, BRAND.green] }),
+              transform: [{ scale: ctaScaleAnim }],
+            },
+          ]}
           disabled={!allResolved}
           onPress={() => onResolve(resolved)}
         >
           <Text style={s.companionBtnText}>{ctaLabel}</Text>
-        </TouchableOpacity>
+        </AnimatedTouchable>
       </View>
     </SafeAreaView>
   );
@@ -3918,13 +3954,18 @@ const s = StyleSheet.create({
   wrapUpCelebrationTitle: { fontSize: 20, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8 },
   wrapUpCelebrationRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
   wrapUpCelebrationText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.green },
+  wrapUpRemainingCount: { color: BRAND.green },
+  // No green border, unlike companionCard - a calmer white card with a
+  // subtle shadow instead (same shadow recipe as uploadBox) reads better
+  // now that the tone here is calm, not celebratory or attention-seeking
+  // (DecisionLog.md 2026-07-19).
+  wrapUpCard: { backgroundColor: BRAND.white, borderRadius: 16, padding: 18, marginBottom: 16, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 3 },
   wrapUpReasonBox: { marginTop: 10, backgroundColor: BRAND.offWhite, borderRadius: 10, padding: 12 },
   wrapUpReasonLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate, marginBottom: 8 },
   wrapUpReasonRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 7 },
   wrapUpReasonDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 1.5, borderColor: BRAND.mist },
   wrapUpReasonText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.ink },
   wrapUpFooter: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 18, backgroundColor: BRAND.white },
-  companionBtnDisabled: { backgroundColor: BRAND.stone },
   beforeAfterStackWrap: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
   beforeAfterStackImage: { width: "100%", height: "100%" },
   beforeAfterStackLabel: { position: "absolute", top: 8, left: 8, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
