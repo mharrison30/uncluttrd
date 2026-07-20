@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-20 — PIConfetti burst-direction fix: spread/initialSpeed were never set
+**Issue:** After the confetti library swap (below), the new confetti fell as uniform rain from the top of the screen instead of bursting from the origin point the way the old cannon did.
+
+**Root cause, confirmed from the library's actual source, not the README:** the initial swap set `blastPosition`, `count`, `fadeOutOnEnd`, and `gravity` on `<PIConfetti.Origin>`, but never `spread` or `initialSpeed` - the two props that control burst direction and force. Both fell back to library defaults: `spread: 2*Math.PI` (a full 360° circle) and `initialSpeed: 1`. Verified in `PIConfetti.tsx`/`utils.ts` that the spread cone is always centered on "upward" (`baseAngle = -Math.PI/2`, hardcoded regardless of `blastPosition`) - so a full-circle spread launched particles in every direction including straight down and sideways immediately at the top edge, with no room to visibly arc upward first. That read as rain, not a burst.
+
+**Decision:** `spread={Math.PI}` (an upward hemisphere - full left-right screen coverage from a single top-center origin, zero particles launching downward initially) and `initialSpeed={2}` (using `CannonConfetti`'s own reference value for its edge-positioned origins, per the approved plan, since `CannonConfetti`'s narrower `Math.PI/5` default is tuned for two converging corner-origins, not one origin covering a full screen width alone). `gravity` nudged from `1.5` to `2` - the launch phase itself now creates hang-time, needing less compensation than when particles had no upward launch at all.
+
+**Outcome:** Approved and implemented. All three values are a reasoned estimate from the physics model, not confirmed visually - needs an on-device test, same as the original swap.
+
+**Impact:** Product/UX
+
+---
+
 ### 2026-07-20 — Confetti library swap: react-native-confetti-cannon to react-native-fast-confetti
 **Decision:** Swaps the completion-celebration confetti from `react-native-confetti-cannon` (plain `Animated` Views, unmaintained for ~5 years, no true physics) to `react-native-fast-confetti` (Skia Atlas API, real physics simulation, actively maintained). Investigated first (2026-07-20 investigation, not logged as its own entry): confirmed no better options exist within a pure-JS approach, confirmed no way to access iOS's actual native celebration effects (e.g. iMessage's) without either shipping undocumented `CAEmitterLayer` behaviors (explicitly flagged unsafe for production by the one detailed technical source that's achieved it) or taking on real, platform-asymmetric native-module maintenance (Android has no equivalent particle-emitter primitive) - even Shopify's own engineering team evaluated and moved away from a native `CAEmitterLayer` module toward a Reanimated-based JS approach for this exact problem. `react-native-fast-confetti` is the ceiling of the JS/Skia tier without taking on that native-maintenance burden.
 
