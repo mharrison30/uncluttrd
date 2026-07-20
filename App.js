@@ -1035,7 +1035,7 @@ function formatCompletedDate(value) {
 // "celebrate the accomplishment" screen the completion redesign is about
 // (DecisionLog.md 2026-07-18) - headline + accomplishments list are new,
 // task count is demoted to small supporting text, no elapsed time anywhere.
-function CompanionCompletedSummary({ completedAt, reason, headline, accomplishments, taskCount, beforeUri, currentUri, justCompletedThisSession }) {
+function CompanionCompletedSummary({ completedAt, reason, headline, accomplishments, taskCount, beforeUri, currentUri }) {
   const dateText = formatCompletedDate(completedAt);
   const [inspectTab, setInspectTab] = useState(null);
   const hasAccomplishments = Array.isArray(accomplishments) && accomplishments.length > 0;
@@ -1075,54 +1075,6 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
         </View>
       )}
       <BeforeAfterInspector visible={!!inspectTab} beforeUri={beforeUri} afterUri={currentUri} initialTab={inspectTab} onClose={() => setInspectTab(null)} />
-      {/* Swapped from react-native-confetti-cannon to react-native-fast-confetti
-          (Skia-based, real physics, actively maintained - DecisionLog.md
-          2026-07-20) for noticeably more premium motion. PIConfetti is the
-          "bursts from a point, then drifts down" component, matching the old
-          cannon's behavior - same count (100) and origin (top-center) as
-          before, fadeOutOnEnd is the direct equivalent of the old fadeOut.
-
-          spread/initialSpeed fix (DecisionLog.md 2026-07-20): the initial
-          swap left both unset, falling back to the library's own defaults -
-          spread: 2*PI (a full 360deg circle) and initialSpeed: 1. Verified
-          in the library's source that PIConfetti always centers its spread
-          cone on "upward" (baseAngle = -PI/2, fixed regardless of
-          blastPosition), so a 2*PI spread launches particles in every
-          direction including immediately downward and sideways right at the
-          top edge - with no "up" to arc into first, that reads as rain, not
-          a burst. spread={Math.PI} (an upward hemisphere: full left-right
-          screen coverage from one origin, zero particles launching downward
-          initially) and initialSpeed={2} (CannonConfetti's own reference
-          value for its edge-positioned origins, up from PIConfetti's
-          default of 1) restore the "burst up and outward, then arc and
-          fall" shape the original cannon had. gravity nudged back up from
-          the initial 1.5 toward 2 - now that the launch phase itself
-          creates lingering hang-time, less compensation is needed there
-          than when particles had no upward launch at all.
-
-          speedVariation fix (DecisionLog.md 2026-07-20): even with
-          spread/initialSpeed correct, the burst still read as uniform rain.
-          Confirmed via generatePIBoxesArray (the actual per-particle physics,
-          not the docs) that each particle's speed is
-          initialSpeed * speedMultiplier, and speedMultiplier defaults to a
-          random draw from speedVariation, which defaults to { min: 0, max: 1 }
-          - meaning a meaningful fraction of the 100 particles were drawing
-          near-zero multipliers and launching with almost no velocity in any
-          direction, just falling straight down from spawn and blending into
-          a "rain" look alongside the particles that did burst correctly.
-          Narrowing to { min: 0.7, max: 1 } ensures every particle gets a
-          strong, visible burst instead of a random 0-100% spread of one. */}
-      {justCompletedThisSession && (
-        <PIConfetti autoplay fadeOutOnEnd gravity={2}>
-          <PIConfetti.Origin blastPosition="top-center" count={100} spread={Math.PI} initialSpeed={2} speedVariation={{ min: 0.7, max: 1 }}>
-            {/* Flake shape/size has no prior equivalent - the old library had
-                no such control. Small rectangular paper-flake look, slightly
-                rounded corners; a new axis worth a visual tuning pass on
-                device, not a ported value like count/origin/fadeOut. */}
-            <PIConfetti.Flake width={8} height={14} radius={2} />
-          </PIConfetti.Origin>
-        </PIConfetti>
-      )}
     </View>
   );
 }
@@ -3476,7 +3428,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
               taskCount={completedTaskCountValue}
               beforeUri={completedBeforeUri}
               currentUri={completedCurrentUri}
-              justCompletedThisSession={justCompletedThisSession}
             />
           )}
           <CompanionRevealModal
@@ -3489,6 +3440,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             onDismiss={handleCompanionRevealContinue}
           />
         </ScrollView>
+        {/* Full-screen overlay, sibling to the ScrollView, not nested inside
+            CompanionCompletedSummary's card (DecisionLog.md 2026-07-20).
+            ConfettiCanvas (react-native-fast-confetti's internals) sizes
+            itself to 100% of its immediate parent, and every physics formula
+            in the library scales directly off that measured container
+            height - nested inside the content-sized companionCard, the
+            confetti was rendering into a few hundred pixels, not the
+            screen, which is why three rounds of prop tuning never fixed the
+            "looks like rain" symptom. s.confettiOverlay sizes to the actual
+            screen/safe-area via this SafeAreaView, not the scrolling card. */}
+        {justCompletedThisSession && (
+          <View style={s.confettiOverlay} pointerEvents="none">
+            <PIConfetti autoplay fadeOutOnEnd gravity={2}>
+              <PIConfetti.Origin blastPosition="top-center" count={100} spread={Math.PI} initialSpeed={2} speedVariation={{ min: 0.7, max: 1 }}>
+                <PIConfetti.Flake width={8} height={14} radius={2} />
+              </PIConfetti.Origin>
+            </PIConfetti>
+          </View>
+        )}
       </SafeAreaView>
     );
   }
@@ -4008,6 +3978,11 @@ const s = StyleSheet.create({
   wrapUpReasonDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 1.5, borderColor: BRAND.mist },
   wrapUpReasonText: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.ink },
   wrapUpFooter: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 18, backgroundColor: BRAND.white },
+  // Sized to this screen's SafeAreaView, not a scrolling content card -
+  // ConfettiCanvas's own height/width: 100% resolves against whatever
+  // immediate parent it's given, and the library's physics formulas scale
+  // directly off that measured size (DecisionLog.md 2026-07-20).
+  confettiOverlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 },
   beforeAfterStackWrap: { borderRadius: 12, overflow: "hidden", backgroundColor: BRAND.offWhite, position: "relative" },
   beforeAfterStackImage: { width: "100%", height: "100%" },
   beforeAfterStackLabel: { position: "absolute", top: 8, left: 8, fontSize: 10, fontFamily: "Inter_700Bold", color: "white", backgroundColor: "rgba(15,42,82,0.7)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, letterSpacing: 0.5 },
