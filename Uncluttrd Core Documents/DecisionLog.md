@@ -11,6 +11,21 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-20 — PIConfetti still looked like rain after the spread/initialSpeed fix: speedVariation was the real dilution
+**Issue:** After fixing `spread`/`initialSpeed` (entry below), confetti still fell as uniform rain rather than bursting - confirmed on-device with the correct update actually running, ruling out a stale-build explanation.
+
+**Investigation approach, given two consecutive misses:** rather than a third guess, verified the exact JSX placement against the library's actual prop-consuming code (`usePIOrigins.ts` reads `spread`/`initialSpeed` directly off each `<PIConfetti.Origin>`'s own props - placement was correct, not a compound-component prop-forwarding bug). Re-derived the spread/angle math precisely (confirmed `spread={Math.PI}` genuinely produces a `[-π, 0)` angle range - left-horizontal through straight-up to right-horizontal, never downward - and cross-checked the y-down coordinate convention against `resolveNamedPosition`'s own position definitions to rule out a coordinate-sign-flip bug). Both checked out correctly.
+
+**Root cause, found by reading the actual per-particle physics function (`generatePIBoxesArray`), not the README:** `speed = initialSpeed * speedMultiplier * ...`, where `speedMultiplier` is a random draw from `speedVariation`, which defaults to `{ min: 0, max: 1 }`. Even with a correctly-aimed burst cone and adequate `initialSpeed`, a meaningful fraction of the 100 particles were randomly drawing near-zero multipliers each render - launching with almost no velocity in any direction and just falling straight down from their spawn point, blending with the correctly-bursting particles into an overall "rain" impression.
+
+**Decision:** `speedVariation={{ min: 0.7, max: 1 }}` on the Origin - every particle now gets a strong, visible burst instead of a random 0-100% spread of one.
+
+**Outcome:** Approved and implemented. Chose to apply this fix directly rather than first spending a native build on internal library instrumentation (`patch-package` + rebuild) to confirm resolved prop values live, since this finding came from reading the actual physics computation directly, not from inference - judged strong enough to act on without that additional cost. Still needs on-device confirmation.
+
+**Impact:** Product/UX
+
+---
+
 ### 2026-07-20 — PIConfetti burst-direction fix: spread/initialSpeed were never set
 **Issue:** After the confetti library swap (below), the new confetti fell as uniform rain from the top of the screen instead of bursting from the origin point the way the old cannon did.
 
