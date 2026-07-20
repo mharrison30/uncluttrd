@@ -11,6 +11,23 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-20 — Confetti still looked like rain after three rounds of prop tuning: the real cause was container size
+**Issue:** After fixing `spread`, `initialSpeed`, and `speedVariation` (two entries below), confetti still fell as rain rather than bursting. Three consecutive prop-tuning attempts, all correctly reasoned from the physics, all ineffective - a strong signal the actual bug wasn't a prop value at all.
+
+**Root cause:** `<PIConfetti>` was rendered inside `CompanionCompletedSummary`'s `companionCard` - a content-sized card (no explicit `width`/`height`, sized to its own badge/headline/accomplishments/images), not the screen. `react-native-fast-confetti`'s internal `ConfettiCanvas` sizes itself to `height: '100%'`/`width: '100%'` of its immediate parent, and confirmed in the library's source that every physics formula (`speed`, `scaledGravity`, apex/duration estimation) scales directly off that measured container height. So the confetti was genuinely bursting correctly the whole time, per its configured physics - just within a container a few hundred pixels tall, positioned wherever the card happened to sit in the scrolling page, not the actual ~800-900px screen. No prop value could have fixed an undersized rendering container.
+
+The old `react-native-confetti-cannon` never had this problem because it computed its own animation extents from `Dimensions.get('window')` directly, completely ignoring whatever container it was placed in - the exact same JSX position "worked" for the old library by accident, and silently broke for a library that correctly measures and scopes itself to its container.
+
+**Decision:** Confetti moved out of `CompanionCompletedSummary`'s card entirely - now a sibling to the Companion screen's `ScrollView`, in a new `confettiOverlay` style (`position: absolute`, full `top`/`left`/`right`/`bottom: 0`) sized by the screen-filling `SafeAreaView` (`flex: 1`) rather than inheriting from the scrolling content card.
+
+**Process note:** this was investigated as a genuinely new hypothesis after three rounds of prop-level fixes failed, rather than a fourth guess at values - traced the actual render tree, then confirmed the mechanism directly in `ConfettiCanvas.tsx`'s source rather than assuming a container-size issue from the symptom alone.
+
+**Outcome:** Approved and implemented. Pure layout/JS change, no new native dependencies - shipped via `eas update`, no rebuild needed.
+
+**Impact:** Product/UX, Architecture
+
+---
+
 ### 2026-07-20 — PIConfetti still looked like rain after the spread/initialSpeed fix: speedVariation was the real dilution
 **Issue:** After fixing `spread`/`initialSpeed` (entry below), confetti still fell as uniform rain rather than bursting - confirmed on-device with the correct update actually running, ruling out a stale-build explanation.
 
