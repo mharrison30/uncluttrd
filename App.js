@@ -1081,14 +1081,29 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
           "bursts from a point, then drifts down" component, matching the old
           cannon's behavior - same count (100) and origin (top-center) as
           before, fadeOutOnEnd is the direct equivalent of the old fadeOut.
-          gravity lowered from the library's 3.0 default (not a direct port -
-          the old library's explosionSpeed/fallSpeed were timing-based, this
-          one is physics-based) to keep the same "lingers, doesn't flash by"
-          intent from the earlier speed fix - needs an on-device pacing check,
-          not just a code-level port. */}
+
+          spread/initialSpeed fix (DecisionLog.md 2026-07-20): the initial
+          swap left both unset, falling back to the library's own defaults -
+          spread: 2*PI (a full 360deg circle) and initialSpeed: 1. Verified
+          in the library's source that PIConfetti always centers its spread
+          cone on "upward" (baseAngle = -PI/2, fixed regardless of
+          blastPosition), so a 2*PI spread launches particles in every
+          direction including immediately downward and sideways right at the
+          top edge - with no "up" to arc into first, that reads as rain, not
+          a burst. spread={Math.PI} (an upward hemisphere: full left-right
+          screen coverage from one origin, zero particles launching downward
+          initially) and initialSpeed={2} (CannonConfetti's own reference
+          value for its edge-positioned origins, up from PIConfetti's
+          default of 1) restore the "burst up and outward, then arc and
+          fall" shape the original cannon had. gravity nudged back up from
+          the initial 1.5 toward 2 - now that the launch phase itself
+          creates lingering hang-time, less compensation is needed there
+          than when particles had no upward launch at all. All three values
+          are a reasoned estimate from the physics, not something
+          confirmable without an on-device look. */}
       {justCompletedThisSession && (
-        <PIConfetti autoplay fadeOutOnEnd gravity={1.5}>
-          <PIConfetti.Origin blastPosition="top-center" count={100}>
+        <PIConfetti autoplay fadeOutOnEnd gravity={2}>
+          <PIConfetti.Origin blastPosition="top-center" count={100} spread={Math.PI} initialSpeed={2}>
             {/* Flake shape/size has no prior equivalent - the old library had
                 no such control. Small rectangular paper-flake look, slightly
                 rounded corners; a new axis worth a visual tuning pass on
