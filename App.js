@@ -1098,12 +1098,23 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
           fall" shape the original cannon had. gravity nudged back up from
           the initial 1.5 toward 2 - now that the launch phase itself
           creates lingering hang-time, less compensation is needed there
-          than when particles had no upward launch at all. All three values
-          are a reasoned estimate from the physics, not something
-          confirmable without an on-device look. */}
+          than when particles had no upward launch at all.
+
+          speedVariation fix (DecisionLog.md 2026-07-20): even with
+          spread/initialSpeed correct, the burst still read as uniform rain.
+          Confirmed via generatePIBoxesArray (the actual per-particle physics,
+          not the docs) that each particle's speed is
+          initialSpeed * speedMultiplier, and speedMultiplier defaults to a
+          random draw from speedVariation, which defaults to { min: 0, max: 1 }
+          - meaning a meaningful fraction of the 100 particles were drawing
+          near-zero multipliers and launching with almost no velocity in any
+          direction, just falling straight down from spawn and blending into
+          a "rain" look alongside the particles that did burst correctly.
+          Narrowing to { min: 0.7, max: 1 } ensures every particle gets a
+          strong, visible burst instead of a random 0-100% spread of one. */}
       {justCompletedThisSession && (
         <PIConfetti autoplay fadeOutOnEnd gravity={2}>
-          <PIConfetti.Origin blastPosition="top-center" count={100} spread={Math.PI} initialSpeed={2}>
+          <PIConfetti.Origin blastPosition="top-center" count={100} spread={Math.PI} initialSpeed={2} speedVariation={{ min: 0.7, max: 1 }}>
             {/* Flake shape/size has no prior equivalent - the old library had
                 no such control. Small rectangular paper-flake look, slightly
                 rounded corners; a new axis worth a visual tuning pass on
