@@ -11,6 +11,15 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-19 — Wrap-up screen final touches: green count, borderless card, CTA reward animation
+**Decision:** Three small styling/animation-only changes, no logic or architecture. (1) The remaining-item count ("2" in "2 things left. No rush.," or "One" in the singular case) is now colored `BRAND.green`, matching the completed-count color - reframes both numbers as parts of the same session rather than a success/problem split. (2) The wrap-up card drops its green border in favor of a plain white card with a subtle shadow (new `wrapUpCard` style, `companionCard` itself untouched since `BatchChecklist`/`CompanionCompletedSummary` still use it) - calmer now that the border was drawing more attention to the container than the content. (3) The Continue button animates to its active green state (color fade + a small scale pop) once every item is resolved, instead of an instant enabled/disabled style swap - a small reward moment for finishing the review.
+
+**Outcome:** Approved and implemented.
+
+**Impact:** Product/UX
+
+---
+
 ### 2026-07-19 — Wrap-up screen polish: leaner summary, Keep/Remove visual distinction
 **Decision:** Simplifies the wrap-up screen's post-heading copy. "Nice work today!" stays as the heading; "You made meaningful progress" is dropped as redundant now that a remaining-count line and a new global explanation line carry that weight instead. "Now let's decide what to do with the remaining N items" becomes "One thing left. No rush." (singular) / "{count} things left. No rush." (plural) - warmer, matches Companion Design Principles #7's calm voice better than the old project-management-adjacent "decide what to do with" framing. A new global line - "We'll include anything you keep in a future organizing session." - renders once beneath the summary, not per item, only while something's still pending.
 
