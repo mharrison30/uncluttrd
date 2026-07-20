@@ -26,7 +26,7 @@ import { getFunctions, httpsCallable } from "firebase/functions";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
-import ConfettiCannon from "react-native-confetti-cannon";
+import { PIConfetti } from "react-native-fast-confetti";
 import * as Updates from "expo-updates";
 
 // TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
@@ -1075,11 +1075,27 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
         </View>
       )}
       <BeforeAfterInspector visible={!!inspectTab} beforeUri={beforeUri} afterUri={currentUri} initialTab={inspectTab} onClose={() => setInspectTab(null)} />
-      {/* explosionSpeed/fallSpeed doubled from the library's defaults
-          (350/3000) - the default reads as a quick flash rather than a
-          celebration moment worth lingering on. */}
+      {/* Swapped from react-native-confetti-cannon to react-native-fast-confetti
+          (Skia-based, real physics, actively maintained - DecisionLog.md
+          2026-07-20) for noticeably more premium motion. PIConfetti is the
+          "bursts from a point, then drifts down" component, matching the old
+          cannon's behavior - same count (100) and origin (top-center) as
+          before, fadeOutOnEnd is the direct equivalent of the old fadeOut.
+          gravity lowered from the library's 3.0 default (not a direct port -
+          the old library's explosionSpeed/fallSpeed were timing-based, this
+          one is physics-based) to keep the same "lingers, doesn't flash by"
+          intent from the earlier speed fix - needs an on-device pacing check,
+          not just a code-level port. */}
       {justCompletedThisSession && (
-        <ConfettiCannon count={100} origin={{ x: Dimensions.get("window").width / 2, y: 0 }} explosionSpeed={700} fallSpeed={6000} fadeOut autoStart />
+        <PIConfetti autoplay fadeOutOnEnd gravity={1.5}>
+          <PIConfetti.Origin blastPosition="top-center" count={100}>
+            {/* Flake shape/size has no prior equivalent - the old library had
+                no such control. Small rectangular paper-flake look, slightly
+                rounded corners; a new axis worth a visual tuning pass on
+                device, not a ported value like count/origin/fadeOut. */}
+            <PIConfetti.Flake width={8} height={14} radius={2} />
+          </PIConfetti.Origin>
+        </PIConfetti>
       )}
     </View>
   );
