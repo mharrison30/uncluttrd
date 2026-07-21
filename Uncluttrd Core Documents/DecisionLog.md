@@ -11,6 +11,25 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-21 — RevenueCat webhook → Cloud Function → Firestore isPro sync (staging, structure only)
+**Decision:** New `revenueCatWebhook` Cloud Function (`onRequest`) replaces the client-writable `isPro` field with a server-verified one, per the plan in `BACKLOG.md`'s long-standing "RevenueCat Webhook" item. Verified RevenueCat's actual webhook/API mechanics against their live docs before building, rather than relying on training knowledge, given this touches real payment/entitlement data - confirmed the exact HMAC signature algorithm (`"{timestamp}.{raw body}"`, HMAC-SHA256, hex-encoded), the current REST API for authoritative entitlement state (`GET /v2/projects/{project_id}/customers/{customer_id}/active_entitlements`, secret-key Bearer auth), and that RevenueCat supports per-app webhook filtering (resolving the "one RevenueCat project, two Firebase projects" mismatch via two separate dashboard-configured webhook integrations, not cross-project routing logic in code).
+
+**No event-type filtering** - every webhook delivery re-fetches authoritative current entitlement state via the REST API rather than deriving active/inactive from the event's own `type`/`entitlement_ids`. RevenueCat's own docs confirm several event types (`BILLING_ISSUE`, `PRODUCT_CHANGE`, `REFUND_REVERSED`) are ambiguous without that extra context, and explicitly recommend this "call the REST API after any webhook" pattern over modeling transition semantics client-side.
+
+**Idempotency** via `event.id`, scoped under `users/{uid}/revenueCatWebhookEvents` - same convention as `analyzePhoto`'s `analysisIdempotency`, ownership enforced by path.
+
+**`app_user_id` assumed to equal the Firebase uid directly**, not re-derived - the client already calls `Purchases.logIn(u.uid)` at sign-in, so RevenueCat's subscriber identity and this app's uid are the same value by construction.
+
+**One real uncertainty flagged, not asserted as fact:** whether the V2 API's `active_entitlements` response's `entitlement_id` field is the developer-facing identifier (`"Uncluttrd Pro"`, same string the client already checks) or an internal RevenueCat id - the one example response seen during research looked like it could be either. Temporary debug logging of the raw response is in place so the first real webhook delivery confirms this unambiguously rather than silently producing `isPro: false` forever if the comparison is wrong.
+
+**Deployed to `cluttrd-staging` only, with placeholder secrets** (`REVENUECAT_WEBHOOK_SECRET`, `REVENUECAT_SECRET_API_KEY` via `firebase functions:secrets:set`; `REVENUECAT_PROJECT_ID` placeholder in `.env.cluttrd-staging`) - explicitly approved as a structure-first deploy, real secrets to follow once gathered from the RevenueCat dashboard. Verified deployable and correctly rejecting unsigned requests (401) with placeholders in place. `firestore.rules` gets a new server-only `revenueCatWebhookEvents` rule but **does not yet tighten `isPro`'s client-write access** - that's deliberately the last step, only once the webhook is proven end-to-end with a real sandbox/staging purchase, matching the approved staging-first plan. Production untouched in this pass.
+
+**Outcome:** Approved and implemented (staging structure). End-to-end verification and the `firestore.rules` tightening are follow-up work once real secrets are provided.
+
+**Impact:** Architecture, Security, Reliability
+
+---
+
 ### 2026-07-20 — Confetti still looked like rain after three rounds of prop tuning: the real cause was container size
 **Issue:** After fixing `spread`, `initialSpeed`, and `speedVariation` (two entries below), confetti still fell as rain rather than bursting. Three consecutive prop-tuning attempts, all correctly reasoned from the physics, all ineffective - a strong signal the actual bug wasn't a prop value at all.
 
