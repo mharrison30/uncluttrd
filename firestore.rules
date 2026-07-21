@@ -36,6 +36,15 @@ service cloud.firestore {
       match /analysisIdempotency/{analysisId} {
         allow read, write: if false;
       }
+
+      // Server (Admin SDK) only - revenueCatWebhook's idempotency records
+      // (DecisionLog.md 2026-07-21), same reasoning as analysisIdempotency
+      // above. NOT yet touching `isPro`'s client-write access above -
+      // that's the last step of the migration, only once the webhook is
+      // verified working end-to-end (BACKLOG.md).
+      match /revenueCatWebhookEvents/{eventId} {
+        allow read, write: if false;
+      }
     }
 
     // Server (Admin SDK) only - deletion-monitoring breadcrumbs written by

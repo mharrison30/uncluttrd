@@ -1,7 +1,8 @@
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret, defineString } = require("firebase-functions/params");
+const crypto = require("crypto");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const { toFile } = require("openai/uploads");
@@ -15,6 +16,29 @@ const db = admin.firestore();
 const ANTHROPIC_KEY = defineSecret("ANTHROPIC_KEY");
 const OPENAI_KEY = defineSecret("OPENAI_KEY");
 const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
+// RevenueCat webhook signing secret (X-RevenueCat-Webhook-Signature) and a
+// RevenueCat secret API key (server-to-server REST calls - distinct from
+// the public appl_.../goog_... keys used client-side for Purchases.configure).
+// Both project-scoped: set independently per Firebase project via
+// `firebase functions:secrets:set`, same as ANTHROPIC_KEY/OPENAI_KEY above.
+// Placeholder values set on cluttrd-staging pending the real ones
+// (DecisionLog.md 2026-07-21) - deploys fine with placeholders since
+// Cloud Functions v2 only needs the secret to exist, not be correct;
+// updating the secret's VALUE later does not require a redeploy.
+const REVENUECAT_WEBHOOK_SECRET = defineSecret("REVENUECAT_WEBHOOK_SECRET");
+const REVENUECAT_SECRET_API_KEY = defineSecret("REVENUECAT_SECRET_API_KEY");
+// Not a secret (an identifier, not a credential) - needed for the v2 REST
+// API's URL path. One RevenueCat project serves both the production and
+// iOS Staging apps (DecisionLog.md 2026-07-16), so this value is the same
+// across environments - no .env.cluttrd-staging override needed, just this
+// one default to update once provided. Unlike the two secrets above,
+// changing this DOES require a redeploy (defineString resolves at
+// deploy/build time, not per-invocation the way Secret Manager does).
+const REVENUECAT_PROJECT_ID = defineString("REVENUECAT_PROJECT_ID", { default: "TODO_SET_REVENUECAT_PROJECT_ID" });
+// The entitlement identifier as configured in the RevenueCat dashboard -
+// same string the client already checks via
+// customerInfo.entitlements.active["Uncluttrd Pro"].
+const PRO_ENTITLEMENT_ID = "Uncluttrd Pro";
 // Resend's shared sandbox sender - works with no domain verification, but
 // can only deliver to the email address the Resend account itself signed up
 // with. Fine for a single-recipient canary alert; would need a verified
@@ -434,3 +458,141 @@ async function sendCanaryAlertEmail(errorMessage) {
     console.error(`[CANARY_ALERT] Resend email send threw: ${emailErr.message}`);
   }
 }
+
+// RevenueCat webhook -> Firestore isPro sync (DecisionLog.md 2026-07-21),
+// replacing the client-writable isPro field with a server-verified one -
+// see BACKLOG.md's "RevenueCat Webhook -> Cloud Function -> Firestore Sync"
+// item for the full history of why the client-write approach was interim.
+//
+// Deliberately does NOT try to derive active/inactive from the event's own
+// `type`/`entitlement_ids` - RevenueCat's own guidance is that several event
+// types (BILLING_ISSUE, PRODUCT_CHANGE, REFUND_REVERSED) are ambiguous
+// without extra context, so every delivery re-fetches the authoritative
+// current state via the REST API and writes whatever that says, rather than
+// modeling event-type transition semantics here. No event-type filtering at
+// all: any webhook delivery is treated as "something changed, go verify."
+exports.revenueCatWebhook = onRequest(
+  { secrets: [REVENUECAT_WEBHOOK_SECRET, REVENUECAT_SECRET_API_KEY] },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).send("Method not allowed");
+      return;
+    }
+
+    // Signature verification BEFORE any parsing/processing - reject
+    // anything that isn't genuinely from RevenueCat before it can do
+    // anything, including being counted for idempotency. Signed payload is
+    // "{timestamp}.{raw body bytes}", HMAC-SHA256 with the signing secret,
+    // hex-encoded - verified against RevenueCat's documented algorithm, not
+    // assumed. req.rawBody is populated automatically by the Cloud
+    // Functions framework before body-parsing, same mechanism Stripe-style
+    // webhook verification relies on elsewhere in the ecosystem.
+    const signatureHeader = req.get("X-RevenueCat-Webhook-Signature");
+    if (!signatureHeader) {
+      console.error("[revenueCatWebhook] Missing signature header");
+      res.status(401).send("Missing signature");
+      return;
+    }
+    const sigParts = Object.fromEntries(
+      signatureHeader.split(",").map((kv) => {
+        const idx = kv.indexOf("=");
+        return [kv.slice(0, idx), kv.slice(idx + 1)];
+      })
+    );
+    const { t: timestamp, v1: providedSignature } = sigParts;
+    if (!timestamp || !providedSignature) {
+      console.error("[revenueCatWebhook] Malformed signature header");
+      res.status(401).send("Malformed signature");
+      return;
+    }
+    const signedPayload = `${timestamp}.${req.rawBody.toString("utf8")}`;
+    const expectedSignature = crypto
+      .createHmac("sha256", REVENUECAT_WEBHOOK_SECRET.value())
+      .update(signedPayload)
+      .digest("hex");
+    const expectedBuf = Buffer.from(expectedSignature, "utf8");
+    const providedBuf = Buffer.from(providedSignature, "utf8");
+    // Length check before timingSafeEqual - it throws on mismatched
+    // buffer lengths rather than returning false.
+    const signatureValid =
+      expectedBuf.length === providedBuf.length &&
+      crypto.timingSafeEqual(expectedBuf, providedBuf);
+    if (!signatureValid) {
+      console.error("[revenueCatWebhook] Invalid signature");
+      res.status(401).send("Invalid signature");
+      return;
+    }
+
+    const event = req.body?.event;
+    if (!event || !event.id || !event.app_user_id) {
+      console.error(`[revenueCatWebhook] Malformed event payload: ${JSON.stringify(req.body)}`);
+      res.status(400).send("Malformed event");
+      return;
+    }
+
+    // app_user_id is expected to equal the Firebase uid directly - the
+    // client calls Purchases.logIn(u.uid) at sign-in, so RevenueCat's
+    // subscriber identity and this app's Firebase uid are the same value
+    // by construction. Not re-derived or looked up here.
+    const uid = event.app_user_id;
+    // Scoped under the user's own doc, same convention as analyzePhoto's
+    // analysisIdempotency - ownership enforced by path, not a uid-match
+    // check in code or rules.
+    const eventRef = db.collection("users").doc(uid).collection("revenueCatWebhookEvents").doc(event.id);
+
+    try {
+      // Idempotency: RevenueCat retries reuse the same event.id.
+      const eventSnap = await eventRef.get();
+      if (eventSnap.exists) {
+        console.log(`[revenueCatWebhook] Duplicate event ${event.id} for uid=${uid}, already processed`);
+        res.status(200).send("OK (duplicate)");
+        return;
+      }
+
+      const activeResp = await fetch(
+        `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID.value()}/customers/${encodeURIComponent(uid)}/active_entitlements`,
+        { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
+      );
+      if (!activeResp.ok) {
+        // Not thrown - a 404 (e.g. a sandbox/test app_user_id with no real
+        // customer record) is a real, non-retryable case, and returning 200
+        // here stops RevenueCat from retrying indefinitely on something
+        // that will never succeed.
+        console.error(`[revenueCatWebhook] active_entitlements fetch failed for uid=${uid}: HTTP ${activeResp.status} - ${await activeResp.text()}`);
+        res.status(200).send("OK (entitlement fetch failed, logged)");
+        return;
+      }
+      const activeData = await activeResp.json();
+      // TEMP DEBUG: logging the raw response verbatim during initial
+      // testing. The V2 API's exact entitlement_id format (developer-facing
+      // identifier like "Uncluttrd Pro" vs. an internal RevenueCat id) was
+      // not fully confirmed from docs alone - this line exists so the first
+      // real webhook delivery makes that unambiguous instead of silently
+      // producing isPro: false forever if the comparison below is wrong.
+      // Remove once confirmed correct against a real event.
+      console.log(`[revenueCatWebhook] active_entitlements raw response for uid=${uid}: ${JSON.stringify(activeData)}`);
+      const isPro = (activeData.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
+
+      try {
+        await db.doc(`users/${uid}`).update({ isPro });
+      } catch (updateErr) {
+        // User doc doesn't exist (e.g. a TRANSFER event's old owner, or a
+        // sandbox test app_user_id with no real account) - logged, not
+        // retried, same reasoning as the entitlement-fetch-failed case above.
+        console.error(`[revenueCatWebhook] Firestore write failed for uid=${uid}: ${updateErr.message}`);
+      }
+
+      await eventRef.set({
+        type: event.type,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        isPro,
+      });
+
+      console.log(`[revenueCatWebhook] Processed ${event.type} for uid=${uid} -> isPro=${isPro}`);
+      res.status(200).send("OK");
+    } catch (err) {
+      console.error(`[revenueCatWebhook] Unhandled error for uid=${uid}: ${err.message}`);
+      res.status(500).send("Internal error");
+    }
+  }
+);
