@@ -21,20 +21,18 @@ const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
 // the public appl_.../goog_... keys used client-side for Purchases.configure).
 // Both project-scoped: set independently per Firebase project via
 // `firebase functions:secrets:set`, same as ANTHROPIC_KEY/OPENAI_KEY above.
-// Placeholder values set on cluttrd-staging pending the real ones
-// (DecisionLog.md 2026-07-21) - deploys fine with placeholders since
-// Cloud Functions v2 only needs the secret to exist, not be correct;
-// updating the secret's VALUE later does not require a redeploy.
+// Real values set on cluttrd-staging 2026-07-21. Correction to the original
+// assumption here: `firebase functions:secrets:set` explicitly warns that a
+// redeploy IS required to pick up a new secret version - it does not
+// resolve `latest` per-invocation the way that was first assumed.
 const REVENUECAT_WEBHOOK_SECRET = defineSecret("REVENUECAT_WEBHOOK_SECRET");
 const REVENUECAT_SECRET_API_KEY = defineSecret("REVENUECAT_SECRET_API_KEY");
 // Not a secret (an identifier, not a credential) - needed for the v2 REST
 // API's URL path. One RevenueCat project serves both the production and
 // iOS Staging apps (DecisionLog.md 2026-07-16), so this value is the same
-// across environments - no .env.cluttrd-staging override needed, just this
-// one default to update once provided. Unlike the two secrets above,
-// changing this DOES require a redeploy (defineString resolves at
-// deploy/build time, not per-invocation the way Secret Manager does).
-const REVENUECAT_PROJECT_ID = defineString("REVENUECAT_PROJECT_ID", { default: "TODO_SET_REVENUECAT_PROJECT_ID" });
+// across environments - real value set directly here rather than only in
+// .env.cluttrd-staging, since it's not actually environment-specific.
+const REVENUECAT_PROJECT_ID = defineString("REVENUECAT_PROJECT_ID", { default: "projc4cb5734" });
 // The entitlement identifier as configured in the RevenueCat dashboard -
 // same string the client already checks via
 // customerInfo.entitlements.active["Uncluttrd Pro"].
