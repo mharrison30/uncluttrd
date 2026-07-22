@@ -2831,7 +2831,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity style={{ marginTop: 12, padding: 8 }} onPress={async () => {
             try {
-              const { customerInfo } = await Purchases.restorePurchases();
+              // restorePurchases() resolves with the CustomerInfo object
+              // directly (RevenueCat docs), unlike purchaseStoreProduct()/
+              // purchasePackage() which resolve with { customerInfo, ... }.
+              // Destructuring { customerInfo } here always produced
+              // undefined, so this threw "Cannot read property
+              // 'entitlements' of undefined" on every single tap,
+              // regardless of whether the restore itself succeeded.
+              const customerInfo = await Purchases.restorePurchases();
               if (customerInfo.entitlements.active["Uncluttrd Pro"]) {
                 setIsPro(true);
                 await AsyncStorage.setItem("isPro", "true");
@@ -2841,6 +2848,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 Alert.alert("No purchases found", "We could not find any previous purchases for this Apple ID.");
               }
             } catch (e) {
+              dlog(`Restore purchases error: ${e.message}`);
               Alert.alert("Restore failed", e.message);
             }
           }}>
