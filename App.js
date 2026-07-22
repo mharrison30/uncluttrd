@@ -2801,10 +2801,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 setShowPaywall(false);
                 Alert.alert("Welcome to Pro!", "You now have unlimited access.");
               } else {
+                dlog(`Purchase succeeded but entitlement not active: ${JSON.stringify(customerInfo.entitlements.active)}`);
                 Alert.alert("Something went wrong", "Your purchase was processed but Pro could not be activated. Please restore purchases or contact support at hello@uncluttrd.app.");
               }
             } catch (e) {
               if (e.userCancelled) return;
+              if (e.code === Purchases.PURCHASES_ERROR_CODE.PRODUCT_ALREADY_PURCHASED_ERROR) {
+                dlog(`Purchase error: already subscribed (code=${e.code}): ${e.message}`);
+              } else {
+                dlog(`Purchase error: ${e.message} (code=${e.code})`);
+              }
               Alert.alert("Purchase failed", "Something went wrong. Please try again or contact support at hello@uncluttrd.app.");
             } finally {
               setPurchaseInProgress(false);
