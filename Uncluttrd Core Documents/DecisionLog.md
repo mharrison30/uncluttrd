@@ -11,6 +11,13 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-22 — `eas submit` for production requires `APP_ENV=production` set explicitly in the shell
+**Decision:** Always run production iOS submission as `APP_ENV=production eas submit --platform ios --profile production ...`, never bare `eas submit --profile production`.
+**Reason:** `eas build` gets `APP_ENV` injected by EAS's own build servers via `eas.json`'s per-profile `env` block - but `eas submit` evaluates `app.config.js` locally, on whatever machine runs the command, which has no `APP_ENV` set. `app.config.js` then falls back to its own `"staging"` default, so submit silently resolves the wrong bundle identifier (`com.mharrison.uncluttrd.staging` instead of `com.mharrison.uncluttrd`) and looks up (or, in interactive mode, offers to set up) credentials for the wrong app entirely. First hit 2026-07-22 submitting build #33 - failed outright non-interactively (`App Store Connect API Keys cannot be set up in --non-interactive mode`) because no staging-bundle ASC API Key credential existed yet; with `APP_ENV=production` set, it correctly resolved the already-configured production credential and submitted cleanly on the same attempt.
+**Outcome:** Approved. Documented here rather than in `eas.json` itself - EAS's config schema rejects unrecognized keys (confirmed: a `_comment` field under `submit` fails schema validation, `"submit._comment" must be of type object`), so this can't be a comment in the JSON file itself.
+
+---
+
 ### 2026-07-21 — RevenueCat webhook → Cloud Function → Firestore isPro sync (staging, structure only)
 **Decision:** New `revenueCatWebhook` Cloud Function (`onRequest`) replaces the client-writable `isPro` field with a server-verified one, per the plan in `BACKLOG.md`'s long-standing "RevenueCat Webhook" item. Verified RevenueCat's actual webhook/API mechanics against their live docs before building, rather than relying on training knowledge, given this touches real payment/entitlement data - confirmed the exact HMAC signature algorithm (`"{timestamp}.{raw body}"`, HMAC-SHA256, hex-encoded), the current REST API for authoritative entitlement state (`GET /v2/projects/{project_id}/customers/{customer_id}/active_entitlements`, secret-key Bearer auth), and that RevenueCat supports per-app webhook filtering (resolving the "one RevenueCat project, two Firebase projects" mismatch via two separate dashboard-configured webhook integrations, not cross-project routing logic in code).
 
