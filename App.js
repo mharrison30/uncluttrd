@@ -2759,6 +2759,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             disabled={purchaseInProgress}
             onPress={async () => {
             dlog("PURCHASE BUTTON TAPPED");
+            dlog(`purchaseInProgress check: ${purchaseInProgress}`);
             if (purchaseInProgress) return; // belt-and-suspenders alongside the disabled prop
             setPurchaseInProgress(true);
             logEvent(getAnalytics(), "pro_upgrade_clicked");
