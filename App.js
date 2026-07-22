@@ -1079,7 +1079,7 @@ function CompanionCompletedSummary({ completedAt, reason, headline, accomplishme
   );
 }
 
-function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) {
+function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, revenueCatLinkedRef }) {
   const [photo, setPhoto] = useState(null);
   const [photoSize, setPhotoSize] = useState({ width: 1, height: 1 });
   const [showMenu, setShowMenu] = useState(false);
@@ -2762,6 +2762,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref }) 
             setPurchaseInProgress(true);
             logEvent(getAnalytics(), "pro_upgrade_clicked");
             try {
+              // Second-layer check: onAuthStateChanged links RevenueCat's
+              // identity before unlocking this screen, but a failed (not
+              // just slow) logIn() there still lets the UI through. Retry
+              // here - logIn() is idempotent - and refuse to purchase under
+              // an unlinked identity rather than risk a repeat of the real
+              // sandbox purchase that landed on no RevenueCat customer record
+              // under the signed-in uid at all.
+              if (!revenueCatLinkedRef.current) {
+                try {
+                  await Purchases.logIn(user.uid);
+                  revenueCatLinkedRef.current = true;
+                } catch (e) {
+                  dlog(`RevenueCat logIn retry error (at purchase): ${e.message}`);
+                  Alert.alert("Unable to prepare your account for purchase", "Please check your connection and try again.");
+                  return;
+                }
+              }
               const offerings = await Purchases.getOfferings();
               const current = offerings.current;
               const product = paywallPlan === "yearly"
@@ -3640,6 +3657,11 @@ function AppRoot() {
   // entitlement changes to whichever account is actually signed in right now,
   // without the stale-closure trap a plain `user` reference would have here.
   const currentUidRef = useRef(null);
+  // True only once Purchases.logIn(uid) has actually succeeded for the
+  // *current* uid. Read imperatively (paywall CTA retry-check), never used
+  // to render, so a ref matches currentUidRef's pattern above rather than
+  // adding new state threaded through MainApp's props.
+  const revenueCatLinkedRef = useRef(false);
 
   const [fontsLoaded] = useFonts({
     Inter_400Regular,
@@ -3711,6 +3733,7 @@ function AppRoot() {
       // accounts signed into the same device.
       setAnalyses(0);
       setIsPro(false);
+      revenueCatLinkedRef.current = false;
       currentUidRef.current = u ? u.uid : null;
       if (u) {
         // Right after sign-in (especially the forced signOut/signIn re-auth
@@ -3726,6 +3749,22 @@ function AppRoot() {
         } catch (e) {
           console.log("User reload error:", e.message);
         }
+
+        // Link RevenueCat's identity to this uid BEFORE unlocking the
+        // authenticated UI below (setUser/setLoading) - closes a real race
+        // where a fast navigator could reach the paywall CTA while
+        // RevenueCat was still on its prior/anonymous identity, causing a
+        // purchase to be attributed to the wrong RevenueCat customer
+        // entirely (confirmed via RevenueCat's REST API after a real
+        // sandbox purchase produced no record under the signed-in uid).
+        // Bounded so a RevenueCat outage delays launch rather than blocking
+        // it forever; if logIn() resolves after the bound, the ref still
+        // gets set from .then() below, and the paywall CTA re-checks/
+        // retries it anyway as a second layer.
+        const loginPromise = Purchases.logIn(u.uid)
+          .then(() => { revenueCatLinkedRef.current = true; })
+          .catch(e => dlog(`RevenueCat logIn error (pre-unlock): ${e.message}`));
+        await Promise.race([loginPromise, new Promise(resolve => setTimeout(resolve, 8000))]);
       }
       setUser(u);
       setLoading(false);
@@ -3779,15 +3818,14 @@ function AppRoot() {
         console.log("Load analysisCount error:", e.message);
       }
 
-      // Link RevenueCat's customer record to our Firebase UID so it's identifiable
-      // in the RevenueCat dashboard by UID/email/name (needed for manual promo grants),
-      // instead of showing up as an anonymous RevenueCat-generated ID.
-      // Fires on every auth resolution (cold launch for already-signed-in users,
-      // fresh sign-in, and post-signup, where handleAuth forces a sign-out/sign-in
-      // to get here with displayName already set). logIn() is idempotent, so repeat calls
-      // for the same user are safe and just refresh the attributes below.
+      // Refresh RevenueCat's stored attributes and pull a fresh entitlement
+      // read for this account. Identity linking itself (Purchases.logIn)
+      // already happened earlier, before setUser() unlocked the UI above -
+      // this block just keeps attributes/entitlement current on every auth
+      // resolution (cold launch for already-signed-in users, fresh sign-in,
+      // and post-signup, where handleAuth forces a sign-out/sign-in to get
+      // here with displayName already set).
       try {
-        await Purchases.logIn(u.uid);
         const nameParts = (u.displayName || "").trim().split(" ");
         Purchases.setAttributes({
           "$email": u.email || "",
@@ -3806,7 +3844,7 @@ function AppRoot() {
         updateDoc(doc(db, "users", u.uid), { isPro: proActive })
           .catch(e => console.log("Sync isPro error:", e.message));
       } catch (e) {
-        console.log("RevenueCat logIn/getCustomerInfo error:", e.message);
+        console.log("RevenueCat setAttributes/getCustomerInfo error:", e.message);
       }
     });
     return unsub;
@@ -3842,7 +3880,7 @@ function AppRoot() {
   }
 
   // Logged in and onboarding done, show main app
-  return <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} />;
+  return <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} revenueCatLinkedRef={revenueCatLinkedRef} />;
 }
 
 export default function App() {
