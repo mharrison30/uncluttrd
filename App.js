@@ -2758,6 +2758,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             style={[s.paywallCta, purchaseInProgress && { opacity: 0.7 }]}
             disabled={purchaseInProgress}
             onPress={async () => {
+            dlog("PURCHASE BUTTON TAPPED");
             if (purchaseInProgress) return; // belt-and-suspenders alongside the disabled prop
             setPurchaseInProgress(true);
             logEvent(getAnalytics(), "pro_upgrade_clicked");
