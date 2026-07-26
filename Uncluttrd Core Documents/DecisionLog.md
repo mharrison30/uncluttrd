@@ -11,6 +11,28 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Pre-Photo Evidence Boundary
+**Decision:** Pre-Photo Evidence Boundary
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** This is a direct consequence of previously adopted architectural principles - Evidence over Inference, Durable Memory, and Space ownership. Any alternative would require Companion to make claims about the current physical state without supporting evidence, contradicting the established architecture.
+**Decision detail:** Before a fresh photo exists, Companion may only present information derived from: explicit user decisions, the current Space, and durable history. Fresh recommendations require fresh evidence.
+**Use instead:** Structure Companion flows as: (1) Surface durable context, (2) Capture fresh evidence, (3) Generate new recommendations.
+**Revisit when:** Only if the underlying architectural principles (Evidence over Inference, Durable Memory, or Space ownership) are intentionally revised.
+
+---
+
+### 2026-07-26 — Working Set is Computed, Not Stored
+**Decision:** Working Set is Computed, Not Stored
+**Decision Class:** Class 2 - Product Philosophy
+**Status:** Adopted
+**Why:** Persistent Work may span many organizing sessions, while each session should remain achievable (approximately 10-15 minutes). Treating the Working Set as computed rather than stored preserves a simple ownership model and avoids prematurely introducing another durable object without evidence that it requires independent identity or lifecycle.
+**Decision detail:** Companion sessions present a bounded Today's Working Set, assembled from Persistent Work at the start of each session. The Working Set is an ephemeral planning construct, not a durable object.
+**Use instead:** Persistent Work remains the durable source of truth. Session planning selects an appropriate subset for today's session. The selection process produces a temporary Working Set used only for that organizing session.
+**Revisit when:** When defining the product philosophy for Working Set selection, including questions such as: What emotional experience should Companion create when choosing today's work? Should the emphasis be responsibility, momentum, coaching, user agency, or another philosophy? Does user research indicate a need for a persistent planning object with its own identity or lifecycle? Note: Class 2 decisions are validated by real user reaction, not by scenario counterexamples - the appropriate test for revisiting this decision is user research or direct product testing, not further architectural reasoning.
+
+---
+
 ### 2026-07-26 — Space progress is not represented as task counts or completion percentages
 **Decision:** Do not represent overall Space progress as task counts or completion percentages.
 **Why:** Companion is designed to support an ongoing relationship with a home, not to encourage completion-chasing. Quantitative progress implies a finite endpoint that doesn't reflect how homes evolve over time.
