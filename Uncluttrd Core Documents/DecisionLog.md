@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — An Interrupted, Unconfirmed Recommendation Does Not Become an In Progress Object
+**Decision:** An Interrupted, Unconfirmed Recommendation Does Not Become an In Progress Object
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Silence creates no explicit state transition. The Session retains the historical fact that a recommendation was shown and received no confirmed outcome. "Unresolved" is derived from the absence of Confirmed, Kept, or Removed events - it is not itself a stored state. Creating an In Progress object, or a stored outcome: unresolved field, would require Companion to assert a state that silence and the available evidence do not establish. Storing "unresolved" as a positive classification would also turn the absence of a decision into a system-made claim, and could create synchronization problems if a stored outcome field and the underlying events ever disagreed. This directly conflicts with the adopted Evidence Boundary, so this is forced rather than preferential.
+**Decision detail:** Assume the Session already records the recommendation that was presented, whether the user confirmed completion, whether the user explicitly kept or dismissed it, and session activity history. The possible outcomes are: confirmed_at exists -> Confirmed; kept_at exists -> Deferred into Persistent Work; removed_at exists -> Removed; none of the above -> Unresolved (the null case, not a stored value). The Session needs enough historical data to establish which recommendation was displayed, when it was displayed, whether any explicit outcome followed, and when activity last occurred. This is ordinary history about the temporary Session, not a new architectural state.
+
+Consequences: Pause can remain low-friction, since no classification question is required when the user leaves. Persistent Work is created only through an explicit Keep decision - silence never satisfies this. Returning users are shown remembered context without Companion pretending it knows the current physical state. Fresh evidence is required before Companion independently reasserts or replaces a recommendation.
+**Use instead:** On return, Companion may honestly say "Last time, I suggested clearing the countertop" and "We didn't confirm what happened after that." It may not say "Continue clearing the countertop" - that would claim the old recommendation remains valid without current evidence. The next interaction should offer a real choice, such as "Pick that back up" versus "Take a fresh look." "Pick that back up" must be understood as the user choosing to resume the prior recommendation, not Companion asserting that it is still correct. If the user asks for a fresh look instead, Companion gets new evidence before recommending anything.
+**Revisit when:** Only if the Evidence Boundary is intentionally revised, or if the product gains a reliable mechanism (such as continuous observation) that would justify Companion asserting a recommendation remains valid without a fresh photo.
+
+---
+
 ### 2026-07-26 — Session Generation and Session Presentation Are Separate Architectural Concerns
 **Decision:** Session Generation and Session Presentation Are Separate Architectural Concerns
 **Decision Class:** Class 1 - Forced Discovery
