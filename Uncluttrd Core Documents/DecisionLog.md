@@ -11,6 +11,33 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — The Evidence Boundary Applies Across Time, Not Only Across Knowledge
+**Decision:** The Evidence Boundary Applies Across Time, Not Only Across Knowledge
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Companion may describe what has already happened and what it is about to do, but may not describe the results of a process before those results are established. This is the same Evidence Boundary already governing certainty, interpretation, interruption, persistence, and visual hierarchy, now shown to also govern temporal reach.
+**Decision detail:** Process description is allowed - a sentence describing the immediate action about to occur. Outcome prediction requires evidence - a sentence describing a future state that has not yet been established is not permitted regardless of how confident or benign it sounds.
+**Use instead:**
+
+**Allowed - process descriptions of the immediate action:**
+- "Continue from the last recommendation I shared."
+- "We'll take a fresh look at the Space."
+- "Take a photo of your Space."
+
+**Not allowed - outcome predictions of a future state that has not yet been established:**
+- "We'll look at your Space before making a recommendation."
+- "We'll figure out the best next step."
+- "We'll know what to do next."
+
+**Worked example - final Journey 4 return-screen card copy:**
+- Pick that back up: "Continue from the last recommendation I shared."
+- Take a fresh look: "We'll take a fresh look at the Space."
+
+These two lines are epistemically parallel rather than grammatically parallel - one truthfully describes the past (a recommendation was shared), the other truthfully describes the immediate next action (a fresh look will happen). Neither predicts a future outcome.
+**Revisit when:** Only if the Evidence Boundary itself is intentionally revised.
+
+---
+
 ### 2026-07-26 — An Interrupted, Unconfirmed Recommendation Does Not Become an In Progress Object
 **Decision:** An Interrupted, Unconfirmed Recommendation Does Not Become an In Progress Object
 **Decision Class:** Class 1 - Forced Discovery
