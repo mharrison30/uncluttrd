@@ -11,6 +11,17 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Visual Weight Must Be Proportional to Claim Strength
+**Decision:** Visual Weight Must Be Proportional to Claim Strength
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** This is a direct extension of the previously adopted Evidence over Inference principle and the Pre-Photo Evidence Boundary. A screen's visual composition makes claims just as surely as its copy does - size, contrast, whitespace, and container treatment all communicate importance independent of what the words say. A composition can overclaim even when every individual sentence on the screen is honest. Any alternative would allow layout to silently contradict a claim classification the architecture has already established, which is not permissible under Evidence over Inference.
+**Decision detail:** Visual emphasis given to any element must match the evidentiary strength of the claim that element represents, using this scale: a durable fact may receive strong visual treatment; a temporary intention should receive moderate treatment; a prediction should receive restrained treatment; a hypothesis should receive minimal treatment. This principle governs the relationship between claim strength and visual weight - it does not prescribe specific visual techniques (e.g., whether to use a card, an icon, or plain text) for any given tier. Those remain implementation choices to be evaluated per screen.
+**Use instead:** When reviewing any wireframe or screen, run two independent checks: (1) is every individual claim in the copy honestly scoped to its available evidence, and (2) does the visual hierarchy make a stronger claim than the copy does. A screen can pass the first check and fail the second - both must be checked separately.
+**Revisit when:** Only if Evidence over Inference or the Pre-Photo Evidence Boundary are intentionally revised.
+
+---
+
 ### 2026-07-26 — Pre-Photo Evidence Boundary
 **Decision:** Pre-Photo Evidence Boundary
 **Decision Class:** Class 1 - Forced Discovery
