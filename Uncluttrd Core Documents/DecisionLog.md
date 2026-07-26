@@ -11,6 +11,14 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Space progress is not represented as task counts or completion percentages
+**Decision:** Do not represent overall Space progress as task counts or completion percentages.
+**Why:** Companion is designed to support an ongoing relationship with a home, not to encourage completion-chasing. Quantitative progress implies a finite endpoint that doesn't reflect how homes evolve over time.
+**Use instead:** Qualitative continuity ("picking up where you left off"), remembered context, and visible improvements. Session-scoped counts (e.g. "2 of 5 items completed" within a single active Session) remain acceptable, since a Session has a defined, bounded scope - unlike a Space, which does not.
+**Revisit when:** If future user research shows people struggle to understand whether they're making progress without lightweight metrics.
+
+---
+
 ### 2026-07-26 — Adopt ObjectModel.md v0.1 (Draft)
 **Decision:** `ObjectModel.md` is created as a new foundational document, alongside ProductPhilosophy.md, ArchitectureGuide.md, and SpaceMemoryModel.md, depending on all three. It defines what objects exist in Uncluttrd's organizing domain and what owns what - not behavior over time (LifecycleModel.md), not storage implementation (PersistenceModel.md), and not the reasoning/evidence/history behind each decision (kept exclusively in this Decision Log). Adopted at Status: Draft, not Adopted - expected to gain further refinement once LifecycleModel.md and PersistenceModel.md exist and exercise these objects against real behavior and storage. Every statement in the document carries an explicit confidence tier (Settled, Provisional, Open, or Explicitly Rejected), per Section 2, "How to Read This Document."
 
