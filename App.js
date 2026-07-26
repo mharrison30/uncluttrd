@@ -356,7 +356,12 @@ function AuthScreen() {
         const fullName = [firstName, lastName, suffix].filter(Boolean).join(" ");
         const cred = await createUserWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
         await updateProfile(cred.user, { displayName: fullName });
-        await ensureUserDocument(cred.user, { referralSource: referralSource || null });
+        // isNewSignup: true marks this doc as a genuine new signup, not just
+        // a first-ever doc materialization - ensureUserDocument also runs on
+        // every auth resolution and would otherwise create this same doc for
+        // a legacy user's routine login, which should not trigger a welcome
+        // email server-side (see sendWelcomeEmail in functions/index.js).
+        await ensureUserDocument(cred.user, { referralSource: referralSource || null, isNewSignup: true });
         // Sign out and back in to force auth state to refresh with new displayName
         await signOut(auth);
         await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);

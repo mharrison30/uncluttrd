@@ -1,5 +1,5 @@
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
+const { onDocumentDeleted, onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const crypto = require("crypto");
@@ -16,16 +16,25 @@ const db = admin.firestore();
 const ANTHROPIC_KEY = defineSecret("ANTHROPIC_KEY");
 const OPENAI_KEY = defineSecret("OPENAI_KEY");
 const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
-// RevenueCat webhook signing secret (X-RevenueCat-Webhook-Signature) and a
+// RevenueCat webhook signing secrets (X-RevenueCat-Webhook-Signature) and a
 // RevenueCat secret API key (server-to-server REST calls - distinct from
 // the public appl_.../goog_... keys used client-side for Purchases.configure).
-// Both project-scoped: set independently per Firebase project via
+// All project-scoped: set independently per Firebase project via
 // `firebase functions:secrets:set`, same as ANTHROPIC_KEY/OPENAI_KEY above.
 // Real values set on cluttrd-staging 2026-07-21. Correction to the original
 // assumption here: `firebase functions:secrets:set` explicitly warns that a
 // redeploy IS required to pick up a new secret version - it does not
 // resolve `latest` per-invocation the way that was first assumed.
-const REVENUECAT_WEBHOOK_SECRET = defineSecret("REVENUECAT_WEBHOOK_SECRET");
+//
+// Two separate webhook secrets, not one (DecisionLog.md 2026-07-24): each
+// RevenueCat webhook integration (one per store - App Store, Play Store)
+// generates its own distinct signing secret, and a single incoming request
+// is only ever signed with the one matching secret for whichever store sent
+// it. revenueCatWebhook below tries both against every request rather than
+// requiring a specific one, so either store's deliveries verify correctly
+// without needing to know in advance which store an event came from.
+const REVENUECAT_WEBHOOK_SECRET_IOS = defineSecret("REVENUECAT_WEBHOOK_SECRET_IOS");
+const REVENUECAT_WEBHOOK_SECRET_ANDROID = defineSecret("REVENUECAT_WEBHOOK_SECRET_ANDROID");
 const REVENUECAT_SECRET_API_KEY = defineSecret("REVENUECAT_SECRET_API_KEY");
 // Not a secret (an identifier, not a credential) - needed for the v2 REST
 // API's URL path. One RevenueCat project serves both the production and
@@ -33,16 +42,29 @@ const REVENUECAT_SECRET_API_KEY = defineSecret("REVENUECAT_SECRET_API_KEY");
 // across environments - real value set directly here rather than only in
 // .env.cluttrd-staging, since it's not actually environment-specific.
 const REVENUECAT_PROJECT_ID = defineString("REVENUECAT_PROJECT_ID", { default: "projc4cb5734" });
-// The entitlement identifier as configured in the RevenueCat dashboard -
-// same string the client already checks via
-// customerInfo.entitlements.active["Uncluttrd Pro"].
-const PRO_ENTITLEMENT_ID = "Uncluttrd Pro";
+// RevenueCat's INTERNAL entitlement id for "Uncluttrd Pro" - NOT the
+// developer-facing lookup_key string (confirmed wrong 2026-07-24: the V2
+// API's GET .../active_entitlements response's entitlement_id field returns
+// this internal id, e.g. "entl16a5fcafc4", never the "Uncluttrd Pro" string
+// - that string only appears as the entitlement's separate `lookup_key`
+// field, e.g. via GET .../entitlements. The original TEMP DEBUG comment
+// below flagged this exact ambiguity as unconfirmed; real webhook deliveries
+// proved it wrong the "Uncluttrd Pro" way, silently computing isPro=false
+// for every genuinely-entitled customer since this webhook went live. Do
+// NOT change this back to "Uncluttrd Pro" - that is the client-side
+// entitlements.active[] key (a different RevenueCat API/SDK, correctly
+// keyed by lookup_key there), not this server-side REST endpoint's shape.
+const PRO_ENTITLEMENT_ID = "entl16a5fcafc4";
 // Resend's shared sandbox sender - works with no domain verification, but
 // can only deliver to the email address the Resend account itself signed up
 // with. Fine for a single-recipient canary alert; would need a verified
 // custom domain to send to any other address.
 const CANARY_ALERT_FROM = "Uncluttrd Canary <onboarding@resend.dev>";
 const CANARY_ALERT_TO = "michael@earthwiseenergy.net";
+// Verified custom domain (DKIM/MX/SPF all confirmed 2026-07-23) - distinct
+// from CANARY_ALERT_FROM's Resend sandbox sender, used for real user-facing
+// transactional email (welcome, Pro upgrade, re-engagement).
+const TRANSACTIONAL_EMAIL_FROM = "Uncluttrd <hello@uncluttrd.app>";
 
 const FREE_MONTHLY_LIMIT = 3;
 const IDEMPOTENCY_TTL_DAYS = 60; // within the requested 30-90 day range; requires a Firestore TTL policy on expiresAt (console/gcloud config, not code)
@@ -429,12 +451,14 @@ exports.analyzePhotoCanary = onSchedule(
   }
 );
 
-// Sends the canary failure email directly via Resend, in the same execution
-// that detected the failure. Wrapped in its own try/catch so a Resend outage
-// or bad key can't crash the canary function itself or mask the original
-// failure - a failure to send just logs a second, distinctly-tagged line,
-// same log-inspection fallback as the primary alert.
-async function sendCanaryAlertEmail(errorMessage) {
+// Shared Resend sender for every outbound email this project sends (canary
+// alert + the welcome/Pro-upgrade/re-engagement user emails below). Never
+// throws out to the caller - a Resend outage or bad key must not crash the
+// caller (revenueCatWebhook still has to answer RevenueCat with 200, the
+// re-engagement scheduler must not let one user's failure abort the batch,
+// and the canary alert itself must not mask the original failure it's
+// reporting) - a send failure just logs a distinctly-tagged line instead.
+async function sendEmail({ from, to, subject, text }) {
   try {
     const resp = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -442,35 +466,107 @@ async function sendCanaryAlertEmail(errorMessage) {
         "Authorization": `Bearer ${RESEND_API_KEY.value()}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        from: CANARY_ALERT_FROM,
-        to: [CANARY_ALERT_TO],
-        subject: "analyzePhoto canary failed",
-        text: `analyzePhoto canary failed at ${new Date().toISOString()}\n\n${errorMessage}`,
-      }),
+      body: JSON.stringify({ from, to: Array.isArray(to) ? to : [to], subject, text }),
     });
     if (!resp.ok) {
-      console.error(`[CANARY_ALERT] Resend email send failed: HTTP ${resp.status} - ${await resp.text()}`);
+      console.error(`[sendEmail] Resend send failed (to=${JSON.stringify(to)}, subject="${subject}"): HTTP ${resp.status} - ${await resp.text()}`);
     }
-  } catch (emailErr) {
-    console.error(`[CANARY_ALERT] Resend email send threw: ${emailErr.message}`);
+  } catch (err) {
+    console.error(`[sendEmail] Resend send threw (to=${JSON.stringify(to)}, subject="${subject}"): ${err.message}`);
   }
+}
+
+// Sends the canary failure email in the same execution that detected the
+// failure - thin wrapper over sendEmail keeping this call site's existing
+// behavior (from/to/subject) unchanged.
+async function sendCanaryAlertEmail(errorMessage) {
+  await sendEmail({
+    from: CANARY_ALERT_FROM,
+    to: [CANARY_ALERT_TO],
+    subject: "analyzePhoto canary failed",
+    text: `analyzePhoto canary failed at ${new Date().toISOString()}\n\n${errorMessage}`,
+  });
+}
+
+// Re-fetches and writes the authoritative isPro state for a single uid -
+// shared by revenueCatWebhook's normal single-uid path (event.app_user_id)
+// and its TRANSFER path below, which can touch several uids from one event.
+// Deliberately does NOT try to derive active/inactive from the event's own
+// `type`/`entitlement_ids` - RevenueCat's own guidance is that several event
+// types (BILLING_ISSUE, PRODUCT_CHANGE, REFUND_REVERSED) are ambiguous
+// without extra context, so every delivery re-fetches the authoritative
+// current state via the REST API and writes whatever that says, rather than
+// modeling event-type transition semantics here.
+// Returns the resulting isPro value, or null if the entitlement fetch
+// itself failed for this uid (logged, not thrown - a 404 e.g. a sandbox/
+// test app_user_id, or a TRANSFER source uid RevenueCat only half-knows
+// about, is a real non-retryable case for that one uid, not the whole event).
+async function syncProStatus(uid) {
+  const activeResp = await fetch(
+    `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID.value()}/customers/${encodeURIComponent(uid)}/active_entitlements`,
+    { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
+  );
+  if (!activeResp.ok) {
+    console.error(`[revenueCatWebhook] active_entitlements fetch failed for uid=${uid}: HTTP ${activeResp.status} - ${await activeResp.text()}`);
+    return null;
+  }
+  const activeData = await activeResp.json();
+  // TEMP DEBUG: logging the raw response verbatim during initial
+  // testing. The V2 API's exact entitlement_id format (developer-facing
+  // identifier like "Uncluttrd Pro" vs. an internal RevenueCat id) was
+  // not fully confirmed from docs alone - this line exists so the first
+  // real webhook delivery makes that unambiguous instead of silently
+  // producing isPro: false forever if the comparison below is wrong.
+  // Remove once confirmed correct against a real event.
+  console.log(`[revenueCatWebhook] active_entitlements raw response for uid=${uid}: ${JSON.stringify(activeData)}`);
+  const isPro = (activeData.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
+
+  // Read before write, reused for both the Pro-transition check below and
+  // the upgrade email's content - not a second round-trip. Not
+  // transactional: two events for the same uid delivered close together
+  // could both read wasPro=false before either write lands, producing two
+  // upgrade emails. Accepted, low-stakes edge case (a friendly duplicate
+  // email, not a billing/security issue) - same risk tolerance as
+  // analyzePhoto's accepted lost-race case elsewhere in this file.
+  const userRef = db.doc(`users/${uid}`);
+  const userSnapBefore = await userRef.get();
+  const wasPro = userSnapBefore.exists && userSnapBefore.data().isPro === true;
+
+  try {
+    await userRef.update({ isPro });
+  } catch (updateErr) {
+    // User doc doesn't exist (e.g. a TRANSFER event's source uid, or a
+    // sandbox test app_user_id with no real account) - logged, not
+    // retried, same reasoning as the entitlement-fetch-failed case above.
+    console.error(`[revenueCatWebhook] Firestore write failed for uid=${uid}: ${updateErr.message}`);
+  }
+
+  // Only on a genuine transition to Pro - not every delivery, and not
+  // re-confirming an already-Pro user (e.g. a BILLING_ISSUE resolving
+  // itself, or an unrelated event/uid re-triggering this handler).
+  if (isPro === true && !wasPro && userSnapBefore.exists) {
+    const { email, displayName } = userSnapBefore.data();
+    if (email) {
+      await sendEmail({
+        from: TRANSACTIONAL_EMAIL_FROM,
+        to: email,
+        subject: "Welcome to Uncluttrd Pro! 🎉",
+        text: proUpgradeEmailText(displayName),
+      });
+    }
+  }
+
+  return isPro;
 }
 
 // RevenueCat webhook -> Firestore isPro sync (DecisionLog.md 2026-07-21),
 // replacing the client-writable isPro field with a server-verified one -
 // see BACKLOG.md's "RevenueCat Webhook -> Cloud Function -> Firestore Sync"
 // item for the full history of why the client-write approach was interim.
-//
-// Deliberately does NOT try to derive active/inactive from the event's own
-// `type`/`entitlement_ids` - RevenueCat's own guidance is that several event
-// types (BILLING_ISSUE, PRODUCT_CHANGE, REFUND_REVERSED) are ambiguous
-// without extra context, so every delivery re-fetches the authoritative
-// current state via the REST API and writes whatever that says, rather than
-// modeling event-type transition semantics here. No event-type filtering at
-// all: any webhook delivery is treated as "something changed, go verify."
+// No event-type filtering: any webhook delivery is treated as "something
+// changed, go verify" (see syncProStatus above for why).
 exports.revenueCatWebhook = onRequest(
-  { secrets: [REVENUECAT_WEBHOOK_SECRET, REVENUECAT_SECRET_API_KEY] },
+  { secrets: [REVENUECAT_WEBHOOK_SECRET_IOS, REVENUECAT_WEBHOOK_SECRET_ANDROID, REVENUECAT_SECRET_API_KEY, RESEND_API_KEY] },
   async (req, res) => {
     if (req.method !== "POST") {
       res.status(405).send("Method not allowed");
@@ -504,17 +600,22 @@ exports.revenueCatWebhook = onRequest(
       return;
     }
     const signedPayload = `${timestamp}.${req.rawBody.toString("utf8")}`;
-    const expectedSignature = crypto
-      .createHmac("sha256", REVENUECAT_WEBHOOK_SECRET.value())
-      .update(signedPayload)
-      .digest("hex");
-    const expectedBuf = Buffer.from(expectedSignature, "utf8");
     const providedBuf = Buffer.from(providedSignature, "utf8");
-    // Length check before timingSafeEqual - it throws on mismatched
-    // buffer lengths rather than returning false.
-    const signatureValid =
-      expectedBuf.length === providedBuf.length &&
-      crypto.timingSafeEqual(expectedBuf, providedBuf);
+    // Tries both store integrations' secrets - a request is only ever
+    // signed with the one matching whichever store actually sent it, so
+    // exactly one of these should match for any genuine delivery. Filters
+    // out an unset secret's value (the empty string a not-yet-configured
+    // defineSecret resolves to) so an unconfigured platform can never
+    // accidentally match via an empty-secret HMAC.
+    const signatureValid = [REVENUECAT_WEBHOOK_SECRET_IOS.value(), REVENUECAT_WEBHOOK_SECRET_ANDROID.value()]
+      .filter(Boolean)
+      .some((secret) => {
+        const expectedSignature = crypto.createHmac("sha256", secret).update(signedPayload).digest("hex");
+        const expectedBuf = Buffer.from(expectedSignature, "utf8");
+        // Length check before timingSafeEqual - it throws on mismatched
+        // buffer lengths rather than returning false.
+        return expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+      });
     if (!signatureValid) {
       console.error("[revenueCatWebhook] Invalid signature");
       res.status(401).send("Invalid signature");
@@ -522,75 +623,198 @@ exports.revenueCatWebhook = onRequest(
     }
 
     const event = req.body?.event;
-    if (!event || !event.id || !event.app_user_id) {
+    // TRANSFER events have no app_user_id at all - confirmed against
+    // RevenueCat's own docs 2026-07-24, not assumed. They carry
+    // transferred_from/transferred_to arrays instead (entitlements moving
+    // between app_user_ids - RevenueCat merging an anonymous pre-login
+    // identity into a real uid produces exactly this). Every other event
+    // type still requires app_user_id as before.
+    const isTransfer = event?.type === "TRANSFER";
+    const malformed = !event || !event.id
+      || (!isTransfer && !event.app_user_id)
+      || (isTransfer && !(event.transferred_to || []).length);
+    if (malformed) {
       console.error(`[revenueCatWebhook] Malformed event payload: ${JSON.stringify(req.body)}`);
       res.status(400).send("Malformed event");
       return;
     }
 
-    // app_user_id is expected to equal the Firebase uid directly - the
-    // client calls Purchases.logIn(u.uid) at sign-in, so RevenueCat's
-    // subscriber identity and this app's Firebase uid are the same value
-    // by construction. Not re-derived or looked up here.
-    const uid = event.app_user_id;
-    // Scoped under the user's own doc, same convention as analyzePhoto's
-    // analysisIdempotency - ownership enforced by path, not a uid-match
-    // check in code or rules.
-    const eventRef = db.collection("users").doc(uid).collection("revenueCatWebhookEvents").doc(event.id);
+    // Normal events: app_user_id is expected to equal the Firebase uid
+    // directly - the client calls Purchases.logIn(u.uid) at sign-in, so
+    // RevenueCat's subscriber identity and this app's Firebase uid are the
+    // same value by construction. Not re-derived or looked up here.
+    // TRANSFER events: every real uid on either side of the move, since
+    // both gain/lose entitlements and should be re-synced - filtered of
+    // RevenueCat's own anonymous ids ($RCAnonymousID:...), which aren't
+    // Firebase uids and have no Firestore doc to update.
+    const targetUids = isTransfer
+      ? [...new Set([...(event.transferred_from || []), ...(event.transferred_to || [])])].filter((id) => !id.startsWith("$RCAnonymousID:"))
+      : [event.app_user_id];
 
     try {
-      // Idempotency: RevenueCat retries reuse the same event.id.
-      const eventSnap = await eventRef.get();
-      if (eventSnap.exists) {
-        console.log(`[revenueCatWebhook] Duplicate event ${event.id} for uid=${uid}, already processed`);
-        res.status(200).send("OK (duplicate)");
-        return;
+      const results = [];
+      for (const uid of targetUids) {
+        // Scoped under each user's own doc, same convention as
+        // analyzePhoto's analysisIdempotency - ownership enforced by path,
+        // not a uid-match check in code or rules. Per-(uid, event.id) rather
+        // than one event-wide record, since a TRANSFER can touch multiple
+        // uids and a partial failure shouldn't block reprocessing whichever
+        // ones weren't reached yet.
+        const eventRef = db.collection("users").doc(uid).collection("revenueCatWebhookEvents").doc(event.id);
+        const eventSnap = await eventRef.get();
+        if (eventSnap.exists) {
+          console.log(`[revenueCatWebhook] Duplicate event ${event.id} for uid=${uid}, already processed`);
+          continue;
+        }
+
+        const isPro = await syncProStatus(uid);
+        if (isPro === null) continue; // entitlement fetch failed for this uid, logged inside syncProStatus - not idempotency-marked, but no retry either since the overall response is still 200 below
+
+        await eventRef.set({
+          type: event.type,
+          processedAt: admin.firestore.FieldValue.serverTimestamp(),
+          isPro,
+        });
+        results.push(`${uid}->isPro=${isPro}`);
       }
 
-      const activeResp = await fetch(
-        `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID.value()}/customers/${encodeURIComponent(uid)}/active_entitlements`,
-        { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
-      );
-      if (!activeResp.ok) {
-        // Not thrown - a 404 (e.g. a sandbox/test app_user_id with no real
-        // customer record) is a real, non-retryable case, and returning 200
-        // here stops RevenueCat from retrying indefinitely on something
-        // that will never succeed.
-        console.error(`[revenueCatWebhook] active_entitlements fetch failed for uid=${uid}: HTTP ${activeResp.status} - ${await activeResp.text()}`);
-        res.status(200).send("OK (entitlement fetch failed, logged)");
-        return;
-      }
-      const activeData = await activeResp.json();
-      // TEMP DEBUG: logging the raw response verbatim during initial
-      // testing. The V2 API's exact entitlement_id format (developer-facing
-      // identifier like "Uncluttrd Pro" vs. an internal RevenueCat id) was
-      // not fully confirmed from docs alone - this line exists so the first
-      // real webhook delivery makes that unambiguous instead of silently
-      // producing isPro: false forever if the comparison below is wrong.
-      // Remove once confirmed correct against a real event.
-      console.log(`[revenueCatWebhook] active_entitlements raw response for uid=${uid}: ${JSON.stringify(activeData)}`);
-      const isPro = (activeData.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
-
-      try {
-        await db.doc(`users/${uid}`).update({ isPro });
-      } catch (updateErr) {
-        // User doc doesn't exist (e.g. a TRANSFER event's old owner, or a
-        // sandbox test app_user_id with no real account) - logged, not
-        // retried, same reasoning as the entitlement-fetch-failed case above.
-        console.error(`[revenueCatWebhook] Firestore write failed for uid=${uid}: ${updateErr.message}`);
-      }
-
-      await eventRef.set({
-        type: event.type,
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
-        isPro,
-      });
-
-      console.log(`[revenueCatWebhook] Processed ${event.type} for uid=${uid} -> isPro=${isPro}`);
+      console.log(`[revenueCatWebhook] Processed ${event.type} (event ${event.id}): ${results.join(", ") || "no uids updated"}`);
       res.status(200).send("OK");
     } catch (err) {
-      console.error(`[revenueCatWebhook] Unhandled error for uid=${uid}: ${err.message}`);
+      console.error(`[revenueCatWebhook] Unhandled error for event ${event.id}: ${err.message}`);
       res.status(500).send("Internal error");
+    }
+  }
+);
+
+// {{FirstName}} substitution shared by all three user-facing email
+// templates below - same source as the in-app "Hi, [Name]" greeting
+// (App.js's user.displayName?.split(' ')[0]).
+const firstNameFrom = (displayName) => (displayName || "").trim().split(" ")[0] || "there";
+
+const welcomeEmailText = (displayName) => `Hi ${firstNameFrom(displayName)},
+
+Welcome to Uncluttrd!
+
+We're Michael and Chantelle, the founders of Uncluttrd. Thanks for giving our app a try.
+
+We built Uncluttrd because we believe getting organized shouldn't feel overwhelming. Sometimes all you need is a place to start.
+
+Ready to begin?
+
+1. Open the app.
+2. Snap a photo of your space.
+3. Let Uncluttrd create your personalized organizing plan.
+
+If you ever have a question, suggestion, or just want to say hello, simply reply to this email. It comes directly to us, and we'd love to hear from you.
+
+Let's turn clutter into calm.
+
+Michael & Chantelle
+Co-Founders, Uncluttrd`;
+
+const proUpgradeEmailText = (displayName) => `Hi ${firstNameFrom(displayName)},
+
+Thank you for becoming an Uncluttrd Pro member!
+
+Your support helps us continue improving Uncluttrd and build new features that make organizing easier for everyone.
+
+As a Pro member, you've unlocked:
+
+✅ Unlimited organizing plans
+✅ Companion, your AI organizing coach
+✅ AI room visualizations
+✅ PDF exports
+
+We can't wait to see what you organize next.
+
+If you ever have a question, an idea, or run into an issue, simply reply to this email. We personally read every message.
+
+Welcome to the next level of organizing.
+
+Michael & Chantelle
+Co-Founders, Uncluttrd`;
+
+const reengagementEmailText = (displayName) => `Hi ${firstNameFrom(displayName)},
+
+We noticed you haven't created your first organizing plan yet, and that's perfectly okay.
+
+Whenever you're ready, just open the app, snap a photo of the space you'd like to organize, and let Uncluttrd build a personalized plan to help you get started.
+
+If you ran into a problem or have a question, just reply to this email. It comes directly to us, and we're always happy to help.
+
+We can't wait to see what you organize first.
+
+Michael & Chantelle
+Co-Founders, Uncluttrd`;
+
+// Fires once, on genuine new-signup doc creation only - gated on the
+// isNewSignup marker App.js's real signup call site sets explicitly
+// (DecisionLog.md 2026-07-24), not on bare users/{uid} doc creation.
+// ensureUserDocument (App.js) also creates this doc on a legacy user's
+// first login after any auth resolution, not just real signups - without
+// this gate, those users would incorrectly get a "welcome" email too.
+// Any future Admin-SDK bulk-write script touching users/{uid} docs won't
+// accidentally trigger this either, for the same reason.
+exports.sendWelcomeEmail = onDocumentCreated(
+  { document: "users/{userId}", secrets: [RESEND_API_KEY] },
+  async (event) => {
+    const data = event.data?.data();
+    if (!data || data.isNewSignup !== true) return;
+    if (!data.email) {
+      console.error(`[sendWelcomeEmail] No email on new signup doc for uid=${event.params.userId}`);
+      return;
+    }
+    await sendEmail({
+      from: TRANSACTIONAL_EMAIL_FROM,
+      to: data.email,
+      subject: "Welcome to Uncluttrd! 👋",
+      text: welcomeEmailText(data.displayName),
+    });
+  }
+);
+
+// Fires once per user, roughly 24h after signup, only if they still have
+// zero plans. Window is 30h-24h ago (not a tight 25h-24h) on an hourly
+// schedule so a single failed/skipped run's cohort still gets caught by
+// the next run - the reengagementEmailSentAt check (in-memory, not a query
+// clause - see the comment below) is what actually prevents a double-send
+// within that overlap, not the window alone.
+exports.reengagementNudge = onSchedule(
+  { schedule: "every 60 minutes", secrets: [RESEND_API_KEY] },
+  async () => {
+    const now = Date.now();
+    const windowStart = admin.firestore.Timestamp.fromMillis(now - 30 * 60 * 60 * 1000);
+    const windowEnd = admin.firestore.Timestamp.fromMillis(now - 24 * 60 * 60 * 1000);
+    // Both clauses are range filters on the same field (createdAt) - served
+    // by the automatic single-field index, no composite index needed. Same
+    // reasoning as checkOrphanedUserDeletions above for why the "already
+    // sent" check stays an in-memory filter instead of a third where()
+    // clause: Firestore's `!=`/not-equal-style filters exclude documents
+    // where the field doesn't exist at all, which is the common case here
+    // (reengagementEmailSentAt is absent until the first successful send).
+    const snap = await db.collection("users")
+      .where("createdAt", ">=", windowStart)
+      .where("createdAt", "<=", windowEnd)
+      .get();
+
+    for (const doc of snap.docs) {
+      try {
+        const data = doc.data();
+        if (data.reengagementEmailSentAt) continue;
+        const plansSnap = await doc.ref.collection("plans").limit(1).get();
+        if (!plansSnap.empty) continue;
+        if (!data.email) continue;
+        await sendEmail({
+          from: TRANSACTIONAL_EMAIL_FROM,
+          to: data.email,
+          subject: "Ready when you are.",
+          text: reengagementEmailText(data.displayName),
+        });
+        await doc.ref.update({ reengagementEmailSentAt: admin.firestore.FieldValue.serverTimestamp() });
+      } catch (err) {
+        console.error(`[reengagementNudge] Failed for uid=${doc.id}: ${err.message}`);
+      }
     }
   }
 );
