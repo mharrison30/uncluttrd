@@ -11,6 +11,12 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Adopt ArchitectureGuide.md v0.1 as a foundational document
+**Decision:** `ArchitectureGuide.md` is adopted as a new foundational document, alongside ProductPhilosophy.md and SpaceMemoryModel.md, in `Uncluttrd Core Documents/`. It defines how architecture documents are organized, how responsibilities are divided between them, and how they evolve over time - the architecture of the documentation itself, not product behavior. It establishes the document hierarchy: Product Philosophy sits at the top, flowing down to Architecture Guide, which branches into four parallel documents at the same level - Space Memory Model, Object Model, Journey, and Analytics - which converge back down into Implementation Plans. This describes conceptual dependency, not implementation order or revision sequence: authority flows downward through the hierarchy, while learning - design pressure that surfaces a needed revision to a higher-level document - flows in every direction.
+**Outcome:** Adopted as v0.1.
+
+---
+
 ### 2026-07-25 — Create SpaceMemoryModel.md v0.1 (Draft)
 **Decision:** `SpaceMemoryModel.md` is created as a new foundational document, alongside ProductPhilosophy.md, Architecture.md, DecisionLog.md, and CompanionDesignPrinciples.md, depending on ProductPhilosophy.md. It answers what Uncluttrd remembers about a Space and why - not how that memory is technically stored or structured. Core principle: a Space is not a database record, it is the AI's evolving understanding of a real place in the user's home. It establishes four guiding-philosophy statements, five durable memory categories (physical understanding, organizing history, user preferences and constraints, purchases and owned organizing products, and behavioral patterns over time) presented as strong working categories rather than a locked list, the distinction between durable memory and temporary coaching context, and the principle that memory must be intentional (not exhaustive) and must support correction and deliberate forgetting, not just indefinite accumulation.
 **Status note:** No existing convention for marking a document "Draft" versus "Adopted" was found elsewhere in this Decision Log - ProductPhilosophy.md is the only prior foundational document adopted this way, and it shipped straight to v1.0/Adopted. This entry and the document's own metadata block state "Draft, v0.1" in plain prose rather than inventing a new formal status taxonomy.
