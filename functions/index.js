@@ -149,7 +149,13 @@ exports.analyzePhoto = onCall(
       const userData = userSnap.exists ? userSnap.data() : {};
       month = currentMonthUTC();
 
-      if (userData.isPro !== true) {
+      // CANARY_TEST_UID is unconditionally exempt from the free-plan limit,
+      // independent of isPro/RevenueCat state - the canary exists to monitor
+      // analyzePhoto's own availability, not to test subscription gating, and
+      // its isPro value can legitimately go false on its own (e.g. a sandbox
+      // subscription naturally expiring) without that being a real incident.
+      // Structural fix, not a per-incident Firestore patch - see DecisionLog.md.
+      if (userData.isPro !== true && uid !== CANARY_TEST_UID.value()) {
         const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
         if (effectiveCount >= FREE_MONTHLY_LIMIT) {
           throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
@@ -205,7 +211,12 @@ exports.analyzePhoto = onCall(
             Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
           );
 
-          if (freshData.isPro === true) {
+          // Same CANARY_TEST_UID exemption as the pre-check above, applied
+          // here too - without it, canary's analysisCount would still climb
+          // indefinitely in the background even though it can never actually
+          // be blocked, which is confusing bookkeeping for an account that
+          // isn't really free-tier-metered.
+          if (freshData.isPro === true || uid === CANARY_TEST_UID.value()) {
             analysesRemaining = null;
             tx.set(idemRef, {
               text,
