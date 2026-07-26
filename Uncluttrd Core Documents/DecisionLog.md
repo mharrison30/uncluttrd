@@ -11,6 +11,34 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Adopt ObjectModel.md v0.1 (Draft)
+**Decision:** `ObjectModel.md` is created as a new foundational document, alongside ProductPhilosophy.md, ArchitectureGuide.md, and SpaceMemoryModel.md, depending on all three. It defines what objects exist in Uncluttrd's organizing domain and what owns what - not behavior over time (LifecycleModel.md), not storage implementation (PersistenceModel.md), and not the reasoning/evidence/history behind each decision (kept exclusively in this Decision Log). Adopted at Status: Draft, not Adopted - expected to gain further refinement once LifecycleModel.md and PersistenceModel.md exist and exercise these objects against real behavior and storage. Every statement in the document carries an explicit confidence tier (Settled, Provisional, Open, or Explicitly Rejected), per Section 2, "How to Read This Document."
+
+**Settled, Space-owned durable objects (four):**
+- Space - the root object of the organizing domain, owning the durable understanding and product activity associated with one real-world space.
+- Persistent Work - a Space-owned object with stable identity that survives beyond the Session that created it, persisting as the exact item rather than a summary, and able to resurface in later Sessions.
+- Location Reference - a Space-owned identity for a recurring, user-recognizable sub-location, carried by a stable internal ID rather than any single attribute, able to retain identity across renaming or relocation when evidence supports continuity.
+- Durable Memory - Space-owned retained understanding, supported by available evidence, not identical to the raw evidence itself; its categories are already defined in SpaceMemoryModel.md and are not restated here.
+
+**Explicitly rejected promotions (four), with revisit conditions:**
+- Area - not currently justified as an independent domain object; the demonstrated requirement (rename/relocation continuity) is satisfied by a Space-owned Location Reference. Revisit if Area gains independent navigation, its own unresolved-work collection, an independent lifecycle, sharing/permissions, or an identity independent of its owning Space.
+- Correction - an event and a source of evidence, not an object. Revisit only if new evidence demonstrates a need for independent ownership beyond the object it currently attaches to.
+- Completion - a lifecycle transition on Persistent Work and a source of evidence, not an independently owned object. Same revisit condition as Correction.
+- Deferral - a lifecycle event recorded on Persistent Work, not a separate object. Same revisit condition as Correction.
+
+**Open questions (five), with what would resolve each:**
+- Location Reference lifecycle (what makes a reference inactive, whether it can reactivate, whether reappearance reactivates the same identity or creates a new one) - resolves once real usage produces evidence of how renamed, relocated, or reappearing locations actually behave.
+- Snapshot ownership and lifecycle (provisionally Space-owned) - resolves once deletion and historical-consequence scenarios are actually exercised, most likely once LifecycleModel.md defines deletion behavior.
+- Runtime understanding / working interpretation representation - genuinely open, not leaning toward a three-layer model or any other specific structure; resolves once a concrete representation is designed against real interaction/prompt-assembly requirements.
+- Whether repeated deferral of Persistent Work should independently produce behavioral memory - resolves from the deferral count/history evidence already being preserved for this purpose, once real usage accumulates enough of it to judge.
+- Cross-cutting deletion behavior (Space deletion, account deletion) for the four durable responsibilities - explicitly deferred to LifecycleModel.md; resolves when that document is written.
+
+**Traceability:** Scenario detail, evidence, and reasoning behind every decision in this document stay exclusively in this Decision Log rather than being duplicated in ObjectModel.md itself - ObjectModel.md states conclusions and their confidence tier only, matching ArchitectureGuide.md's Writing Standards (Principle before Reasoning before Examples, decisions/hypotheses/open/deferred stated explicitly) and Revision Philosophy (significant changes recorded in this Decision Log, not re-derived per document).
+
+**Outcome:** Adopted as v0.1, Draft.
+
+---
+
 ### 2026-07-26 — Reconcile SpaceMemoryModel.md to v0.2 against ArchitectureGuide.md v0.1
 **Decision:** `SpaceMemoryModel.md` is updated to v0.2, a documentation reconciliation against the newly adopted `ArchitectureGuide.md`, not a design change. Four agreed edits: (1) old Sections 4 ("What It Means to Know a Space") and 5 ("Durable Memory Categories") are merged into a single Section 5, since the categories directly answer the question the first section poses. (2) A short bolded principle statement is added at the top of that merged section so it follows the Guide's Principle → Reasoning → Examples progression, matching the style already established by Section 3's Core Principle quote. (3) The document's introductory scope limitations (what the document does and does not define, previously plain prose before the first `---`) are promoted into a new, dedicated Section 2, "Scope Boundary," moved verbatim with no wording changes. (4) Version bumped 0.1 → 0.2. Section numbers 3 ("Core Principle") through 12 ("Questions Intentionally Deferred") shift accordingly; the one internal cross-reference that changed as a result ("The four Guiding Philosophy statements (Section 3)" in the Decisions Made section) is updated to "(Section 4)" - every other internal section reference already landed back on its original number by coincidence, since the one section added (Scope Boundary) and the one section removed (via the 4/5 merge) offset each other for everything after the merge point.
 **Reason:** `ArchitectureGuide.md` (adopted 2026-07-26, see entry above) establishes that architecture documents should follow a Principle → Reasoning → Examples progression per section, and that scope limitations should be explicit rather than left as unlabeled introductory prose. This reconciliation applies only those two structural standards to the one existing document they visibly under-served - no other section, wording, or architectural decision in `SpaceMemoryModel.md` was touched, per the Guide's own Revision Philosophy: standards should be applied where they produce a meaningful improvement in an existing document, not enforced as blanket rewrites.
