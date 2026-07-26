@@ -704,7 +704,7 @@ Ready to begin?
 
 1. Open the app.
 2. Snap a photo of your space.
-3. Let Uncluttrd create your personalized organizing plan.
+3. Let Uncluttrd create your personalized organizing space.
 
 If you ever have a question, suggestion, or just want to say hello, simply reply to this email. It comes directly to us, and we'd love to hear from you.
 
@@ -721,7 +721,7 @@ Your support helps us continue improving Uncluttrd and build new features that m
 
 As a Pro member, you've unlocked:
 
-✅ Unlimited organizing plans
+✅ Unlimited organizing spaces
 ✅ Companion, your AI organizing coach
 ✅ AI room visualizations
 ✅ PDF exports
@@ -737,9 +737,9 @@ Co-Founders, Uncluttrd`;
 
 const reengagementEmailText = (displayName) => `Hi ${firstNameFrom(displayName)},
 
-We noticed you haven't created your first organizing plan yet, and that's perfectly okay.
+We noticed you haven't created your first organizing space yet, and that's perfectly okay.
 
-Whenever you're ready, just open the app, snap a photo of the space you'd like to organize, and let Uncluttrd build a personalized plan to help you get started.
+Whenever you're ready, just open the app, snap a photo of the space you'd like to organize, and let Uncluttrd build a personalized space to help you get started.
 
 If you ran into a problem or have a question, just reply to this email. It comes directly to us, and we're always happy to help.
 
