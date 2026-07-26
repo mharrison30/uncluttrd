@@ -11,6 +11,24 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Session Generation and Session Presentation Are Separate Architectural Concerns
+**Decision:** Session Generation and Session Presentation Are Separate Architectural Concerns
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Companion may internally generate a broader organizing strategy from the available evidence. That internal strategy may include possible actions, dependencies, ordering, and alternatives. The existence of that reasoning does not entitle the interface to present the full strategy as settled fact. A complete visible plan would imply that the interpretation is stable, the execution order is settled, future evidence will not change the strategy, and every listed action is already trustworthy enough to ask of the user. The architecture does not support those claims. As the user acts, the Space changes and new evidence may reveal that an anticipated action is unnecessary, incorrect, incomplete, or should be reordered. Showing the full plan beforehand would therefore require Companion either to preserve a claim it no longer believes or silently revise something it previously presented as settled. Companion instead presents only the next action that is currently supported by the evidence.
+**Decision detail:** Companion reveals trustworthy actions, not complete plans. The session unfolds as a repeated cycle: Observe, recommend one trustworthy action, observe again.
+
+**Consequence - No "Today's Plan" Screen:** There is no legitimate list-of-steps screen to redesign. It is removed entirely. Companion may hold a broader internal strategy, but the user experience exposes one trustworthy action at a time.
+
+**Consequence - Session Completion:** A session is complete when Companion has no further trustworthy action worth asking the user to take today. Completion does not mean the Space is finished, every possible task is complete, or the user successfully completed a predefined plan. It means the current session has reached the limit of what the present evidence and context support. This is consistent with Persistent Work because unfinished, deferred, or later-relevant work can remain attached to the Space without preventing the current session from ending.
+
+**Consequence - Claim-Strength Audit:** The existing claim-strength review must check not only numbers and visual metrics, but also language that implies hidden evaluation. Review question: does this word imply Companion has evaluated something it has not actually established? Terms requiring an evidentiary basis include high impact, important, critical, priority, easy, difficult, quick, major, and minor. These are not automatically forbidden, but Companion may use them only when the claimed judgment is supported by a defined and demonstrable signal. Confidence that a task exists is not evidence of its impact, importance, or difficulty.
+
+**Use instead:** The interface may show Today's Focus, the current action, practical guidance for that action, Retake or refresh evidence controls where required, Pause or adjust controls, and the next action once it becomes trustworthy. The interface must not show a complete numbered plan, a fixed step count, an upfront execution roadmap, or future actions presented as settled commitments.
+**Revisit when:** Revisit only if the product later gains reliable, user-visible evidence that can support stable future actions, such as continuous visual observation or explicit user confirmation of the complete session strategy. Until then, Journey 3 must use reveal-as-you-go presentation.
+
+---
+
 ### 2026-07-26 — Visual Weight Must Be Proportional to Claim Strength
 **Decision:** Visual Weight Must Be Proportional to Claim Strength
 **Decision Class:** Class 1 - Forced Discovery
