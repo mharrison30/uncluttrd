@@ -11,6 +11,38 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-27 — Recommendation Promoted to First-Class Object
+**Decision:** Recommendation is promoted to a first-class object.
+**Reason:** It has identity, ownership, lifecycle, and relationships independent of any single screen; Journey 5 already established that modification behavior belongs to the object, not the UI.
+**Outcome:** Approved.
+
+---
+
+### 2026-07-27 — Decision Dimension Confirmed as Controlled Vocabulary, Not an Independent Object
+**Decision:** Decision Dimension is confirmed as controlled vocabulary, not an independent object.
+**Reason:** No independent identity, ownership, or lifecycle; exists only as a referenced value.
+**Outcome:** Approved.
+
+---
+
+### 2026-07-27 — Remembered Statement Supports Two Creation Paths
+**Decision:** Remembered Statement supports two creation paths - structured (carries Decision Dimension, actionable) and volunteered (no Decision Dimension, memory only, not directly actionable). Both are the same object type.
+**Outcome:** Approved.
+
+---
+
+### 2026-07-27 — Decision Dimension Is Shared Controlled Vocabulary Referenced by Both Recommendation and Remembered Statement
+**Decision:** Decision Dimension is shared controlled vocabulary referenced by both Recommendation and Remembered Statement - this shared reference is the mechanism that allows a stored Remembered Statement to be matched against a future Recommendation.
+**Outcome:** Approved.
+
+---
+
+### 2026-07-27 — Claim Identity Remains Explicitly Deferred to Journey 5.1
+**Decision:** Claim Identity remains explicitly deferred to Journey 5.1. Not resolved by this reconciliation.
+**Outcome:** Approved.
+
+---
+
 ### 2026-07-26 — Explicit Truth Carries Its Own Scope
 **Decision:** Explicit Truth Carries Its Own Scope
 **Decision Class:** Class 1 - Forced Discovery
