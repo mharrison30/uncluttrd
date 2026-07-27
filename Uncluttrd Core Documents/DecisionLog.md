@@ -11,6 +11,19 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Observation Does Not Establish Evaluation
+**Decision:** Observation Does Not Establish Evaluation
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Journey 5 explored whether repeated organizing history could justify changing future recommendations. The working assumption was that a Space being organized, then messy again, implies the previous strategy failed. A counterexample demonstrated that the available evidence does not support this conclusion: the same repeated observations (organized, then messy again) are equally consistent with two opposite evaluations - that the previous strategy failed, or that the previous strategy succeeded exactly as intended. Because the available observations support both interpretations equally, Companion is entitled to neither. The boundary is therefore not about confidence - it is about evidence type. Observation establishes events. Evaluation establishes meaning. One cannot substitute for the other.
+**Decision detail:** Repeated observations establish what occurred. They do not establish whether the observed outcome represents success, failure, or a problem requiring a different strategy. Evaluation requires independently grounded evidence. Observation answers "what happened?" Evaluation answers "what does that mean?" Repeated observations never become evaluation simply by accumulating. Evaluation requires evidence that directly addresses success, failure, satisfaction, or intent.
+
+Consequences: Long-term photo history alone cannot justify changing organizing strategy. Long-term memory remains valuable for remembering explicit user preferences, accepted or rejected strategies, user feedback, and durable organizing decisions. Those are evaluative signals because they originate from explicit evidence rather than inference.
+**Use instead:** Companion may use repeated observations to report history - for example, number of completed sessions, recommendation history, or previously completed work. Companion must not infer that a strategy succeeded, that a strategy failed, that recurrence is desirable or undesirable, or that a different strategy is now required. Those conclusions require independent evaluative evidence, such as explicit user feedback or another separately grounded signal.
+**Revisit when:** If Companion gains a new, independently grounded source of evaluative evidence beyond repeated observations, this boundary may be revisited.
+
+---
+
 ### 2026-07-26 — Every Visible Element Asserts Both Truth and Importance
 **Decision:** Every Visible Element Asserts Both Truth and Importance
 **Decision Class:** Class 1 - Forced Discovery
