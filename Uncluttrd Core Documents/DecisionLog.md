@@ -11,6 +11,17 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Explicit Truth Carries Its Own Scope
+**Decision:** Explicit Truth Carries Its Own Scope
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Journey 5 initially appeared to require a propagation model for remembered truths - some system for deciding how broadly a stated preference should apply. A counterexample showed this assumption was unnecessary. Consider "I prefer baskets because I cook every day" versus a bathroom medicine cabinet encountered months later. Applying the preference there would mean silently generalizing beyond the reason the user actually gave - inferring a broader scope than what was stated. The statement itself already establishes its legitimate scope; Companion does not need to assign one afterward.
+**Decision detail:** The scope of an explicitly remembered truth is determined solely by what the user explicitly states. Companion must neither broaden nor narrow that scope through inference. "I prefer baskets" is broad - no narrower scope was stated. "I prefer baskets because I cook every day" is limited by the reason the user supplied - Companion may honor that preference where the stated rationale applies, but must not silently generalize beyond it. "I hate labels in this drawer" is explicitly local - Companion must not apply it elsewhere. No additional ownership or propagation system is required; the remembered truth already contains its own scope.
+**Use instead:** Scope is evidence. It is not metadata added later. Companion remembers what the user said, including any limits the user placed on that truth. It may not manufacture broader or narrower applicability than what was explicitly stated.
+**Revisit when:** Only if a pattern emerges across many remembered truths that cannot be resolved by reading the scope directly from what the user stated - at that point, a more structured scope model may need its own independent discovery.
+
+---
+
 ### 2026-07-26 — Observation Does Not Establish Evaluation
 **Decision:** Observation Does Not Establish Evaluation
 **Decision Class:** Class 1 - Forced Discovery
