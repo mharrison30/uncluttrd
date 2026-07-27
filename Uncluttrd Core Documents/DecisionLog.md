@@ -11,6 +11,32 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-07
 
+### 2026-07-26 — Every Visible Element Asserts Both Truth and Importance
+**Decision:** Every Visible Element Asserts Both Truth and Importance
+**Decision Class:** Class 1 - Forced Discovery
+**Status:** Adopted
+**Why:** Earlier journeys established that every visible element is a claim about what Companion knows. Journey 5 exposed a separate failure mode. A rejected history wireframe presented only truthful, evidence-supported facts (five completed sessions, most recent session, included in the last five sessions), and it passed Evidence Review, Layout Review, Language Review, and Process vs Outcome Review. It was still architecturally incorrect. The failure was not that the information was false - it was that the interface never justified why those particular facts deserved the user's attention. Truth alone does not justify presentation. Selection itself communicates importance, and that assertion must be justified just as rigorously as the fact itself.
+**Decision detail:** Every visible element makes two independent claims. Truth (Epistemic Claim): Companion is entitled to know this. Governed by the Evidence Boundary. Importance (Relevance Claim): Companion is entitled to interrupt the user's attention with this now. Governed by product value. A fact must change understanding, decision-making, or available action to justify proactive presentation. Otherwise it belongs in history, not in the current experience.
+
+The review order becomes:
+1. Evidence Review - Is Companion entitled to know this?
+2. Relevance Review - Why this? Why now? What changes because it is shown?
+3. Layout Review - Does presentation imply unsupported importance or preference?
+4. Language Review - Does wording imply unsupported certainty or characterization?
+5. Process vs Outcome Review - Does the interface describe only earned process, or does it predict outcomes?
+
+Each stage assumes every earlier stage has already passed. A fact that fails Relevance Review should never proceed to Layout or Language review.
+
+This prevents a new class of architectural error: displaying truthful but non-actionable information simply because it is available. It also establishes that prominence, grouping, ordering, badges, summary cards, callouts, and highlighted metrics are all relevance claims, not merely presentation choices.
+**Use instead:**
+
+**Passes Evidence, fails Relevance:** "This drawer has appeared in your last five completed sessions." True, but if it changes neither recommendation nor user decision, it should not be proactively surfaced.
+
+**Passes Evidence and Relevance:** "This recommendation is based on today's photo." True, and relevant because it explains why the recommendation can be trusted.
+**Revisit when:** If Companion later demonstrates that long-term memory changes future recommendations in ways that improve user decisions, Relevance Review may justify surfacing some historical context. The burden remains on demonstrating why the history matters now, not merely that it exists.
+
+---
+
 ### 2026-07-26 — The Evidence Boundary Applies Across Time, Not Only Across Knowledge
 **Decision:** The Evidence Boundary Applies Across Time, Not Only Across Knowledge
 **Decision Class:** Class 1 - Forced Discovery
