@@ -1638,9 +1638,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const skippedExclusionText = skippedItemTextsRef.current.length
         ? `\n\nThe user has permanently skipped the following items earlier in this project - do not suggest these again in any form (not reworded, not narrower/broader versions of the same task), even if still visible in photo 3. This is different from items reported as "still working on this, not done yet" below, which SHOULD keep appearing until resolved:\n${skippedItemTextsRef.current.map(t => `- "${t}"`).join("\n")}`
         : "";
-      // TEMP DEBUG (skip-paraphrase investigation, remove once diagnosed).
-      dlog(`[SKIP DEBUG] batch ending=${companionBatchIndex} | skippedItemTextsRef.current (${skippedItemTextsRef.current.length}): ${JSON.stringify(skippedItemTextsRef.current)} | this round's own skips: ${JSON.stringify(skippedItems.map(i => i.text))}`);
-
       const nextPrompt = `You are a warm, encouraging professional organizer helping with an ongoing organizing session. You are shown three photos of the same space, in order: (1) the original photo, before any organizing began, (2) the state at the start of this session, (3) the state right now, after this session's work.\n\nThis session's checklist, and what the user reported for each item:\n${checklistLines}${skippedExclusionText}\n\nTrust photo 3 over what the user reported. The checklist reflects intent, not verified fact - if an item was marked done but photo 3 shows it clearly wasn't addressed, don't call out the discrepancy or tell the user they're wrong. Just generate the next batch naturally around what photo 3 actually shows, prioritizing what's genuinely still needed there.\n\nFirst, compare photo 2 and photo 3. In one short sentence, describe the overall visible progress made this session - specific and photo-grounded (name what got cleared or organized), not a generic compliment and not a count of items checked off. If you cannot identify confident, specific visible progress, respond with exactly this sentence instead: "You made progress this session and moved the space forward."\n\nThen generate the next balanced session's worth of steps (a small checklist, not one item and not an exhaustive plan), based only on what is visible in photo 3 right now, accounting for any items above reported as "still working on this, not done yet" - those will be carried into the next session automatically, so do not repeat or rephrase them; only return additional NEW steps needed to round out a well-sized session given what's already carried over. Also exclude anything from the permanently-skipped list above, if one was given. Same qualitative sizing rules as before: don't return several trivial items, don't disguise one overwhelming task as one item, prefer a genuine mix suited to what this space actually needs. Never estimate or state how long any step will take. Before suggesting each new step, verify the problem is genuinely visible and unaddressed in photo 3, not a common decluttering trope you're defaulting to. If no new steps are needed, return an empty list - that combined with nothing carried over is itself a meaningful signal the space may be substantially complete, and should inform completionRecommended below.\n\nThen compare photo 1 (the original) and photo 3 (right now) only, to judge overall project progress. Using only what you can actually see: has clutter decreased, are related items grouped, is the intended surface or area usable, is there an obvious next improvement still visible? Before citing anything as still remaining, verify it is confidently and clearly visible in photo 3 right now, not a plausible guess or a common decluttering trope you're defaulting to - if you can't confidently confirm an item is still there, don't cite it as a reason to continue. "Substantially complete" means the space is functional and meaningfully improved, not that it looks visually perfect. Judge only the original-vs-now comparison, not whether this specific session went well.\n\nIf completionRecommended is true, also write a short, punchy celebratory headline naming the specific space and transformation (e.g. "You reclaimed your kitchen"), based only on the photo 1 vs photo 3 comparison, plus a short list of 2 to 4 specific, photo-grounded accomplishments as brief phrases, not full sentences (e.g. "Counter cleared", "Pantry organized", "Recycling removed") - nothing you can't verify by looking at the photos, no percentages, no generic praise. If completionRecommended is false, return an empty string for celebrationHeadline and an empty list for accomplishments.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"visibleChange":"one short sentence describing this session's visible progress, or the exact fallback sentence if none is confident","nextBatch":["one or two warm sentences describing one new step","..."],"completionRecommended":true or false,"completionReason":"one short, specific sentence. If completionRecommended is true, explain specifically why the space now appears substantially complete. If false, describe the clearest single remaining visible opportunity. No generic praise, nothing you can't verify by looking at the photos.","celebrationHeadline":"short celebratory headline if completionRecommended is true, else empty string","accomplishments":["short accomplishment phrase","..."]}`;
       const generateNextActionFn = httpsCallable(functions, "generateNextAction");
       const result = await generateNextActionFn({
@@ -2763,8 +2760,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             style={[s.paywallCta, purchaseInProgress && { opacity: 0.7 }]}
             disabled={purchaseInProgress}
             onPress={async () => {
-            dlog("PURCHASE BUTTON TAPPED");
-            dlog(`purchaseInProgress check: ${purchaseInProgress}`);
             if (purchaseInProgress) return; // belt-and-suspenders alongside the disabled prop
             setPurchaseInProgress(true);
             logEvent(getAnalytics(), "pro_upgrade_clicked");
@@ -2781,7 +2776,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   await Purchases.logIn(user.uid);
                   revenueCatLinkedRef.current = true;
                 } catch (e) {
-                  dlog(`RevenueCat logIn retry error (at purchase): ${e.message}`);
                   Alert.alert("Unable to prepare your account for purchase", "Please check your connection and try again.");
                   return;
                 }
@@ -2806,16 +2800,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 setShowPaywall(false);
                 Alert.alert("Welcome to Pro!", "You now have unlimited access.");
               } else {
-                dlog(`Purchase succeeded but entitlement not active: ${JSON.stringify(customerInfo.entitlements.active)}`);
                 Alert.alert("Something went wrong", "Your purchase was processed but Pro could not be activated. Please restore purchases or contact support at hello@uncluttrd.app.");
               }
             } catch (e) {
               if (e.userCancelled) return;
-              if (e.code === Purchases.PURCHASES_ERROR_CODE.PRODUCT_ALREADY_PURCHASED_ERROR) {
-                dlog(`Purchase error: already subscribed (code=${e.code}): ${e.message}`);
-              } else {
-                dlog(`Purchase error: ${e.message} (code=${e.code})`);
-              }
               Alert.alert("Purchase failed", "Something went wrong. Please try again or contact support at hello@uncluttrd.app.");
             } finally {
               setPurchaseInProgress(false);
@@ -2859,7 +2847,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 Alert.alert("No purchases found", "We could not find any previous purchases for this Apple ID.");
               }
             } catch (e) {
-              dlog(`Restore purchases error: ${e.message}`);
               Alert.alert("Restore failed", e.message);
             }
           }}>
@@ -3793,7 +3780,7 @@ function AppRoot() {
         // retries it anyway as a second layer.
         const loginPromise = Purchases.logIn(u.uid)
           .then(() => { revenueCatLinkedRef.current = true; })
-          .catch(e => dlog(`RevenueCat logIn error (pre-unlock): ${e.message}`));
+          .catch(() => {});
         await Promise.race([loginPromise, new Promise(resolve => setTimeout(resolve, 8000))]);
       }
       setUser(u);
