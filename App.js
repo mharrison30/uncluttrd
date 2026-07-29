@@ -2949,7 +2949,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(item.spaceType, "What would you like to do?", [
-                  { text: "View Full Space", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(true); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
+                  // Plans saved before the Companion batch workflow shipped
+                  // (2026-07-18, see DecisionLog.md) have neither a populated
+                  // currentBatch nor companionComplete - forcing showCompanion
+                  // true for them opens the Companion screen with nothing to
+                  // render (no stage-appropriate content exists), leaving only
+                  // the header/back button visible. Route those straight to
+                  // the Results screen instead, which already renders their
+                  // photo/tiers/proTip correctly - the same screen "back"
+                  // already fell through to before this fix.
+                  { text: "View Full Space", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); const hasCompanionContent = !!item.companionComplete || (Array.isArray(item.currentBatch?.items) && item.currentBatch.items.length > 0); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(hasCompanionContent); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
                   // Gated the same way as the main results-screen share button
                   // (isPro ? "How would you like to share?" : "Upgrade to Pro
                   // for a beautiful branded PDF") - now that free plans are
