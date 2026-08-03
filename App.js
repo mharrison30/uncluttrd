@@ -17,12 +17,14 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
-import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, orderBy, limit, serverTimestamp, arrayUnion } from "firebase/firestore";
+import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment } from "firebase/firestore";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
+import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -64,6 +66,953 @@ let batchItemIdCounter = 0;
 function makeItemId() {
   batchItemIdCounter += 1;
   return `item-${Date.now()}-${batchItemIdCounter}`;
+}
+
+// ---- Space/Project/Session/Batch shadow migration (additive only) ----
+// Writes a parallel, read-inert shadow of the target Space -> Project ->
+// Session -> Batch model (ObjectModel.md) alongside every new plan.
+// Nothing in the app reads this data yet - resume logic, History, the
+// resume banner, deletion, PDF export, and analytics all continue to
+// read/write `plans` exactly as before. Deliberately scoped to
+// plan-creation time only; it does not stay in sync with later
+// batches/pauses/completion - that is a separate, later slice.
+const SHADOW_SCHEMA_VERSION = 1;
+
+// computeShadowIds/computeShadowBatchId now live in shared/spaceMigration.js
+// (imported above) - single shared derivation, deterministic not random,
+// used by both this file and the CLI/migration runner so the scheme can
+// never independently drift between callers again.
+
+// Pure - no Firestore calls, no side effects. Takes exactly what's known
+// at the point savePlanToHistory finishes (the entry it wrote, plus
+// whatever photoUrl the upload step obtained - null if that step
+// failed). Kept separate from writeSpaceShadowStructure specifically so
+// it can be unit-tested (idempotency, field-mapping correctness)
+// without a Firestore connection.
+function buildShadowDocs({ planId, entry, photoUrl }) {
+  // entry is always a brand-new plan here (savePlanToHistory just wrote
+  // it), so entry.canonicalSpaceId is always absent - passed through
+  // anyway for consistency with every other computeShadowIds call site.
+  const ids = computeShadowIds(planId, entry);
+  const hasBatch = !!entry.currentBatch;
+  const batchIndex = hasBatch ? entry.currentBatch.batchIndex : 1;
+  const batchId = computeShadowBatchId(planId, batchIndex);
+  // creationStatus is "created" always - it is the only state a
+  // *persisted* shadow document can ever carry, since writeBatch's
+  // atomicity guarantees structural completeness (all four docs, or
+  // none). It is not a signal about evidence completeness - that's
+  // evidenceStatus, tracked independently, since photoUrl availability
+  // has nothing to do with whether the shadow structure itself is whole.
+  // A write that doesn't complete at all persists no document, so
+  // "failed" is never something a document could carry either - it's
+  // operational telemetry (a dlog line in writeSpaceShadowStructure's
+  // catch block), not document state.
+  const creationStatus = "created";
+  const evidenceStatus = photoUrl ? "complete" : "unavailable";
+  const provenance = { sourcePlanId: planId, shadowSchemaVersion: SHADOW_SCHEMA_VERSION, creationStatus, evidenceStatus };
+  return {
+    ids: { ...ids, batchId },
+    space: {
+      ...provenance,
+      createdAt: entry.createdAt,
+      displayName: getSpaceDisplayName(entry),
+      activeProjectId: ids.projectId,
+    },
+    project: {
+      ...provenance,
+      scopeType: "Space",
+      scopeId: ids.spaceId,
+      status: "active",
+      // Preserves the plan.shadowSourceVersion -> project.sourceVersion
+      // relationship from the moment of creation, not just from the first
+      // later mutation - derived from entry's own field, never hardcoded,
+      // so this stays correct even if a plan is ever created with a
+      // starting version other than 1. This is the only field this fix
+      // adds; nothing else in this document, or the other three, changes.
+      sourceVersion: entry.shadowSourceVersion ?? 1,
+      startingEvidence: { photoUrl: photoUrl || null, capturedAt: entry.createdAt },
+      currentEvidence: { photoUrl: photoUrl || null, capturedAt: entry.createdAt },
+      createdAt: entry.createdAt,
+      completedAt: null,
+      abandonedAt: null,
+      supersededAt: null,
+    },
+    session: {
+      ...provenance,
+      projectId: ids.projectId,
+      startedAt: entry.createdAt,
+      endedAt: null,
+      status: "active",
+    },
+    batch: {
+      ...provenance,
+      batchIndex,
+      items: hasBatch ? entry.currentBatch.items : [],
+      suggestedAt: hasBatch ? entry.currentBatch.suggestedAt : entry.createdAt,
+      completedAt: null,
+      originalPhotoUrl: photoUrl || null,
+      progressPhotoUrl: null,
+    },
+  };
+}
+
+// The only function that actually touches Firestore for the shadow
+// structure. Additive-only: writes under users/{uid}/spaces/..., which
+// nothing else in the app reads. Never throws - a shadow-write failure
+// must never affect the real plan save it's piggybacking on, so every
+// caller treats this as fire-and-forget. Uses a single writeBatch so the
+// four documents are created atomically: either all four exist and
+// correctly reference each other, or none do - no document is ever left
+// half-linked to a Project/Space that doesn't exist. Because every doc
+// uses a deterministic ID via setDoc (not addDoc), calling this again
+// for the same planId overwrites the same four documents rather than
+// creating new ones - this is what Task 3's idempotency invariant
+// actually verifies.
+async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
+  try {
+    const shadow = buildShadowDocs({ planId, entry, photoUrl });
+    const { spaceId, projectId, sessionId, batchId } = shadow.ids;
+    const batch = writeBatch(db);
+    batch.set(doc(db, "users", uid, "spaces", spaceId), shadow.space);
+    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId), shadow.project);
+    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId), shadow.session);
+    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId, "batches", batchId), shadow.batch);
+    await batch.commit();
+    dlog(`[SPACE SHADOW] wrote shadow structure for plan ${planId} (evidenceStatus: ${shadow.project.evidenceStatus})`);
+    return { outcome: "written", evidenceStatus: shadow.project.evidenceStatus };
+  } catch (e) {
+    // A genuine atomic-write failure. No shadow docs exist for this plan
+    // at all (writeBatch is all-or-nothing) - there is no document to
+    // mark anything on. This is reported only as operational telemetry
+    // (dlog + this function's own return value to its caller), never as
+    // a field written to Firestore - see checkSpaceShadowExists /
+    // repairSpaceShadow below for how this state is later detected and
+    // recovered from.
+    dlog(`[SPACE SHADOW] shadow write FAILED for plan ${planId}: ${e.message}`);
+    console.log("Space shadow write error (non-fatal, plan save unaffected):", e.message);
+    return { outcome: "failed", error: e.message };
+  }
+}
+
+// ---- Missing-shadow detection and repair ----
+// The write above is fire-and-forget: if it fails silently (app
+// backgrounded, connectivity lost, process killed mid-write), the
+// shadow simply never exists, with no durable trace beyond a local dlog
+// line that may itself never be seen. Given the transactional write's
+// all-or-nothing semantics, there is no partial state to repair around -
+// a plan's shadow is either fully present (Space, Project, Session, and
+// at least one Batch) or fully absent (nothing) by construction, so
+// detection only needs to check for that binary.
+//
+// Batch Identity Alignment fix: a plan can have any number of Batch
+// documents (one per archived batchHistory entry, plus the current one),
+// so this reads the whole batches subcollection instead of one document
+// at a fixed ID - the earlier version checked a single batchId=planId
+// document that syncPlanToSpaceGraph/forceFullReprojection never
+// actually write to (they use computeShadowBatchId per real batchIndex),
+// meaning it always undercounted or missed real batches entirely once a
+// plan progressed past creation. presentCount and allPresent can only
+// confirm "at least one batch, not zero" without also reading the plan's
+// own batchHistory/currentBatch to know the exact expected count - that
+// finer check belongs to validateSpaceShadowMigration, which already has
+// the plan in hand and cross-checks the real expected set.
+async function checkSpaceShadowExists(uid, planId, plan) {
+  const { spaceId, projectId, sessionId } = computeShadowIds(planId, plan);
+  const [spaceSnap, projectSnap, sessionSnap, batchesSnap] = await Promise.all([
+    getDoc(doc(db, "users", uid, "spaces", spaceId)),
+    getDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId)),
+    getDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId)),
+    getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId, "batches")),
+  ]);
+  const batchSnaps = batchesSnap.docs;
+  const coreDocsPresentCount = [spaceSnap, projectSnap, sessionSnap].filter(s => s.exists()).length;
+  const nonePresent = coreDocsPresentCount === 0 && batchSnaps.length === 0;
+  const allPresent = coreDocsPresentCount === 3 && batchSnaps.length > 0;
+  return {
+    allPresent,
+    nonePresent,
+    presentCount: coreDocsPresentCount + batchSnaps.length,
+    batchCount: batchSnaps.length,
+    snaps: { spaceSnap, projectSnap, sessionSnap, batchSnaps },
+  };
+}
+
+// Thin wrapper around the canonical syncPlanToSpaceGraph projection.
+// Previously called writeSpaceShadowStructure directly - re-verified
+// during Step 5 and confirmed that was wrong: writeSpaceShadowStructure
+// only ever reconstructs creation-time state (a single batch taken from
+// entry.currentBatch, hardcoded "active" status, no batchHistory/
+// companionComplete/progressPhotos handling), which is correct for a
+// brand-new plan but silently produces an incomplete/incorrect shadow
+// for any plan that had already progressed before its shadow went
+// missing, and cannot repair a STALE (present but outdated) shadow at
+// all - it has no version awareness. Delegating to syncPlanToSpaceGraph
+// fixes both: it derives the full current-state projection from the
+// live plan (every archived batch plus the current one, real status/
+// evidence), and its own transactional version guard makes repeated
+// calls safe, so this no longer needs its own presence short-circuit -
+// calling it on an already-current shadow is a harmless no-op via that
+// guard. This keeps exactly one repair/sync projection in the codebase
+// instead of two competing ones.
+async function repairSpaceShadow(uid, planId) {
+  const result = await syncPlanToSpaceGraph(uid, planId);
+  dlog(`[SPACE SHADOW REPAIR] plan ${planId}: ${result.outcome}, result=${JSON.stringify(result)}`);
+  if (result.outcome === "source-plan-missing") return { planId, action: "none", reason: "source plan missing" };
+  if (result.outcome === "no-op") return { planId, action: "none", reason: result.reason };
+  return { planId, action: "repaired", result };
+}
+
+// Batch form - "for a given plan (or a batch of plans)" per the repair
+// requirement. Sequential, not parallel, to stay gentle on Firestore
+// quota when run against many plans at once from the admin path.
+async function repairSpaceShadowBatch(uid, planIds) {
+  const results = [];
+  for (const planId of planIds) {
+    results.push(await repairSpaceShadow(uid, planId));
+  }
+  return results;
+}
+
+// ---- Read-only shadow-migration validator (dev-only client trigger) ----
+// Every check below only calls getDoc/getDocs. There is no write
+// operation anywhere in this function - confirmed directly, not just
+// asserted (grep for setDoc/updateDoc/addDoc/deleteDoc/writeBatch inside
+// this function's body returns nothing; see the report for the actual
+// command run).
+//
+// Several invariants are deliberately staleness-aware rather than strict
+// equality checks: Part 1 only shadow-writes at plan-creation time, so a
+// plan that has since progressed (more batches, items toggled,
+// completed) will legitimately diverge from its creation-time shadow
+// snapshot. That divergence is expected and out of this slice's scope,
+// not a shadow-write defect - flagging it as a hard MISMATCH would make
+// the validator useless against real, in-progress production plans. Each
+// such case is reported as INFO with an explanation, distinct from a
+// true MISMATCH.
+// Step 6: optional third `prefetched` param - { planSnap, presence } -
+// lets a caller that already read these (loadSpaceShadowGraph) pass them
+// through instead of triggering a second independent read of the same
+// plan doc and the same four shadow docs. Absent (the default) for any
+// caller without pre-fetched data - e.g. the CLI's own equivalent, or the
+// dev-only post-write check in savePlanToHistory - in which case this
+// fetches everything itself exactly as before; standalone behavior and
+// return shape are unchanged either way.
+async function validateSpaceShadowMigration(uid, planId, prefetched) {
+  const findings = [];
+  const ok = (name) => findings.push({ invariant: name, status: "OK" });
+  const fail = (name, expected, found) => findings.push({ invariant: name, status: "MISMATCH", expected, found });
+  const info = (name, note) => findings.push({ invariant: name, status: "INFO", note });
+
+  const planSnap = prefetched?.planSnap || await getDoc(doc(db, "users", uid, "plans", planId));
+  if (!planSnap.exists()) {
+    fail("source-plan-exists", "plan document present", "not found");
+    return { planId, findings };
+  }
+  const plan = planSnap.data();
+
+  // §12 Migration Part 4: derived from the plan we just read, not bare
+  // planId - resolves through plan.canonicalSpaceId if this plan has been
+  // through a merge (see computeShadowIds, shared/spaceMigration.js).
+  const { spaceId, projectId, sessionId } = computeShadowIds(planId, plan);
+
+  // Shadow-missing is its own distinct condition, not just another
+  // mismatch - it's the expected signature of an interrupted
+  // fire-and-forget write (see checkSpaceShadowExists/repairSpaceShadow
+  // above), and needs to be measured and acted on separately from a
+  // shadow that exists but disagrees with its source plan.
+  const presence = prefetched?.presence || await checkSpaceShadowExists(uid, planId, plan);
+  if (presence.nonePresent) {
+    findings.push({ invariant: "shadow-presence", status: "MISSING", note: "no shadow documents exist for this plan - likely an interrupted fire-and-forget write; repairable via repairSpaceShadow(uid, planId), not a data-mismatch" });
+    return { planId, findings };
+  }
+  if (!presence.allPresent) {
+    // Should not be reachable given the transactional write's atomicity,
+    // but not silently ignored if it somehow happens.
+    findings.push({ invariant: "shadow-presence", status: "MISMATCH", expected: "0 documents, or Space+Project+Session plus at least 1 Batch (atomic)", found: `${presence.presentCount} present (${presence.batchCount} batch doc(s))` });
+  }
+
+  // presence.snaps already holds all shadow docs (checkSpaceShadowExists
+  // fetched them to compute presentCount) - reuse them instead of a second
+  // independent read of each, whether presence came from prefetched data or
+  // from the call just above. projectsSnap is not something either presence
+  // check or loadSpaceShadowGraph ever fetches, so it's always read here.
+  const { spaceSnap, projectSnap, sessionSnap, batchSnaps } = presence.snaps;
+  const projectsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects"));
+
+  // One source plan maps to exactly one expected Project.
+  const projectsForThisPlan = projectsSnap.docs.filter(d => d.data().sourcePlanId === planId);
+  if (projectsForThisPlan.length === 1 && projectSnap.exists()) ok("one-project-per-plan");
+  else fail("one-project-per-plan", "exactly 1", `${projectsForThisPlan.length}`);
+
+  // The Project points to the expected Space.
+  if (projectSnap.exists() && projectSnap.data().scopeId === spaceId) ok("project-points-to-space");
+  else fail("project-points-to-space", spaceId, projectSnap.exists() ? projectSnap.data().scopeId : "(project missing)");
+
+  // Freshness (shadow_freshness / STALE) is a separate axis from every
+  // structural check in this function - a shadow can be structurally
+  // perfect and stale, or broken and current. Delegated to a shared,
+  // SDK-neutral function so this client validator and the admin CLI
+  // (scripts/validateSpaceMigration.js) can never drift out of sync on
+  // what "stale" means. See shared/spaceShadowValidation.js.
+  findings.push(...evaluateSpaceShadowValidation(plan, { project: projectSnap.exists() ? projectSnap.data() : null }));
+
+  // Ownership chain - every doc lives under the same uid path segment.
+  // True by construction given how the refs above were built (uid is
+  // baked into every path), but confirmed explicitly here rather than
+  // assumed. Batches are checked individually (there can be any number
+  // of them), not as a single fixed doc.
+  [["space", spaceSnap], ["project", projectSnap], ["session", sessionSnap]].forEach(([label, snap]) => {
+    if (snap.exists() && snap.ref.path.startsWith(`users/${uid}/`)) ok(`ownership-chain-${label}`);
+    else fail(`ownership-chain-${label}`, `path starts with users/${uid}/`, snap.exists() ? snap.ref.path : "(missing)");
+  });
+  batchSnaps.forEach((snap) => {
+    if (snap.ref.path.startsWith(`users/${uid}/`)) ok(`ownership-chain-batch-${snap.id}`);
+    else fail(`ownership-chain-batch-${snap.id}`, `path starts with users/${uid}/`, snap.ref.path);
+  });
+
+  // Reconstructed Batches match the source plan's batchHistory and
+  // currentBatch - staleness-aware per the note below, generalized across
+  // every expected batch (Batch Identity Alignment fix - a plan can have
+  // any number of batches, not just one). Builds the expected list the
+  // same way syncPlanToSpaceGraph/forceFullReprojection do, and looks
+  // each one up by its real computeShadowBatchId, not a single fixed ID.
+  const archivedBatches = Array.isArray(plan.batchHistory) ? plan.batchHistory : [];
+  const expectedBatches = [
+    ...archivedBatches.map(b => ({ ...b, archived: true })),
+    ...(plan.currentBatch ? [{ ...plan.currentBatch, archived: false }] : []),
+  ];
+  const batchSnapsById = new Map(batchSnaps.map(s => [s.id, s]));
+
+  if (expectedBatches.length === 0) {
+    info("batch-content-match", "source plan has no batchHistory or currentBatch to compare against");
+  } else {
+    expectedBatches.forEach((sourceBatch) => {
+      const expectedId = computeShadowBatchId(planId, sourceBatch.batchIndex);
+      const shadowSnap = batchSnapsById.get(expectedId);
+      if (!shadowSnap) {
+        fail(`batch-${sourceBatch.batchIndex}-shadow-exists`, "batch document present", "not found");
+        return;
+      }
+      const shadowItems = shadowSnap.data().items || [];
+      const sourceItems = sourceBatch.items || [];
+      const textsMatch = shadowItems.length === sourceItems.length && shadowItems.every((it, i) => it.text === sourceItems[i]?.text);
+      if (textsMatch) ok(`batch-${sourceBatch.batchIndex}-item-text-match`);
+      else fail(`batch-${sourceBatch.batchIndex}-item-text-match`, sourceItems.map(i => i.text), shadowItems.map(i => i.text));
+
+      // Correction made before staging testing, Slice 1 (caught while
+      // designing the "plan progressed" scenario, not after): archived
+      // does NOT mean strictly comparable. An archived batch reflects
+      // real user resolution (items checked/carried/skipped as the user
+      // actually worked) which a creation-time-only shadow snapshot never
+      // captured by design. Comparing shadow-vs-archived status would
+      // therefore show a false MISMATCH on nearly every genuinely
+      // completed batch, not just on real shadow-write defects. The only
+      // state where a status mismatch is actually meaningful is when
+      // nothing has happened to THIS batch since it was last synced:
+      // still the live current batch, and every item still "pending."
+      const nothingHasHappenedYet = !sourceBatch.archived && sourceItems.every(i => i.status === "pending");
+      if (nothingHasHappenedYet) {
+        const statusesMatch = shadowItems.length === sourceItems.length && shadowItems.every((it, i) => it.status === sourceItems[i]?.status);
+        if (statusesMatch) ok(`batch-${sourceBatch.batchIndex}-item-status-match`);
+        else fail(`batch-${sourceBatch.batchIndex}-item-status-match`, sourceItems.map(i => i.status), shadowItems.map(i => i.status));
+      } else {
+        info(`batch-${sourceBatch.batchIndex}-item-status-match`, sourceBatch.archived
+          ? "this batch has been archived - its final status reflects real user resolution, which a creation-time-only shadow snapshot never captured by design; expected staleness, not a defect"
+          : "this batch has live item status changes since the last shadow sync; expected staleness, not validated as pass/fail here");
+      }
+    });
+
+    // Exact-count cross-check - checkSpaceShadowExists alone can only
+    // confirm "at least one batch present," not "exactly the right
+    // ones." This is where that finer completeness check happens, now
+    // that the plan's real expected set is known.
+    const expectedIds = new Set(expectedBatches.map(b => computeShadowBatchId(planId, b.batchIndex)));
+    const unexpectedBatchIds = batchSnaps.filter(s => !expectedIds.has(s.id)).map(s => s.id);
+    if (unexpectedBatchIds.length) fail("batch-count-matches-plan", `${expectedIds.size} expected batch document(s)`, `${batchSnaps.length} present, including unexpected: ${unexpectedBatchIds.join(", ")}`);
+    else if (batchSnaps.length === expectedIds.size) ok("batch-count-matches-plan");
+    else fail("batch-count-matches-plan", `${expectedIds.size} expected batch document(s)`, `${batchSnaps.length} present`);
+  }
+
+  // companionComplete preserved accurately - same staleness reasoning.
+  if (!projectSnap.exists()) {
+    fail("companion-complete-reflected", "project document present", "not found");
+  } else if (plan.companionComplete) {
+    info("companion-complete-reflected", "source plan is now complete; the creation-time shadow snapshot predates this and was never updated - expected, since Part 1 does not sync ongoing state, not a defect");
+  } else {
+    ok("companion-complete-reflected");
+  }
+
+  const mismatches = findings.filter(f => f.status === "MISMATCH");
+  dlog(`[SPACE SHADOW VALIDATE] plan ${planId}: ${findings.length} checks, ${mismatches.length} mismatch(es)`);
+  if (mismatches.length) dlog(`[SPACE SHADOW VALIDATE] mismatches: ${JSON.stringify(mismatches)}`);
+  return { planId, findings };
+}
+
+// ---- Slice 2: read-only Space shadow graph loader (dev inspector) ----
+// Assembles the full shadow graph for one plan into a single, stable
+// shape for display: { sourcePlan, space, project, session, batch,
+// validation }. Read-only - the only calls it makes are getDoc/getDocs
+// via checkSpaceShadowExists and validateSpaceShadowMigration, both
+// already proven read-only in Slice 1 (re-verified for this slice too,
+// not carried forward by assumption - see the report). Deliberately
+// reuses validateSpaceShadowMigration for the `validation` field rather
+// than reimplementing any invariant check, so the inspector and the CLI
+// validator can never drift out of sync with each other - if an
+// invariant is fixed or added there, this picks it up automatically.
+// Never throws on a missing/partial shadow; a pre-Slice-1 legacy plan
+// with no shadow at all is a normal, expected, explicit state, not an
+// error condition.
+async function loadSpaceShadowGraph(uid, planId) {
+  const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+  if (!planSnap.exists()) {
+    return {
+      sourcePlan: { exists: false, id: planId },
+      space: { exists: false }, project: { exists: false }, session: { exists: false }, batches: [],
+      validation: { findings: [{ invariant: "source-plan-exists", status: "MISMATCH", expected: "plan document present", found: "not found" }] },
+      expectedIds: computeShadowIds(planId),
+    };
+  }
+  const sourcePlan = { exists: true, id: planId, data: planSnap.data() };
+  const expectedIds = computeShadowIds(planId, sourcePlan.data);
+
+  const presence = await checkSpaceShadowExists(uid, planId, sourcePlan.data);
+  const toEntry = (snap) => (snap && snap.exists() ? { exists: true, id: snap.id, data: snap.data() } : { exists: false });
+  // Batch Identity Alignment fix: batches is now a list (any number of
+  // documents), sorted by batchIndex for stable, predictable display -
+  // not a single fixed-ID document.
+  const toBatchEntries = (snaps) => [...snaps]
+    .map(s => ({ exists: true, id: s.id, data: s.data() }))
+    .sort((a, b) => (a.data.batchIndex ?? 0) - (b.data.batchIndex ?? 0));
+
+  if (presence.nonePresent) {
+    return {
+      sourcePlan,
+      space: { exists: false }, project: { exists: false }, session: { exists: false }, batches: [],
+      validation: { findings: [{ invariant: "shadow-presence", status: "MISSING", note: "no shadow documents exist for this plan - either a pre-Slice-1 legacy plan, or an interrupted fire-and-forget write" }] },
+      expectedIds,
+    };
+  }
+
+  // Not reachable given the transactional write's atomicity, but not
+  // silently mishandled if it somehow occurs - surfaced explicitly
+  // rather than treated as either "present" or "missing".
+  if (!presence.allPresent) {
+    return {
+      sourcePlan,
+      space: toEntry(presence.snaps.spaceSnap), project: toEntry(presence.snaps.projectSnap),
+      session: toEntry(presence.snaps.sessionSnap), batches: toBatchEntries(presence.snaps.batchSnaps),
+      validation: { findings: [{ invariant: "shadow-presence", status: "MISMATCH", expected: "0 documents, or Space+Project+Session plus at least 1 Batch (atomic)", found: `${presence.presentCount} present (${presence.batchCount} batch doc(s))` }] },
+      expectedIds,
+    };
+  }
+
+  // Step 6: pass the plan and shadow reads already done above straight
+  // through instead of letting validateSpaceShadowMigration re-fetch the
+  // same plan doc and the same shadow docs a second time.
+  const validation = await validateSpaceShadowMigration(uid, planId, { planSnap, presence });
+
+  return {
+    sourcePlan,
+    space: toEntry(presence.snaps.spaceSnap),
+    project: toEntry(presence.snaps.projectSnap),
+    session: toEntry(presence.snaps.sessionSnap),
+    batches: toBatchEntries(presence.snaps.batchSnaps),
+    validation,
+    expectedIds,
+  };
+}
+
+// ---- Shadow Synchronization: canonical projection function ----
+// The single owner of "derive shadow state from the current plan." Not
+// wired into any mutation trigger yet (that is Step 3, deliberately not
+// started here) - this is the function itself, ready to be called.
+//
+// Always a full re-projection from freshly-read plan state, never from
+// caller-provided data - deliberately, since mutation-triggered syncs are
+// fire-and-forget and may complete out of order. Implemented as a real
+// Firestore transaction, not a read-then-write sequence: the plan and
+// Project docs are read inside the transaction and compared before any
+// write is attempted, so an older, later-completing sync can never
+// overwrite a newer shadow graph - either the version check no-ops it
+// directly, or (if two syncs' reads/writes genuinely interleave)
+// Firestore's own transaction conflict detection retries this function
+// from scratch against the now-current state.
+async function syncPlanToSpaceGraph(uid, planId) {
+  const planRef = doc(db, "users", uid, "plans", planId);
+
+  return runTransaction(db, async (tx) => {
+    // Explicit plan-existence check, first, before anything else - part of
+    // this function's core contract, not a test-only concern. This
+    // function may only ever project from an existing authoritative plan.
+    // If the plan is absent at transaction-read time - whether deleted
+    // before the transaction started, or deleted while it was in flight
+    // and forced Firestore to retry it - this is a normal terminal outcome
+    // for a fire-and-forget caller, not an error: exit with zero writes,
+    // no Space/Project/Session/Batch created or modified.
+    const planSnap = await tx.get(planRef);
+    if (!planSnap.exists()) {
+      return { outcome: "source-plan-missing" };
+    }
+    const plan = planSnap.data();
+    const planVersion = typeof plan.shadowSourceVersion === "number" ? plan.shadowSourceVersion : 1;
+
+    // Migration/Live-Sync Projection Alignment (MigrationSyncAlignmentDesign.md):
+    // the full graph - Space, Project (incl. migrationVersion), every
+    // reconstructed Session, every Batch - is derived by the exact same
+    // shared function forceFullReprojection uses, not a separate inline
+    // single-Session projection. This is what makes a migrated plan stay
+    // migration-complete after an ordinary live mutation: there is no
+    // longer a second, simpler shape for live sync to silently regress it
+    // to. ids (spaceId/projectId, canonicalSpaceId-aware) come from the
+    // same derivation, not computed separately.
+    const derived = deriveFullReprojectionDocs(planId, plan);
+    const { spaceId, projectId } = derived.ids;
+    const spaceRef = doc(db, "users", uid, "spaces", spaceId);
+    const projectRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId);
+
+    const projectSnap = await tx.get(projectRef);
+    const existingVersion = projectSnap.exists() && typeof projectSnap.data().sourceVersion === "number"
+      ? projectSnap.data().sourceVersion
+      : -1; // no shadow yet - always proceed
+
+    if (existingVersion > planVersion) {
+      // A newer projection is already persisted than what this plan state
+      // would produce - this call is the late one. Do not write anything.
+      return { outcome: "no-op", reason: "existing shadow already at or ahead of this plan version", existingVersion, planVersion };
+    }
+
+    // syncedAt uses this SDK's own serverTimestamp() sentinel - the shared
+    // derivation deliberately omits it (client and admin SDKs' sentinels
+    // are different, incompatible objects - see shared/spaceMigration.js's
+    // file header). Added here, once, exactly as forceFullReprojection
+    // does it.
+    const now = serverTimestamp();
+    tx.set(spaceRef, { ...derived.space, syncedAt: now });
+    tx.set(projectRef, { ...derived.project, syncedAt: now });
+
+    let batchCount = 0;
+    derived.sessions.forEach((session) => {
+      const sessionRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id);
+      tx.set(sessionRef, { ...session.data, syncedAt: now });
+      session.batches.forEach((batch) => {
+        const batchRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id, "batches", batch.id);
+        tx.set(batchRef, { ...batch.data, syncedAt: now });
+        batchCount++;
+      });
+    });
+
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+  });
+}
+
+// ---- Shadow Synchronization: deletion lifecycle ----
+// The projection layer's second deterministic operation (sync current
+// state; remove graph for a deleted source) - same single owner, not a
+// violation of it. Must be called only AFTER the authoritative plan
+// deletion has already succeeded (see deletePlan's call site) - plans
+// remains authoritative during this phase, so a temporarily orphaned
+// shadow (repairable later by a reconciliation sweep) is a safer failure
+// state than ever deleting the shadow while the plan it represents is
+// still live.
+// §12 Migration Part 4: canonicalSpaceId is an explicit third parameter,
+// not resolved internally via computeShadowIds(planId, plan) - by the time
+// this runs the plan is already gone (see the comment above), so there is
+// no plan document left to read plan.canonicalSpaceId from. The caller
+// must capture it from the plan record it already has in hand BEFORE
+// initiating deletion (MergeExecutionDesign.md §2). Passing null/undefined
+// reproduces today's exact behavior (spaceId === planId), correct for the
+// overwhelming majority of plans that have never been merged.
+async function deleteSpaceShadowGraph(uid, planId, canonicalSpaceId) {
+  const spaceId = canonicalSpaceId || planId;
+  const projectId = planId;
+  const sessionId = planId;
+  try {
+    const batchesSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId, "batches"));
+    await Promise.all(batchesSnap.docs.map(d => deleteDoc(d.ref)));
+    await deleteDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId));
+
+    // A Space could plausibly still be valid for other Projects (post-§12
+    // migration, once merging exists) - check before assuming it's safe to
+    // delete, rather than assuming today's 1:1 model always holds. Today,
+    // pre-migration, this will always find zero siblings - the check is
+    // here so this function doesn't need to change once that's no longer
+    // true.
+    const siblingProjectsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects"));
+    const hasSiblingProjects = siblingProjectsSnap.docs.some(d => d.id !== projectId);
+
+    await deleteDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId));
+    if (!hasSiblingProjects) {
+      await deleteDoc(doc(db, "users", uid, "spaces", spaceId));
+    }
+    return { outcome: "deleted", spaceDeleted: !hasSiblingProjects };
+  } catch (e) {
+    // Non-fatal by design - the plan itself is already gone by the time
+    // this runs. A shadow left behind here is an orphan, not a
+    // correctness risk to any live plan, and is exactly what the future
+    // reconciliation sweep is for.
+    dlog(`[SPACE SHADOW DELETE] cleanup failed for plan ${planId}, orphaned shadow left for reconciliation: ${e.message}`);
+    return { outcome: "failed", error: e.message };
+  }
+}
+
+// ---- Step 5: non-blocking app-start reconciliation for the active/
+// resumable plan ----
+// Deliberately cheap: exactly two reads (the plan, and its Project
+// shadow only - not the full 4-doc checkSpaceShadowExists, and not
+// validateSpaceShadowMigration's full invariant sweep), to avoid the
+// read-amplification pattern already flagged during Slice 3's scoping.
+// Classification is presence-of-Project-doc plus the same version
+// comparison shared/spaceShadowValidation.js uses for STALE - not a
+// third copy of that logic, just the two fields needed to decide whether
+// a sync is worth running at all. Any actual repair is delegated to the
+// canonical syncPlanToSpaceGraph projection (the same function every
+// real mutation call site uses, and what repairSpaceShadow above now
+// delegates to as well) - never a separate projection. Never throws:
+// every caller of this function is expected to be a fire-and-forget
+// call with its own .catch(), matching the pattern already used at the
+// five mutation call sites.
+async function reconcileActivePlanShadow(uid, planId) {
+  const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+  if (!planSnap.exists()) {
+    dlog(`[SPACE SHADOW RECONCILE] plan ${planId}: source plan no longer exists, nothing to reconcile`);
+    return { outcome: "source-plan-missing" };
+  }
+  const plan = planSnap.data();
+  const { spaceId, projectId } = computeShadowIds(planId, plan);
+  const projectSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId));
+  const planVersion = typeof plan.shadowSourceVersion === "number" ? plan.shadowSourceVersion : 1;
+  const projectVersion = projectSnap.exists() && typeof projectSnap.data().sourceVersion === "number" ? projectSnap.data().sourceVersion : -1;
+
+  if (!projectSnap.exists()) {
+    dlog(`[SPACE SHADOW RECONCILE] plan ${planId}: MISSING (no Project shadow) - syncing`);
+    return syncPlanToSpaceGraph(uid, planId);
+  }
+  if (planVersion > projectVersion) {
+    dlog(`[SPACE SHADOW RECONCILE] plan ${planId}: STALE (plan v${planVersion} > project v${projectVersion}) - syncing`);
+    return syncPlanToSpaceGraph(uid, planId);
+  }
+  dlog(`[SPACE SHADOW RECONCILE] plan ${planId}: already current (plan v${planVersion}, project v${projectVersion}) - no action`);
+  return { outcome: "already-current", planVersion, projectVersion };
+}
+
+// ---- Migration engine: unconditional full reprojection + a separate,
+// read-only completeness check ----
+// Deliberately distinct from syncPlanToSpaceGraph, not a thin variant of
+// it. syncPlanToSpaceGraph's internal existingVersion > planVersion guard
+// (see its body above) is correct and required for its own callers (live
+// mutation sync, reconcileActivePlanShadow, repairSpaceShadow) - it is
+// what stops an out-of-order fire-and-forget sync from clobbering a
+// newer shadow. But that same guard means its contract is overloaded for
+// migration's purposes: it decides "is this already complete enough to
+// skip" AND performs the write, in one function - a migration runner
+// needs those two decisions kept apart, so it can know definitively,
+// before calling anything, whether a write is about to happen, rather
+// than discover after the fact that the function it called silently
+// chose not to.
+//
+// forceFullReprojection is the write half: unconditional, no internal
+// completeness/staleness decision beyond the same plan-existence
+// precondition syncPlanToSpaceGraph already has (a basic precondition,
+// not a completeness judgment - there is nothing to project from a plan
+// that doesn't exist). It also differs from syncPlanToSpaceGraph on the
+// merits, not just by dropping a guard: per SpaceMemoryModel.md §12's
+// committed Migration Invariant, migration must "reconstruct Session
+// boundaries from the legacy plan's existing batchHistory timestamps
+// wherever they are distinguishable, rather than collapsing all
+// historical activity into one undifferentiated record."
+// syncPlanToSpaceGraph always writes exactly one Session (sessionId =
+// planId) - correct for its own job (projecting live current state) but
+// not compliant with §12 for a first-time migration. forceFullReprojection
+// does real Session reconstruction instead.
+//
+// checkMigrationCompleteness is the decision half: read-only, intended to
+// be called by a migration runner BEFORE forceFullReprojection to decide
+// whether there is anything to do at all.
+
+// MIGRATION_VERSION, reconstructSessionClusters, and the payload/
+// completeness derivation logic itself now live in shared/spaceMigration.js
+// (imported above) - the pure SDK-neutral core, callable from both this
+// file and a Node admin CLI/migration runner, so they can never
+// independently drift. Both functions below are thin I/O shells: they do
+// their own reads/writes with the client SDK and call into the shared
+// module for the actual decisions.
+
+async function forceFullReprojection(uid, planId) {
+  const planRef = doc(db, "users", uid, "plans", planId);
+
+  return runTransaction(db, async (tx) => {
+    const planSnap = await tx.get(planRef);
+    if (!planSnap.exists()) {
+      return { outcome: "source-plan-missing" };
+    }
+    const plan = planSnap.data();
+    const derived = deriveFullReprojectionDocs(planId, plan);
+    const { spaceId, projectId } = derived.ids;
+    const spaceRef = doc(db, "users", uid, "spaces", spaceId);
+    const projectRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId);
+
+    // syncedAt uses this SDK's own serverTimestamp() sentinel - the shared
+    // derivation deliberately omits it, since the client and admin SDKs'
+    // sentinels are different, incompatible objects. See
+    // shared/spaceMigration.js's file header.
+    tx.set(spaceRef, { ...derived.space, syncedAt: serverTimestamp() });
+    tx.set(projectRef, { ...derived.project, syncedAt: serverTimestamp() });
+
+    let batchCount = 0;
+    derived.sessions.forEach((session) => {
+      const sessionRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id);
+      tx.set(sessionRef, { ...session.data, syncedAt: serverTimestamp() });
+      session.batches.forEach((batch) => {
+        const batchRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id, "batches", batch.id);
+        tx.set(batchRef, { ...batch.data, syncedAt: serverTimestamp() });
+        batchCount++;
+      });
+    });
+
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+  });
+}
+
+// Read-only. Reads Space/Project/every Session/every Batch actually
+// present, then delegates the completeness decision entirely to the
+// shared evaluateMigrationCompleteness. Never writes.
+async function checkMigrationCompleteness(uid, planId) {
+  const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+  if (!planSnap.exists()) return { complete: false, reasons: ["source plan missing"] };
+  const plan = planSnap.data();
+  const { spaceId, projectId } = computeShadowIds(planId, plan);
+
+  const spaceSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId));
+  const projectSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId));
+  if (!spaceSnap.exists() || !projectSnap.exists()) {
+    return { complete: false, reasons: ["Space or Project document missing"] };
+  }
+
+  const sessionsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions"));
+  const sessionsWithBatches = await Promise.all(sessionsSnap.docs.map(async (sDoc) => {
+    const batchesSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sDoc.id, "batches"));
+    return { id: sDoc.id, data: sDoc.data(), batches: batchesSnap.docs.map((b) => ({ id: b.id, data: b.data() })) };
+  }));
+
+  return evaluateMigrationCompleteness(planId, plan, {
+    space: spaceSnap.data(),
+    project: projectSnap.data(),
+    sessionsWithBatches,
+  });
+}
+
+// ---- §12 Migration Part 3, Pass 2: merge-proposal surfacing/resolution
+// UI - MergeProposalDesign.md. Every write below commits atomically (a
+// single writeBatch: the immutable history entry and the current-state
+// document change together, or neither does - Firestore batches are
+// genuinely all-or-nothing, so a rejected write - e.g. a security-rules
+// denial - leaves no partial candidate/history state behind). Every read
+// uses the authenticated client SDK, subject to the same rules as any
+// other user data (Pass 1's `mergeCandidates`/`history` rules).
+
+// Read-only. Non-blocking app-start query (mirrors reconcileActivePlanShadow's
+// own app-start-trigger pattern) - a user's pending candidates only.
+//
+// stale-confirmed candidates are deliberately NOT queried here (removed
+// from proactive surfacing per a later product decision - the
+// "Understood"/reversal actions and the stale-confirmed review-screen
+// section were pulled, but the underlying data, resolutionStatus
+// transition, and acknowledgedAt field are untouched and unchanged in
+// Firestore - see acknowledgeStaleConfirmed/reverseStaleConfirmed below,
+// kept in place but currently unreferenced by any render path, for a
+// possible future history/decisions view). staleUnacknowledged is kept
+// in the return shape as an always-empty array rather than removed
+// outright, so this function's callers don't need special-casing for a
+// shape that may come back if that future view is built.
+async function queryMergeCandidatesForBanner(uid) {
+  const candidatesRef = collection(db, "users", uid, "mergeCandidates");
+  const pendingSnap = await getDocs(query(candidatesRef, where("resolutionStatus", "==", "pending")));
+  const pending = pendingSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  return { pending, staleUnacknowledged: [] };
+}
+
+// User-Managed Space Identity (§12 Migration Part 3). Just another
+// authoritative mutation - the exact same contract already proven at
+// five other call sites (e.g. the batch-pause/wrap-up/completion/
+// next-batch/retroactive-save syncs above): write the authoritative
+// field on the plan document, increment shadowSourceVersion, then fire
+// syncPlanToSpaceGraph without awaiting it. No new mechanism, no
+// special-cased sync path. `spaceType` (the AI's original classification)
+// is never touched - only the new `spaceName` field is written, per the
+// design principle recorded at getSpaceDisplayName's definition
+// (shared/spaceMigration.js): the user's name becomes canonical: display,
+// detection, comparison, merge-candidate grouping.
+async function renameSpace(uid, planId, newName) {
+  await updateDoc(doc(db, "users", uid, "plans", planId), { spaceName: newName, shadowSourceVersion: increment(1) });
+  syncPlanToSpaceGraph(uid, planId).catch((e) => dlog(`[SPACE SHADOW SYNC] rename sync failed for plan ${planId}: ${e.message}`));
+  return { outcome: "renamed", planId, spaceName: newName };
+}
+
+// Read-only. Snapshots each selected plan's Project shadow document's
+// version fields (MergeProposalDesign.md Section 8's expectedSpaceState:
+// { [planId]: { sourceVersion, migrationVersion } }) - execution-layer
+// state, captured at confirmation time so a future merge-execution step
+// can detect drift, never stored as a precomputed "eligible" bit (Section
+// 1's governing principle). A plan that hasn't completed Part 1
+// structural migration yet has no Project document - recorded as null
+// for that plan rather than blocking confirmation, since Part 2
+// detection is already independent of structural migration completion
+// (Section 4).
+async function buildExpectedSpaceState(uid, planIds) {
+  const entries = await Promise.all(planIds.map(async (planId) => {
+    // §12 Migration Part 4: reads the plan first so a plan that already
+    // survived (or lost) an earlier merge resolves to its real canonical
+    // Space, not its own bare planId - relevant once the confirmed-cluster-
+    // growing case (MergeExecutionDesign.md §12) proposes a new candidate
+    // involving an already-merged plan.
+    const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+    const plan = planSnap.exists() ? planSnap.data() : null;
+    const { spaceId, projectId } = computeShadowIds(planId, plan);
+    const projectSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId));
+    if (!projectSnap.exists()) return [planId, null];
+    const data = projectSnap.data();
+    return [planId, { sourceVersion: typeof data.sourceVersion === "number" ? data.sourceVersion : null, migrationVersion: typeof data.migrationVersion === "number" ? data.migrationVersion : null }];
+  }));
+  return Object.fromEntries(entries);
+}
+
+// "Same Space", full selection (every displayed member selected) - the
+// set didn't change, so the SAME document is updated in place. No split,
+// no supersession, no new candidate ID.
+async function confirmMergeCandidateFull(uid, candidateId, spaceType, selectedPlanIds) {
+  const expectedSpaceState = await buildExpectedSpaceState(uid, selectedPlanIds);
+  const batch = writeBatch(db);
+  const candidateRef = doc(db, "users", uid, "mergeCandidates", candidateId);
+  const historyRef = doc(collection(db, "users", uid, "mergeCandidates", candidateId, "history"));
+  const eventId = historyRef.id;
+
+  batch.set(historyRef, { actor: "user", type: "confirmed", confirmedPlanIds: selectedPlanIds, at: serverTimestamp() });
+  batch.update(candidateRef, {
+    resolutionStatus: "confirmed-merge",
+    confirmationEventId: eventId,
+    confirmedPlanIds: selectedPlanIds,
+    expectedSpaceState,
+    resolvedAt: serverTimestamp(),
+  });
+  await batch.commit();
+  return { outcome: "confirmed-in-place", candidateId, confirmationEventId: eventId };
+}
+
+// "Same Space", partial selection (a subset of an N-way candidate) - the
+// set changed, so the original is superseded (never mutated into either
+// outcome - MergeProposalDesign.md Section 10's write sequence) and two
+// new, independent documents are created: the confirmed group, and the
+// pending remainder if 2+ plans remain. All in one atomic batch.
+async function confirmMergeCandidatePartial(uid, candidateId, spaceType, allPlanIds, selectedPlanIds) {
+  const remainderPlanIds = allPlanIds.filter((id) => !selectedPlanIds.includes(id)).sort();
+  const confirmedId = computeMergeCandidateId(spaceType, selectedPlanIds);
+  const remainderId = remainderPlanIds.length >= 2 ? computeMergeCandidateId(spaceType, remainderPlanIds) : null;
+  const expectedSpaceState = await buildExpectedSpaceState(uid, selectedPlanIds);
+
+  const batch = writeBatch(db);
+  const now = serverTimestamp();
+
+  const confirmedHistoryRef = doc(collection(db, "users", uid, "mergeCandidates", confirmedId, "history"));
+  const confirmedEventId = confirmedHistoryRef.id;
+  batch.set(confirmedHistoryRef, { actor: "user", type: "confirmed", confirmedPlanIds: selectedPlanIds, splitFrom: candidateId, at: now });
+  batch.set(doc(db, "users", uid, "mergeCandidates", confirmedId), {
+    tier: "1", spaceType, planIds: selectedPlanIds, candidateKeyVersion: CANDIDATE_KEY_VERSION, detectionVersion: DETECTION_VERSION,
+    detectedAt: now, resolutionStatus: "confirmed-merge", resolvedAt: now,
+    confirmationEventId: confirmedEventId, confirmedPlanIds: selectedPlanIds, expectedSpaceState,
+    staleReason: null, staleDetectedAt: null, supersededBy: null, supersededAt: null, splitFrom: candidateId,
+  });
+
+  if (remainderId) {
+    const remainderHistoryRef = doc(collection(db, "users", uid, "mergeCandidates", remainderId, "history"));
+    batch.set(remainderHistoryRef, { actor: "system", type: "split-remainder", planIds: remainderPlanIds, splitFrom: candidateId, at: now });
+    batch.set(doc(db, "users", uid, "mergeCandidates", remainderId), {
+      tier: "1", spaceType, planIds: remainderPlanIds, candidateKeyVersion: CANDIDATE_KEY_VERSION, detectionVersion: DETECTION_VERSION,
+      detectedAt: now, resolutionStatus: "pending", resolvedAt: null,
+      staleReason: null, staleDetectedAt: null, supersededBy: null, supersededAt: null, splitFrom: candidateId,
+    });
+  }
+
+  const supersededBy = remainderId ? [confirmedId, remainderId] : [confirmedId];
+  batch.update(doc(db, "users", uid, "mergeCandidates", candidateId), {
+    resolutionStatus: "superseded",
+    supersededBy,
+    supersededAt: now,
+  });
+
+  await batch.commit();
+  return { outcome: "split", confirmedId, remainderId, confirmationEventId: confirmedEventId, supersededBy };
+}
+
+// "Keep Separate" - scoped to the currently-displayed set as a whole
+// (MergeProposalDesign.md Section 9), preserved as pairwise separation
+// among the reviewed members, never a global "never match again" rule -
+// enforced downstream by the corrected reconciliation algorithm (Pass 1),
+// not by anything special done here.
+async function keepMergeCandidateSeparate(uid, candidateId) {
+  const batch = writeBatch(db);
+  const candidateRef = doc(db, "users", uid, "mergeCandidates", candidateId);
+  const historyRef = doc(collection(db, "users", uid, "mergeCandidates", candidateId, "history"));
+  batch.set(historyRef, { actor: "user", type: "dismissed", at: serverTimestamp() });
+  batch.update(candidateRef, { resolutionStatus: "dismissed", resolvedAt: serverTimestamp() });
+  await batch.commit();
+  return { outcome: "dismissed", candidateId };
+}
+
+// "Not now" / "Not sure yet" - resolutionStatus stays pending (nothing
+// decided); only lastShownAt/deferredCount change, disjoint fields from
+// what "Keep Separate" touches (Section 5) so deferral can never be
+// conflated with rejection at the schema level.
+async function deferMergeCandidate(uid, candidateId, reasonTag) {
+  const batch = writeBatch(db);
+  const candidateRef = doc(db, "users", uid, "mergeCandidates", candidateId);
+  const historyRef = doc(collection(db, "users", uid, "mergeCandidates", candidateId, "history"));
+  batch.set(historyRef, { actor: "user", type: "deferred", reason: reasonTag, at: serverTimestamp() });
+  batch.update(candidateRef, { lastShownAt: serverTimestamp(), deferredCount: increment(1) });
+  await batch.commit();
+  return { outcome: "deferred", candidateId };
+}
+
+// Stale-confirmed "Understood, no longer applicable" - not a question;
+// closes out the notification. resolutionStatus remains stale-confirmed
+// permanently (Section 6).
+async function acknowledgeStaleConfirmed(uid, candidateId) {
+  const batch = writeBatch(db);
+  const candidateRef = doc(db, "users", uid, "mergeCandidates", candidateId);
+  const historyRef = doc(collection(db, "users", uid, "mergeCandidates", candidateId, "history"));
+  batch.set(historyRef, { actor: "user", type: "acknowledged-stale", at: serverTimestamp() });
+  batch.update(candidateRef, { acknowledgedAt: serverTimestamp() });
+  await batch.commit();
+  return { outcome: "acknowledged", candidateId };
+}
+
+// Stale-confirmed reversal ("Actually, I don't think these are the same
+// space") - a genuine identity-layer reversal, distinct from an ordinary
+// Keep Separate; recorded in history explicitly as a reversal-of-confirmed
+// (Section 6), not merged into ordinary rejection records.
+async function reverseStaleConfirmed(uid, candidateId) {
+  const batch = writeBatch(db);
+  const candidateRef = doc(db, "users", uid, "mergeCandidates", candidateId);
+  const historyRef = doc(collection(db, "users", uid, "mergeCandidates", candidateId, "history"));
+  batch.set(historyRef, { actor: "user", type: "reversal-of-confirmed", at: serverTimestamp() });
+  batch.update(candidateRef, { resolutionStatus: "dismissed", resolvedAt: serverTimestamp() });
+  await batch.commit();
+  return { outcome: "reversed", candidateId };
+}
+
+// Display-only formatter for the stale-confirmed explanation shown to the
+// user. The stored staleReason (evaluateCandidateInvalidation,
+// shared/spaceMigration.js) is diagnostic text meant for logs/CLI output
+// and contains a raw internal plan ID (e.g. "plan aBc123 no longer
+// exists") - never shown to a user verbatim. This never reads or writes
+// staleReason itself, purely reformats it for one render call.
+function friendlyStaleReason(staleReason) {
+  if (typeof staleReason === "string" && staleReason.includes("no longer exists")) {
+    return "One of the records in this group was removed.";
+  }
+  if (typeof staleReason === "string" && staleReason.includes("display name changed")) {
+    return "One of the records in this group was renamed.";
+  }
+  return "Something about this group changed since you confirmed it.";
 }
 
 // Set at build time by app.config.js's `extra.APP_ENV`, which every EAS
@@ -1090,6 +2039,38 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [showMenu, setShowMenu] = useState(false);
   const [showAccount, setShowAccount] = useState(false);
   const [showFaq, setShowFaq] = useState(false);
+  // Dev-only Space shadow inspector (Slice 2) - never shown outside __DEV__,
+  // see the menu entry below and the screen render block near showFaq.
+  const [showSpaceInspector, setShowSpaceInspector] = useState(false);
+  const [inspectorUidInput, setInspectorUidInput] = useState("");
+  const [inspectorPlanIdInput, setInspectorPlanIdInput] = useState("");
+  const [inspectorLoading, setInspectorLoading] = useState(false);
+  const [inspectorResult, setInspectorResult] = useState(null);
+  const [inspectorError, setInspectorError] = useState(null);
+  // §12 Migration Part 3, Pass 2 - merge-proposal review screen
+  // (MergeProposalDesign.md). showMergeReview reuses the Space
+  // Inspector's screen shape; see the render block near showSpaceInspector
+  // and the menu entry below. mergeBannerDismissedThisSession is set only
+  // by an explicit "Not Now"/"Not sure yet" action - simply opening the
+  // review screen and navigating back does NOT count as a durable
+  // decision and must not hide the banner (MergeProposalDesign.md
+  // Section 3 / this pass's explicit test (b)).
+  const [showMergeReview, setShowMergeReview] = useState(false);
+  const [mergeBannerDismissedThisSession, setMergeBannerDismissedThisSession] = useState(false);
+  const [mergeCandidatesLoaded, setMergeCandidatesLoaded] = useState(false);
+  const [pendingMergeCandidates, setPendingMergeCandidates] = useState([]);
+  const [staleConfirmedCandidates, setStaleConfirmedCandidates] = useState([]);
+  const [mergeReviewPlansById, setMergeReviewPlansById] = useState({});
+  const [mergeReviewPlansLoading, setMergeReviewPlansLoading] = useState(false);
+  const [mergeSelections, setMergeSelections] = useState({}); // candidateId -> Set of selected planIds
+  const [mergeActionLoadingId, setMergeActionLoadingId] = useState(null); // candidateId currently mid-write, or null
+  // User-Managed Space Identity - rename bottom sheet. renamePlanTarget
+  // is { id, currentName } | null; reused from both the merge-review
+  // screen's evidence cards and the History screen's row Alert, per Task
+  // 6/7's "same bottom sheet, no new mechanism" requirement.
+  const [renamePlanTarget, setRenamePlanTarget] = useState(null);
+  const [renameSheetValue, setRenameSheetValue] = useState("");
+  const [renameSheetSaving, setRenameSheetSaving] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deletePassword, setDeletePassword] = useState("");
   const [deleteError, setDeleteError] = useState("");
@@ -1125,6 +2106,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
+  // Space Detail screen (on-device UX fix - "View Plan" from My Spaces
+  // must land on the Space's own content, not the Companion journey).
+  // Holds only the plan ID, not a copy of the item itself - the detail
+  // screen looks the current item up from `history` by ID on every
+  // render, so a rename (which already patches `history` in place) is
+  // reflected immediately with no separate patch target to keep in sync.
+  const [spaceDetailPlanId, setSpaceDetailPlanId] = useState(null);
   // Results/Companion screen split (DecisionLog.md 2026-07-18). `results`
   // truthy still gates "we're viewing a plan at all" - this just selects
   // which of the two screens to render within that context. Pure view
@@ -1424,7 +2412,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
     logEvent(getAnalytics(), "batch_session_paused", { planId: currentPlanId, batchIndex: companionBatchIndex });
     if (currentPlanId) {
-      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": batchItems })
+      updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": batchItems, shadowSourceVersion: increment(1) })
+        .then(() => {
+          syncPlanToSpaceGraph(user.uid, currentPlanId).catch(e => dlog(`[SPACE SHADOW SYNC] pause sync failed for plan ${currentPlanId}: ${e.message}`));
+        })
         .catch(e => console.log("Save paused batch state error:", e.message));
     }
     goHome();
@@ -1457,7 +2448,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     if (source === "pause") {
       logEvent(getAnalytics(), "batch_session_paused", { planId: currentPlanId, batchIndex: companionBatchIndex });
       if (currentPlanId) {
-        updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": nextItems })
+        updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { "currentBatch.items": nextItems, shadowSourceVersion: increment(1) })
+          .then(() => {
+            syncPlanToSpaceGraph(user.uid, currentPlanId).catch(e => dlog(`[SPACE SHADOW SYNC] wrap-up (pause) sync failed for plan ${currentPlanId}: ${e.message}`));
+          })
           .catch(e => console.log("Save paused batch state error:", e.message));
       }
       goHome();
@@ -1546,7 +2540,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           accomplishments: completedLocal.accomplishments,
           taskCount: completedLocal.taskCount,
         },
+        shadowSourceVersion: increment(1),
       }).then(() => {
+        syncPlanToSpaceGraph(user.uid, currentPlanId).catch(e => dlog(`[SPACE SHADOW SYNC] completion sync failed for plan ${currentPlanId}: ${e.message}`));
         // history is a one-time getDocs load, not onSnapshot (same gap
         // Session 1 discovery flagged for plan delete) - without this, My
         // Plans keeps showing the pre-completion snapshot until next reload,
@@ -1715,6 +2711,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             suggestedAt: new Date().toISOString(),
             items: composedItems,
           },
+          shadowSourceVersion: increment(1),
+        }).then(() => {
+          syncPlanToSpaceGraph(user.uid, effectivePlanId).catch(e => dlog(`[SPACE SHADOW SYNC] next-batch sync failed for plan ${effectivePlanId}: ${e.message}`));
         }).catch(e => console.log("Save companion progress error:", e.message));
       }
 
@@ -1878,6 +2877,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       console.log("Saving plan for user:", user.uid);
       const entry = {
         schemaVersion: 1,
+        shadowSourceVersion: 1,
         createdAt: new Date().toISOString(),
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
         spaceType: plan.spaceType,
@@ -1903,6 +2903,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
       // Persist the original photo so reopening this plan later (e.g. to regenerate
       // a visualization) uses its own photo instead of whatever is in the live `photo` state.
+      let shadowPhotoUrl = null;
       if (photo?.uri) {
         try {
           const compressed = await manipulateAsync(photo.uri, [{ resize: { width: 1024 } }], { compress: 0.75, format: SaveFormat.JPEG });
@@ -1920,10 +2921,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           const photoUrl = await getDownloadURL(fileRef);
           await updateDoc(doc(db, "users", user.uid, "plans", docRef.id), { photoUrl });
           setHistory(prev => prev.map(h => h.id === docRef.id ? { ...h, photoUrl } : h));
+          shadowPhotoUrl = photoUrl;
         } catch (photoErr) {
           console.log("Save original photo error:", photoErr.message);
         }
       }
+
+      // Space/Project/Session/Batch shadow write - additive only, see the
+      // block of functions above savePlanToHistory's definition. Never
+      // awaited into the caller's critical path beyond this point, and
+      // its own try/catch already guarantees it never throws - fire and
+      // forget is intentional here, not an oversight.
+      writeSpaceShadowStructure(user.uid, docRef.id, entry, shadowPhotoUrl).then(() => {
+        if (__DEV__) validateSpaceShadowMigration(user.uid, docRef.id);
+      });
+
       return docRef.id;
     } catch (e) {
       console.log("Save history error:", e.message, e.code);
@@ -1971,7 +2983,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // rather than several separate dotted status/timestamp fields.
         if (batchItems.length) {
           try {
-            await updateDoc(doc(db, "users", user.uid, "plans", planId), { "currentBatch.items": batchItems });
+            await updateDoc(doc(db, "users", user.uid, "plans", planId), { "currentBatch.items": batchItems, shadowSourceVersion: increment(1) });
+            syncPlanToSpaceGraph(user.uid, planId).catch(e => dlog(`[SPACE SHADOW SYNC] retroactive-save sync failed for plan ${planId}: ${e.message}`));
           } catch (e) {
             console.log("Retroactive companion backfill error:", e.message);
           }
@@ -1990,6 +3003,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // Tracks which plan's photo is currently being restored so a late-resolving download
   // for an abandoned plan can't overwrite the photo of whichever plan is now on screen.
   const activePlanIdRef = useRef(null);
+
+  // Step 5 shadow reconciliation - see the useEffect near resumablePlan below.
+  const reconciledPlanIdRef = useRef(null);
 
   // Downloads a plan's stored photo locally so manipulateAsync (which requires a
   // local file URI, not a remote URL) can use it when regenerating a visualization.
@@ -2301,7 +3317,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <!-- PAGE 1 -->
         ${makeHeader(false)}
         <div class="page">
-          <div style="font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;margin-top:8px;">${results.spaceType}</div>
+          <div style="font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;margin-top:8px;">${getSpaceDisplayName(results)}</div>
           <div style="font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:10px;">Your Organization Space</div>
           <div style="background:#E6E9EE;border:1px solid #D7DCE3;border-radius:10px;padding:14px;margin-bottom:14px;font-size:13px;color:#64748B;line-height:1.6;">${results.overview}</div>
           ${pdfBudget ? buildTier(pdfBudget) : ""}
@@ -2427,7 +3443,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     if (!results) return;
     try {
       let text = "✨ Uncluttrd Organization Space\n";
-      text += "Space: " + results.spaceType + "\n\n";
+      text += "Space: " + getSpaceDisplayName(results) + "\n\n";
       text += results.overview + "\n\n";
       results.tiers?.forEach(t => {
         text += "--- " + t.label + " (" + t.range + ") ---\n";
@@ -2475,6 +3491,270 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
   const resumablePlan = history.find(isCompanionResumable);
 
+  // Step 5: non-blocking app-start reconciliation, scoped to the same
+  // resumable plan Home already surfaces via the banner below - not a
+  // sweep over all of history. Guarded by reconciledPlanIdRef so the
+  // isPro-triggered re-run of loadHistory's effect (see its own comment)
+  // doesn't re-trigger this for the same plan twice in one session;
+  // harmless if it somehow did (syncPlanToSpaceGraph is itself
+  // idempotent/version-guarded), this just avoids the extra reads.
+  // Fire-and-forget: never awaited by render or navigation, and every
+  // failure - from either the classification reads or the sync itself -
+  // is caught here and only ever reaches dlog, never thrown.
+  useEffect(() => {
+    if (!resumablePlan || !user) return;
+    if (reconciledPlanIdRef.current === resumablePlan.id) return;
+    reconciledPlanIdRef.current = resumablePlan.id;
+    reconcileActivePlanShadow(user.uid, resumablePlan.id)
+      .catch(e => dlog(`[SPACE SHADOW RECONCILE] startup reconciliation failed for plan ${resumablePlan.id}: ${e.message}`));
+  }, [resumablePlan?.id, user]);
+
+  // §12 Migration Part 3, Pass 2 - non-blocking app-start query for the
+  // merge-proposal Home banner (MergeProposalDesign.md Section 3). Runs
+  // once per user (not re-polled/re-escalated during the session - a
+  // single fetch, exactly like the "shown at most once per app session"
+  // decision requires). After the user acts on a candidate inside the
+  // review screen, the relevant handler splices it out of this state
+  // directly rather than re-querying.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    queryMergeCandidatesForBanner(user.uid)
+      .then(({ pending, staleUnacknowledged }) => {
+        if (cancelled) return;
+        setPendingMergeCandidates(pending);
+        setStaleConfirmedCandidates(staleUnacknowledged);
+        setMergeCandidatesLoaded(true);
+      })
+      .catch((e) => dlog(`[MERGE CANDIDATES] app-start query failed: ${e.message}`));
+    return () => { cancelled = true; };
+  }, [user]);
+
+  // Fetches (once each) the plan documents referenced by whatever
+  // candidates are currently loaded, for the review screen's evidence
+  // cards. Only fetches plans not already cached, so revisiting the
+  // review screen mid-session doesn't re-read anything already fetched.
+  useEffect(() => {
+    if (!showMergeReview || !user) return;
+    const allPlanIds = new Set();
+    pendingMergeCandidates.forEach((c) => (c.planIds || []).forEach((id) => allPlanIds.add(id)));
+    const missing = [...allPlanIds].filter((id) => !(id in mergeReviewPlansById));
+    if (missing.length === 0) return;
+    setMergeReviewPlansLoading(true);
+    Promise.all(missing.map(async (id) => {
+      try {
+        const snap = await getDoc(doc(db, "users", user.uid, "plans", id));
+        return [id, snap.exists() ? { id, ...snap.data() } : null];
+      } catch (e) {
+        dlog(`[MERGE REVIEW] plan fetch failed for ${id}: ${e.message}`);
+        return [id, null];
+      }
+    })).then((entries) => {
+      setMergeReviewPlansById((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+    }).finally(() => setMergeReviewPlansLoading(false));
+  }, [showMergeReview, user, pendingMergeCandidates]);
+
+  const toggleMergeSelection = (candidateId, planId) => {
+    setMergeSelections((prev) => {
+      const current = new Set(prev[candidateId] || []);
+      if (current.has(planId)) current.delete(planId); else current.add(planId);
+      return { ...prev, [candidateId]: current };
+    });
+  };
+
+  // Full-vs-partial selection consistency (MergeProposalDesign.md Section
+  // 9/10, this pass's explicit requirement): if every displayed member is
+  // selected, the set didn't change - update the SAME document in place,
+  // no split. Otherwise the set changed - supersede the original, create
+  // two new independent documents.
+  const handleConfirmSameSpace = async (candidate) => {
+    const selected = Array.from(mergeSelections[candidate.id] || []).sort();
+    if (selected.length < 2) return;
+    setMergeActionLoadingId(candidate.id);
+    try {
+      const allIds = [...candidate.planIds].sort();
+      const isFullSelection = selected.length === allIds.length && selected.every((id, i) => id === allIds[i]);
+      if (isFullSelection) {
+        await confirmMergeCandidateFull(user.uid, candidate.id, candidate.spaceType, selected);
+      } else {
+        await confirmMergeCandidatePartial(user.uid, candidate.id, candidate.spaceType, candidate.planIds, selected);
+      }
+      setPendingMergeCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+      setMergeSelections((prev) => { const next = { ...prev }; delete next[candidate.id]; return next; });
+    } catch (e) {
+      Alert.alert("Couldn't save", e.message);
+    } finally {
+      setMergeActionLoadingId(null);
+    }
+  };
+
+  const handleKeepSeparate = async (candidate) => {
+    setMergeActionLoadingId(candidate.id);
+    try {
+      await keepMergeCandidateSeparate(user.uid, candidate.id);
+      setPendingMergeCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+    } catch (e) {
+      Alert.alert("Couldn't save", e.message);
+    } finally {
+      setMergeActionLoadingId(null);
+    }
+  };
+
+  const handleDeferMergeCandidate = async (candidate, reasonTag) => {
+    setMergeActionLoadingId(candidate.id);
+    try {
+      await deferMergeCandidate(user.uid, candidate.id, reasonTag);
+      // Session-local removal only - resolutionStatus stays "pending" in
+      // Firestore (deferMergeCandidate only touches lastShownAt/
+      // deferredCount, per Section 5), so this candidate is still fully
+      // eligible to surface again. Removing it from this array is what
+      // advances the review flow to the next candidate and keeps THIS
+      // session from re-showing it, exactly mirroring how the once-per-
+      // session query effect (queryMergeCandidatesForBanner) already
+      // only ever runs once on app start - the next real re-query, on
+      // the next app launch, will pick it back up from Firestore as-is.
+      setPendingMergeCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+      // "Not Now"/"Not sure yet" hides the banner for the remainder of
+      // this session only - nothing durable was decided about the
+      // candidate itself (it stays pending).
+      setMergeBannerDismissedThisSession(true);
+    } catch (e) {
+      Alert.alert("Couldn't save", e.message);
+    } finally {
+      setMergeActionLoadingId(null);
+    }
+  };
+
+  // Not called from any render path - stale-confirmed candidates are no
+  // longer proactively surfaced (see queryMergeCandidatesForBanner).
+  // Left in place, not deleted, for a possible future history/decisions
+  // view where acknowledging/reversing a stale-confirmed record would
+  // still make sense.
+  const handleAcknowledgeStale = async (candidate) => {
+    setMergeActionLoadingId(candidate.id);
+    try {
+      await acknowledgeStaleConfirmed(user.uid, candidate.id);
+      setStaleConfirmedCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+    } catch (e) {
+      Alert.alert("Couldn't save", e.message);
+    } finally {
+      setMergeActionLoadingId(null);
+    }
+  };
+
+  const handleReverseStale = async (candidate) => {
+    setMergeActionLoadingId(candidate.id);
+    try {
+      await reverseStaleConfirmed(user.uid, candidate.id);
+      setStaleConfirmedCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+    } catch (e) {
+      Alert.alert("Couldn't save", e.message);
+    } finally {
+      setMergeActionLoadingId(null);
+    }
+  };
+
+  // User-Managed Space Identity - rename bottom sheet handlers. Reused
+  // from both the merge-review screen's evidence cards and the History
+  // screen's row Alert (Task 6/7) - opening it only needs a planId and
+  // its current display name, regardless of which screen triggered it.
+  const openRenameSheet = (planId, currentName) => {
+    setRenamePlanTarget({ id: planId, currentName: currentName || "" });
+    setRenameSheetValue(currentName || "");
+  };
+  const closeRenameSheet = () => {
+    if (renameSheetSaving) return;
+    setRenamePlanTarget(null);
+    setRenameSheetValue("");
+  };
+  const handleSaveRename = async () => {
+    const trimmed = renameSheetValue.trim();
+    if (!renamePlanTarget || !trimmed) return;
+    setRenameSheetSaving(true);
+    try {
+      await renameSpace(user.uid, renamePlanTarget.id, trimmed);
+      // Patch every local cache that might be displaying this plan's name
+      // right now, so the UI reflects the rename immediately without
+      // waiting for a re-query - the review screen's evidence cards and
+      // the History list are both plain plan-field caches, keyed the same
+      // way real Firestore documents are, so a targeted patch is exact,
+      // not a guess.
+      setMergeReviewPlansById((prev) => (renamePlanTarget.id in prev ? { ...prev, [renamePlanTarget.id]: { ...prev[renamePlanTarget.id], spaceName: trimmed } } : prev));
+      setHistory((prev) => prev.map((h) => (h.id === renamePlanTarget.id ? { ...h, spaceName: trimmed } : h)));
+      if (currentPlanId === renamePlanTarget.id) setResults((prev) => (prev ? { ...prev, spaceName: trimmed } : prev));
+      setRenamePlanTarget(null);
+      setRenameSheetValue("");
+    } catch (e) {
+      Alert.alert("Couldn't rename", e.message);
+    } finally {
+      setRenameSheetSaving(false);
+    }
+  };
+
+  // Suggestions: distinct display names already used across the user's
+  // OWN other plans (never AI-generated) - derived from `history`, which
+  // is already loaded (loadHistory's effect), so this is a plain
+  // client-side computation, not a new query (Task 6).
+  const renameSuggestions = () => {
+    if (!renamePlanTarget) return [];
+    const names = new Set();
+    history.forEach((h) => {
+      const n = getSpaceDisplayName(h);
+      if (n && n !== renamePlanTarget.currentName) names.add(n);
+    });
+    return [...names].slice(0, 8);
+  };
+
+  // Rendered from within both the merge-review screen and the History
+  // screen's own return blocks (each is a separate early-return branch,
+  // so the same Modal element has to be included in each one to ever
+  // render, regardless of which screen triggered it) - defined once here
+  // so neither branch duplicates the JSX itself.
+  const renderRenameSheet = () => (
+    <Modal visible={!!renamePlanTarget} animationType="slide" transparent onRequestClose={closeRenameSheet}>
+      <View style={s.renameSheetBackdrop}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
+        <View style={s.renameSheetCard}>
+          <Text style={s.renameSheetTitle}>Rename Space</Text>
+          <TextInput
+            style={s.renameSheetInput}
+            value={renameSheetValue}
+            onChangeText={setRenameSheetValue}
+            maxLength={50}
+            placeholder="e.g. Kitchen"
+            placeholderTextColor="#94A3B8"
+            autoFocus
+            editable={!renameSheetSaving}
+          />
+          {renameSuggestions().length > 0 && (
+            <>
+              <Text style={s.renameSuggestionsLabel}>Names you've used before</Text>
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                {renameSuggestions().map((name) => (
+                  <TouchableOpacity key={name} style={s.renameSuggestionChip} onPress={() => setRenameSheetValue(name)} disabled={renameSheetSaving}>
+                    <Text style={s.renameSuggestionChipText}>{name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          )}
+          <View style={{ flexDirection: "row", gap: 10 }}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={closeRenameSheet} disabled={renameSheetSaving}>
+              <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.startOverBtn, { flex: 1, marginTop: 0, backgroundColor: (renameSheetValue.trim() && !renameSheetSaving) ? BRAND.green : "#CBD5E1", borderWidth: 0 }]}
+              onPress={handleSaveRename}
+              disabled={!renameSheetValue.trim() || renameSheetSaving}
+            >
+              <Text style={[s.startOverText, { color: "white" }]}>{renameSheetSaving ? "Saving..." : "Save"}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
   const resumeCompanionSession = (item) => {
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
     setResults(item);
@@ -2482,6 +3762,68 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
+    restorePhotoFromPlan(item);
+  };
+
+  // Two explicit, unambiguous destinations from Space Detail - replacing
+  // the previous single openCompanionOrResults(item), which computed
+  // showCompanion from `hasCompanionContent = !!item.companionComplete ||
+  // (currentBatch.items.length > 0)`. That expression is true for nearly
+  // every real plan (a completed plan always has companionComplete set;
+  // an in-progress one always has currentBatch.items) - so
+  // setShowCompanion(hasCompanionContent) was landing on Companion
+  // (results && showCompanion, ~5150) almost unconditionally, and Results
+  // (results && !showCompanion, ~4967) - where the actual budget tiers/
+  // product recommendations/visualization live - was becoming
+  // unreachable from "View Full Plan" in practice. Root cause was this
+  // conflation, not a missing navigation path - the Results screen itself
+  // was never touched and never went anywhere.
+  //
+  // "View Full Plan" must ALWAYS open Results - no conditional.
+  //
+  // Also clears every OTHER screen flag that sits between Space Detail's
+  // own render condition (~4371) and Results' (~4994) in the render
+  // chain - showFaq, showMergeReview, showSpaceInspector, showAccount.
+  // Each top-level screen is its own early-return `if (flag) return (...)`,
+  // checked in source order on every render - Space Detail's check fires
+  // first and masks any of these being left true from earlier navigation
+  // in the same session, but the instant spaceDetailPlanId is cleared
+  // (as this function does), the chain falls through to the next truthy
+  // flag instead of Results if one of them was never reset. Third
+  // occurrence of this exact bug class (goHome, then the merge-review
+  // screen, now here) - always clear every flag between where you are
+  // and where you're going, not just the one you're leaving.
+  const openSpaceResults = (item) => {
+    setShowFaq(false);
+    setShowMergeReview(false);
+    setShowSpaceInspector(false);
+    setShowAccount(false);
+    setResults(item);
+    setShowCompanion(false);
+    setVizImage(item.vizImages || {});
+    setVizLoading({});
+    setCurrentPlanId(item.id);
+    setSpaceDetailPlanId(null);
+    restorePhotoFromPlan(item);
+  };
+  // "Continue Organizing" - only ever reached when the user explicitly
+  // chooses it (only rendered when isCompanionResumable(item) is true -
+  // see the Space Detail screen below), never as a default. Same
+  // intervening-flag vulnerability and fix as openSpaceResults above -
+  // the Companion render condition (results && showCompanion) sits even
+  // further down the chain, past all the same flags.
+  const openCompanionSession = (item) => {
+    setShowFaq(false);
+    setShowMergeReview(false);
+    setShowSpaceInspector(false);
+    setShowAccount(false);
+    logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "space_detail" });
+    setResults(item);
+    setShowCompanion(true);
+    setVizImage(item.vizImages || {});
+    setVizLoading({});
+    setCurrentPlanId(item.id);
+    setSpaceDetailPlanId(null);
     restorePhotoFromPlan(item);
   };
   const clearCompanionRevealState = () => {
@@ -2492,7 +3834,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionRevealReady(false);
   };
   const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -2509,6 +3851,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (showHistory) { setShowHistory(false); setShowMenu(true); return true; }
       if (showFaq) { setShowFaq(false); setShowMenu(true); return true; }
       if (showAccount) { setShowAccount(false); setShowMenu(true); return true; }
+      if (showSpaceInspector) { setShowSpaceInspector(false); setShowMenu(true); return true; }
+      if (showMergeReview) { setShowMergeReview(false); setShowMenu(true); return true; }
+      // Reached only from My Spaces (History) - back returns there, not
+      // to Menu, matching the drill-down it actually came from.
+      if (spaceDetailPlanId) { setSpaceDetailPlanId(null); setShowHistory(true); return true; }
       // Checked before the Companion branch below, same reasoning as
       // History/FAQ/Account above it - the wrap-up screen (DecisionLog.md
       // 2026-07-19) is a step within Companion, not its own destination, so
@@ -2526,7 +3873,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, results, showCompanion, unresolvedReview]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, results, showCompanion, unresolvedReview]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -2660,9 +4007,37 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // attached Metro session, so this uses the same debugLogBuffer/
     // debugShareLog mechanism (long-press the header logo) as the rest of
     // the app's on-device debugging.
-    let step = "deleteDoc";
+    let step = "readCanonicalSpaceId";
     try {
+      // §12 Migration Part 4: captured BEFORE deletion, specifically so
+      // deleteSpaceShadowGraph below can still resolve the correct (possibly
+      // merged-away) Space after the plan document is gone - there is no
+      // other place left to read plan.canonicalSpaceId from once the plan
+      // doc no longer exists (MergeExecutionDesign.md §2). A cheap read;
+      // failure here is treated as "assume never merged" (null), not a
+      // reason to abort the delete - a stale-but-findable orphaned shadow at
+      // the wrong path is a strictly better failure mode than blocking the
+      // user's own delete action on a diagnostic read.
+      let canonicalSpaceId = null;
+      try {
+        const planSnapForDelete = await getDoc(doc(db, "users", uid, "plans", planId));
+        canonicalSpaceId = planSnapForDelete.exists() ? (planSnapForDelete.data().canonicalSpaceId || null) : null;
+      } catch (e) {
+        dlog(`[PLAN DELETE] canonicalSpaceId pre-read failed for ${planId}, proceeding as unmerged: ${e.message}`);
+      }
+
+      step = "deleteDoc";
       await deleteDoc(doc(db, "users", uid, "plans", planId));
+
+      // Shadow cleanup only ever runs AFTER the authoritative plan deletion
+      // above has already succeeded - never before. deleteSpaceShadowGraph
+      // never throws (it catches internally), so awaiting it here cannot
+      // fail this function or roll back the plan deletion that already
+      // happened; a failure here just leaves an orphaned shadow for the
+      // future reconciliation sweep to find and remove, which is a safer
+      // failure state than ever risking the reverse order.
+      step = "deleteSpaceShadowGraph";
+      await deleteSpaceShadowGraph(uid, planId, canonicalSpaceId);
 
       step = "listAll";
       const prefixes = [
@@ -2879,10 +4254,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           {[
             { icon: Home, label: "Home", action: goHome },
             { icon: Folder, label: "My Spaces", action: () => { setShowMenu(false); setShowHistory(true); } },
+            // §12 Migration Part 3, Pass 2 - always reachable regardless of
+            // banner state (MergeProposalDesign.md Section 3 / this pass's
+            // "Menu access" requirement), not gated on pendingMergeCandidates.length.
+            { icon: Layers, label: "Review Duplicate Spaces", action: () => { setShowMenu(false); setShowMergeReview(true); } },
             { icon: User, label: "Account", action: () => { setShowMenu(false); setShowAccount(true); } },
             { icon: Star, label: "Upgrade to Pro", action: () => { setShowMenu(false); setShowPaywall(true); }, hide: isPro },
             { icon: HelpCircle, label: "Help & FAQ", action: () => { setShowMenu(false); setShowFaq(true); } },
             { icon: Mail, label: "Contact Us", action: () => Linking.openURL("mailto:hello@uncluttrd.app") },
+            { icon: Wrench, label: "🔍 Space Inspector (dev)", action: () => { setShowMenu(false); setShowSpaceInspector(true); }, hide: !__DEV__ },
           ].filter(item => !item.hide).map((item, i) => (
             <TouchableOpacity key={i} style={s.menuItem} onPress={() => {
               if (item.pro && !isPro) { setShowMenu(false); setShowPaywall(true); return; }
@@ -2935,17 +4315,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           ) : (
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
-                Alert.alert(item.spaceType, "What would you like to do?", [
-                  // Plans saved before the Companion batch workflow shipped
-                  // (2026-07-18, see DecisionLog.md) have neither a populated
-                  // currentBatch nor companionComplete - forcing showCompanion
-                  // true for them opens the Companion screen with nothing to
-                  // render (no stage-appropriate content exists), leaving only
-                  // the header/back button visible. Route those straight to
-                  // the Results screen instead, which already renders their
-                  // photo/tiers/proTip correctly - the same screen "back"
-                  // already fell through to before this fix.
-                  { text: "View Full Space", onPress: () => { console.log("Opening plan", item.id, "vizImages:", JSON.stringify(item.vizImages)); const hasCompanionContent = !!item.companionComplete || (Array.isArray(item.currentBatch?.items) && item.currentBatch.items.length > 0); if (isCompanionResumable(item)) { logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "my_plans" }); } setResults(item); setShowCompanion(hasCompanionContent); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); setShowHistory(false); restorePhotoFromPlan(item); } },
+                Alert.alert(getSpaceDisplayName(item), "What would you like to do?", [
+                  // "View Plan" goes straight to Results (budget tiers,
+                  // products, visualization, rename pencil) - Space Detail
+                  // is no longer the default stop, since it doesn't offer
+                  // anything actionable beyond what Results already shows.
+                  // Space Detail itself stays in the codebase (still
+                  // reachable via spaceDetailPlanId elsewhere) for future
+                  // use, just not on this default tap path.
+                  { text: "View Plan", onPress: () => { setShowHistory(false); openSpaceResults(item); } },
+                  // Opens the exact same bottom sheet used by the merge-
+                  // review screen's rename affordance and the Space Detail
+                  // screen below - no new mechanism, no duplicate sheet.
+                  { text: "Rename", onPress: () => openRenameSheet(item.id, getSpaceDisplayName(item)) },
                   // Gated the same way as the main results-screen share button
                   // (isPro ? "How would you like to share?" : "Upgrade to Pro
                   // for a beautiful branded PDF") - now that free plans are
@@ -2955,8 +4337,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                     ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
                     : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
                   {
-                    text: "Delete Space", style: "destructive", onPress: () => {
-                      Alert.alert("Delete this space?", "This can't be undone.", [
+                    text: "Delete Plan", style: "destructive", onPress: () => {
+                      Alert.alert("Delete this plan?", "This can't be undone.", [
                         { text: "Cancel", style: "cancel" },
                         { text: "Delete", style: "destructive", onPress: () => deletePlan(item.id) },
                       ]);
@@ -2965,12 +4347,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   { text: "Cancel", style: "cancel" },
                 ]);
               }}>
-                <View style={s.historyIcon}>
-                  <Text style={{ fontSize: 20 }}>🏠</Text>
-                </View>
+                {item.photoUrl ? (
+                  // Same photo source as the Space Detail screen's Photos
+                  // section (item.photoUrl - the plan's original photo) -
+                  // not a separate thumbnail asset or a new field.
+                  <Image source={{ uri: item.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                ) : (
+                  <View style={s.historyIcon}>
+                    <Text style={{ fontSize: 20 }}>🏠</Text>
+                  </View>
+                )}
                 <View style={{ flex: 1 }}>
                   <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 8 }}>
-                    <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{item.spaceType}</Text>
+                    <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{getSpaceDisplayName(item)}</Text>
                     <Text style={[s.historyDate, { flexShrink: 0 }]}>{item.date}</Text>
                   </View>
                   {item.companionComplete && (
@@ -2984,6 +4373,138 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             ))
           )}
         </ScrollView>
+        {renderRenameSheet()}
+      </SafeAreaView>
+    );
+  }
+
+  // SPACE DETAIL SCREEN - on-device UX fix. Reached only from My Spaces
+  // ("View Plan"). Shows the Space's own content (photos, status,
+  // history) rather than dropping the user straight into the Companion
+  // journey - that journey is still one tap away ("Continue Organizing"/
+  // "View Full Plan" below), just no longer the forced default. Reuses
+  // the exact same rename bottom sheet as the merge-review screen and
+  // History's own "Rename" action (renderRenameSheet, openRenameSheet) -
+  // no second sheet built. Structurally modeled on the Space Inspector
+  // (header + ScrollView of SectionCard-shaped blocks) per the
+  // investigation's finding that the Inspector's shape, not its
+  // shadow-graph-specific data source, is what's reusable here - the
+  // Inspector itself stays untouched, dev-only, and reads the shadow
+  // graph (a diagnostic concern); this screen reads the plan document
+  // directly, the same source every other end-user screen already uses.
+  if (spaceDetailPlanId) {
+    const item = history.find((h) => h.id === spaceDetailPlanId);
+    if (!item) {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+            <View style={[s.hdr, { alignItems: "flex-start" }]}>
+            <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+              <DrawerIcon size={54} dark={true} />
+            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+              <Text style={s.hdrPageName}>Space Not Found</Text>
+            </View>
+            <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Spaces" accessibilityRole="button">
+              <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
+            </TouchableOpacity>
+          </View>
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            <Text style={{ fontSize: 14, color: "#64748B" }}>This space could no longer be found.</Text>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    const startingUri = item.photoUrl || null;
+    const latestUri = Array.isArray(item.progressPhotos) && item.progressPhotos.length ? item.progressPhotos[item.progressPhotos.length - 1].url : null;
+    const statusLabel = item.companionComplete ? "Completed" : (item.currentBatch ? "In progress" : "Not started");
+    const allBatches = [...(Array.isArray(item.batchHistory) ? item.batchHistory : []), ...(item.currentBatch ? [item.currentBatch] : [])]
+      .sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0));
+
+    const SpaceDetailSectionCard = ({ title, children }) => (
+      <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
+        <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
+        {children}
+      </View>
+    );
+
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
+          </TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Text style={s.hdrPageName} numberOfLines={1}>{getSpaceDisplayName(item)}</Text>
+              <TouchableOpacity onPress={() => openRenameSheet(item.id, getSpaceDisplayName(item))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this space" accessibilityRole="button">
+                <Pencil size={14} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
+              </TouchableOpacity>
+            </View>
+            <Text style={s.hdrTag}>{item.date}</Text>
+          </View>
+          <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Spaces" accessibilityRole="button">
+            <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
+          </TouchableOpacity>
+        </View>
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          <SpaceDetailSectionCard title="Photos">
+            {startingUri && latestUri ? (
+              <BeforeAfterStack beforeUri={startingUri} afterUri={latestUri} height={200} />
+            ) : startingUri ? (
+              <Image source={{ uri: startingUri }} style={{ width: "100%", height: 200, borderRadius: 10 }} resizeMode="cover" />
+            ) : (
+              <View style={{ width: "100%", height: 120, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" }}>
+                <Text style={{ fontSize: 12, color: "#94A3B8" }}>No photo yet</Text>
+              </View>
+            )}
+          </SpaceDetailSectionCard>
+
+          <SpaceDetailSectionCard title="Status">
+            <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{statusLabel}</Text>
+            <Text style={{ fontSize: 12, color: "#64748B" }}>Started {item.date}</Text>
+          </SpaceDetailSectionCard>
+
+          <SpaceDetailSectionCard title="History">
+            {allBatches.length === 0 ? (
+              <Text style={{ fontSize: 13, color: "#64748B" }}>No sessions recorded yet.</Text>
+            ) : allBatches.map((b, i) => (
+              <View key={b.batchIndex ?? i} style={{ marginBottom: i === allBatches.length - 1 ? 0 : 12 }}>
+                <Text style={{ fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginBottom: 4 }}>Session {i + 1}</Text>
+                {(b.items || []).map((it, j) => (
+                  <View key={it.id || j} style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    {it.status !== "pending" ? (
+                      <Check size={14} color={BRAND.green} strokeWidth={2.5} />
+                    ) : (
+                      <View style={{ width: 14, height: 14, borderRadius: 7, borderWidth: 1.5, borderColor: BRAND.mist }} />
+                    )}
+                    <Text style={{ fontSize: 13, color: BRAND.ink, flex: 1 }} numberOfLines={2}>{it.text}</Text>
+                  </View>
+                ))}
+              </View>
+            ))}
+          </SpaceDetailSectionCard>
+
+          {/* Always available, always leads to Results (budget tiers,
+              product recommendations, visualization) - never
+              conditionally rerouted to Companion. Primary action. */}
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => openSpaceResults(item)}>
+            <Text style={[s.startOverText, { color: "white" }]}>View Full Plan</Text>
+          </TouchableOpacity>
+          {/* Companion is reached ONLY through this explicit, separately-
+              labeled secondary action, and only when there's genuinely an
+              in-progress checklist to resume - never the default. */}
+          {isCompanionResumable(item) && (
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openCompanionSession(item)}>
+              <Text style={s.mergeSecondaryBtnText}>Continue Organizing</Text>
+            </TouchableOpacity>
+          )}
+        </ScrollView>
+        {renderRenameSheet()}
       </SafeAreaView>
     );
   }
@@ -3038,6 +4559,327 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <TouchableOpacity style={s.contactBtn} onPress={() => Linking.openURL("mailto:hello@uncluttrd.app")}>
             <Text style={s.contactBtnText}>📧 Contact Support</Text>
           </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // MERGE PROPOSAL REVIEW SCREEN (§12 Migration Part 3, Pass 2 -
+  // MergeProposalDesign.md) - reuses the Space Inspector's screen shape
+  // (header-with-back + ScrollView of stacked SectionCard-style blocks).
+  // Also independently reachable via its own menu entry above, so it is
+  // never only reachable through the banner. Every write below goes
+  // through the atomic module-level functions defined near
+  // checkMigrationCompleteness - each one a single writeBatch, never a
+  // bare updateDoc/setDoc from inside this render block.
+  if (showMergeReview) {
+    const allPlanIds = new Set();
+    pendingMergeCandidates.forEach((c) => (c.planIds || []).forEach((id) => allPlanIds.add(id)));
+    const stillLoadingPlans = mergeReviewPlansLoading && [...allPlanIds].some((id) => !(id in mergeReviewPlansById));
+
+    const MergeSectionCard = ({ children }) => (
+      <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
+        {children}
+      </View>
+    );
+
+    const EvidenceCard = ({ plan, onRename }) => {
+      if (plan === undefined) {
+        return <View style={s.mergeEvidenceCard}><ActivityIndicator size="small" color={BRAND.green} /></View>;
+      }
+      if (!plan) {
+        return (
+          <View style={s.mergeEvidenceCard}>
+            <Text style={{ fontSize: 12, color: "#B45309" }}>Record no longer available</Text>
+          </View>
+        );
+      }
+      const startingUri = plan.photoUrl || null;
+      const latestUri = Array.isArray(plan.progressPhotos) && plan.progressPhotos.length ? plan.progressPhotos[plan.progressPhotos.length - 1].url : null;
+      const dateLabel = plan.date || (plan.createdAt ? new Date(plan.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "");
+      // Project-level status doesn't exist until Part 1 structural
+      // migration completes for this plan - falls back to reading the
+      // equivalent facts directly from the plan document instead of
+      // blocking or erroring (MergeProposalDesign.md Section 4).
+      const statusLabel = plan.companionComplete ? "Completed" : (plan.currentBatch ? "In progress" : "Not started");
+      return (
+        <View style={s.mergeEvidenceCard}>
+          <Text style={s.mergeEvidenceLabel}>{getSpaceDisplayName(plan) || "Space"}</Text>
+          {onRename && (
+            // A TouchableOpacity nested inside another TouchableOpacity
+            // (this card's own checkbox-select wrapper, in
+            // renderPendingCandidate) captures its own taps in React
+            // Native's responder system without also triggering the
+            // parent's onPress - unlike DOM event bubbling, no
+            // stopPropagation is needed for this to work correctly.
+            <TouchableOpacity onPress={onRename} style={s.mergeRenameLink} accessibilityLabel="Rename this space" accessibilityRole="button" hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+              <Pencil size={11} color={BRAND.green} strokeWidth={2.25} />
+              <Text style={s.mergeRenameLinkText}>Rename</Text>
+            </TouchableOpacity>
+          )}
+          {startingUri && latestUri ? (
+            <BeforeAfterStack beforeUri={startingUri} afterUri={latestUri} height={110} />
+          ) : startingUri ? (
+            <Image source={{ uri: startingUri }} style={s.mergeEvidencePhoto} resizeMode="cover" />
+          ) : (
+            <View style={[s.mergeEvidencePhoto, { alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" }]}>
+              <Text style={{ fontSize: 11, color: "#94A3B8" }}>No photo</Text>
+            </View>
+          )}
+          <Text style={s.mergeEvidenceMeta} numberOfLines={1}>{dateLabel}</Text>
+          <Text style={s.mergeEvidenceMeta} numberOfLines={1}>{statusLabel}</Text>
+        </View>
+      );
+    };
+
+    const renderPendingCandidate = (candidate) => {
+      const selected = mergeSelections[candidate.id] || new Set();
+      const canConfirm = selected.size >= 2;
+      const loading = mergeActionLoadingId === candidate.id;
+      return (
+        <MergeSectionCard key={candidate.id}>
+          <Text style={s.mergeCandidateSignal}>These spaces currently share the name "{candidate.spaceType}".</Text>
+          <Text style={s.mergeCandidateInstruction}>Select all of the records that belong to the same physical space.</Text>
+          <Text style={s.mergeCandidateSupportCopy}>Records you leave unselected will not be included in this group. You can review the remaining records separately.</Text>
+          <Text style={[s.mergeCandidateSupportCopy, { marginTop: 4 }]}>If that's not correct, you can rename either space before deciding whether they're the same place.</Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: 10, marginBottom: 12 }}>
+            {candidate.planIds.map((planId) => {
+              const isSelected = selected.has(planId);
+              const planForCard = mergeReviewPlansById[planId];
+              return (
+                <TouchableOpacity
+                  key={planId}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: isSelected }}
+                  onPress={() => toggleMergeSelection(candidate.id, planId)}
+                  style={[s.mergeEvidenceCardWrap, isSelected && s.mergeEvidenceCardWrapSelected]}
+                  disabled={loading}
+                >
+                  <EvidenceCard plan={planForCard} onRename={planForCard ? () => openRenameSheet(planId, getSpaceDisplayName(planForCard)) : null} />
+                  <View style={[s.mergeCheckbox, isSelected && s.mergeCheckboxChecked]}>
+                    {isSelected && <Check size={14} color="white" strokeWidth={3} />}
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <TouchableOpacity
+            style={[s.startOverBtn, { marginTop: 0, backgroundColor: canConfirm ? BRAND.green : "#CBD5E1", borderWidth: 0 }]}
+            disabled={!canConfirm || loading}
+            onPress={() => handleConfirmSameSpace(candidate)}
+          >
+            <Text style={[s.startOverText, { color: "white" }]}>{loading ? "Saving..." : "These are the same space"}</Text>
+          </TouchableOpacity>
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} disabled={loading} onPress={() => handleKeepSeparate(candidate)}>
+              <Text style={s.mergeSecondaryBtnText}>Keep Separate</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} disabled={loading} onPress={() => handleDeferMergeCandidate(candidate, "not-now")}>
+              <Text style={s.mergeSecondaryBtnText}>Not Now</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} disabled={loading} onPress={() => handleDeferMergeCandidate(candidate, "not-sure")}>
+              <Text style={s.mergeSecondaryBtnText}>Not sure yet</Text>
+            </TouchableOpacity>
+          </View>
+        </MergeSectionCard>
+      );
+    };
+
+    // Stale-confirmed candidates are deliberately never rendered on this
+    // screen (removed from proactive surfacing - see
+    // queryMergeCandidatesForBanner's comment). The card/actions that used
+    // to render them (renderStaleCandidate, "Understood, no longer
+    // applicable", the reversal action) were removed from this render path
+    // rather than left as dead-but-reachable UI; the underlying handlers
+    // (handleAcknowledgeStale/handleReverseStale) and their I/O functions
+    // are still defined below, unreferenced by any render path, kept for a
+    // possible future history/decisions view - see their own comments.
+
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrPageName}>Review Duplicate Spaces</Text>
+            <Text style={s.hdrTag}>{pendingMergeCandidates.length} to review</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => { setShowMergeReview(false); setShowMenu(true); }} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
+            <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
+          </TouchableOpacity>
+        </View>
+        <ScrollView contentContainerStyle={[s.scrollContent, { paddingBottom: 140 }]}>
+          {stillLoadingPlans && (
+            <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 12 }}>Loading...</Text>
+          )}
+          {pendingMergeCandidates.length === 0 && !stillLoadingPlans && (
+            <View style={{ alignItems: "center", paddingTop: 40 }}>
+              <Text style={s.mergeAllCaughtUpTitle}>All caught up!</Text>
+              <Text style={s.mergeAllCaughtUpSub}>No duplicate spaces need your review right now.</Text>
+              <TouchableOpacity style={[s.startOverBtn, { backgroundColor: BRAND.green, borderWidth: 0, paddingHorizontal: 32 }]} onPress={goHome}>
+                <Text style={[s.startOverText, { color: "white" }]}>Back to Home</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          {pendingMergeCandidates.map(renderPendingCandidate)}
+        </ScrollView>
+        {renderRenameSheet()}
+      </SafeAreaView>
+    );
+  }
+
+  // SPACE INSPECTOR SCREEN (dev-only, Slice 2) - read-only diagnostic tool.
+  // Never reachable outside __DEV__ (see the menu entry above, gated with
+  // hide: !__DEV__). Everything below only calls loadSpaceShadowGraph,
+  // which is itself read-only (getDoc/getDocs only - see the report for
+  // the grep confirming this). No mutation, no repair action anywhere on
+  // this screen - a MISSING shadow only ever displays the CLI command to
+  // run separately, never a button that would write from here.
+  if (showSpaceInspector) {
+    const runInspection = async () => {
+      const uid = inspectorUidInput.trim();
+      const planId = inspectorPlanIdInput.trim();
+      if (!uid || !planId) { setInspectorError("Enter both a uid and a planId."); return; }
+      setInspectorLoading(true);
+      setInspectorError(null);
+      setInspectorResult(null);
+      try {
+        const graph = await loadSpaceShadowGraph(uid, planId);
+        setInspectorResult(graph);
+      } catch (e) {
+        setInspectorError(e.message);
+      } finally {
+        setInspectorLoading(false);
+      }
+    };
+
+    const Row = ({ label, value }) => (
+      <View style={{ flexDirection: "row", justifyContent: "space-between", paddingVertical: 4 }}>
+        <Text style={{ fontSize: 13, color: "#64748B" }}>{label}</Text>
+        <Text style={{ fontSize: 13, color: "#0F2A52", fontFamily: "Inter_600SemiBold", maxWidth: "60%", textAlign: "right" }}>{String(value)}</Text>
+      </View>
+    );
+    const SectionCard = ({ title, children }) => (
+      <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 12 }}>
+        <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
+        {children}
+      </View>
+    );
+
+    const graph = inspectorResult;
+    const isMissing = graph && graph.validation.findings.some(f => f.status === "MISSING");
+    const findingColor = (status) => status === "OK" ? "#15803D" : status === "INFO" ? "#64748B" : status === "MISSING" ? "#B45309" : status === "STALE" ? "#CA8A04" : "#DC2626";
+
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrPageName}>🔍 Space Inspector</Text>
+            <Text style={s.hdrTag}>Dev-only, read-only</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => { setShowSpaceInspector(false); setShowMenu(true); }} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
+            <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
+          </TouchableOpacity>
+        </View>
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          <SectionCard title="Lookup">
+            <TextInput
+              style={{ borderWidth: 1, borderColor: "#D7DCE3", borderRadius: 10, padding: 10, fontSize: 14, marginBottom: 8, color: "#0F2A52" }}
+              placeholder="uid (staging)" placeholderTextColor="#94A3B8" autoCapitalize="none" autoCorrect={false}
+              value={inspectorUidInput} onChangeText={setInspectorUidInput}
+            />
+            <TextInput
+              style={{ borderWidth: 1, borderColor: "#D7DCE3", borderRadius: 10, padding: 10, fontSize: 14, marginBottom: 10, color: "#0F2A52" }}
+              placeholder="planId" placeholderTextColor="#94A3B8" autoCapitalize="none" autoCorrect={false}
+              value={inspectorPlanIdInput} onChangeText={setInspectorPlanIdInput}
+            />
+            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={runInspection} disabled={inspectorLoading}>
+              <Text style={[s.startOverText, { color: "white" }]}>{inspectorLoading ? "Loading..." : "Load Shadow Graph"}</Text>
+            </TouchableOpacity>
+            {inspectorError && <Text style={{ color: "#DC2626", fontSize: 13, marginTop: 8 }}>{inspectorError}</Text>}
+          </SectionCard>
+
+          {graph && isMissing && (
+            <SectionCard title="Validation">
+              <Text style={{ fontSize: 13, color: "#B45309", fontFamily: "Inter_600SemiBold", marginBottom: 10 }}>MISSING - no shadow documents exist for this plan.</Text>
+              <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 4 }}>Expected deterministic IDs (Space/Project/Session all equal to planId, by design; batches are per-index, see below):</Text>
+              <Row label="spaceId" value={graph.expectedIds.spaceId} />
+              <Row label="projectId" value={graph.expectedIds.projectId} />
+              <Row label="sessionId" value={graph.expectedIds.sessionId} />
+              <Row label="batch ID scheme" value="planId-batch{N}, one per batchIndex" />
+              <Text style={{ fontSize: 12, color: "#64748B", marginTop: 12, marginBottom: 6 }}>To repair (run separately, not from this screen):</Text>
+              <View style={{ backgroundColor: "#0F2A52", borderRadius: 8, padding: 10 }}>
+                <Text style={{ color: "#A7F3D0", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" }} selectable={true}>
+                  {`node scripts/validateSpaceMigration.js --uid=${inspectorUidInput.trim()} --planId=${inspectorPlanIdInput.trim()} --repair`}
+                </Text>
+              </View>
+            </SectionCard>
+          )}
+
+          {graph && !isMissing && (
+            <>
+              <SectionCard title="Overview">
+                <Row label="Space name/type" value={graph.space.data?.displayName ?? "(none)"} />
+                <Row label="Project status" value={graph.project.data?.status ?? "(missing)"} />
+                <Row label="Session status" value={graph.session.data?.status ?? "(missing)"} />
+                <Row label="Batch count" value={graph.batches.length} />
+                <Row label="Highest batch index" value={graph.batches.length ? graph.batches[graph.batches.length - 1].data.batchIndex : "(missing)"} />
+                <Row label="Source plan ID" value={graph.sourcePlan.id} />
+                <Row label="Shadow schema version" value={graph.project.data?.shadowSchemaVersion ?? "(n/a)"} />
+              </SectionCard>
+
+              <SectionCard title="Ownership">
+                <Row label="spaceId" value={graph.expectedIds.spaceId} />
+                <Row label="projectId" value={graph.expectedIds.projectId} />
+                <Row label="sessionId" value={graph.expectedIds.sessionId} />
+                {graph.batches.map((b) => (
+                  <Row key={b.id} label={`batchId (index ${b.data.batchIndex})`} value={b.id} />
+                ))}
+                <Row label="Project -> Space (scopeId matches)" value={graph.project.data?.scopeId === graph.expectedIds.spaceId ? "✓ correct" : "✗ MISMATCH"} />
+                <Row label="Session -> Project (projectId matches)" value={graph.session.data?.projectId === graph.expectedIds.projectId ? "✓ correct" : "✗ MISMATCH"} />
+                <Row label="Batch -> Session" value="(structural - proven by Firestore path, no separate pointer field in this schema)" />
+              </SectionCard>
+
+              <SectionCard title="Evidence">
+                <Row label="Starting evidence URL" value={graph.project.data?.startingEvidence?.photoUrl ?? "(none)"} />
+                <Row label="Current evidence URL" value={graph.project.data?.currentEvidence?.photoUrl ?? "(none)"} />
+                <Row label="Evidence status" value={graph.project.data?.evidenceStatus ?? "(n/a)"} />
+                {graph.project.data?.evidenceStatus === "unavailable" && (
+                  <Text style={{ fontSize: 12, color: "#B45309", marginTop: 6 }}>Unavailable reason: photoUrl was not yet available at shadow-write time (photo upload had not completed) - Part 1's expected, non-error state, not a defect.</Text>
+                )}
+              </SectionCard>
+
+              <SectionCard title="Work State">
+                {graph.batches.map((b) => (
+                  <View key={b.id} style={{ marginBottom: 10 }}>
+                    <Text style={{ fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginBottom: 2 }}>Batch {b.data.batchIndex} ({b.id})</Text>
+                    {(b.data.items || []).map((item, i) => (
+                      <Row key={i} label={item.text} value={item.status} />
+                    ))}
+                  </View>
+                ))}
+                <Row label="companionComplete (source plan)" value={graph.sourcePlan.data?.companionComplete ? "set" : "not set"} />
+              </SectionCard>
+
+              <SectionCard title="Validation">
+                {graph.validation.findings.map((f, i) => (
+                  <View key={i} style={{ marginBottom: 8 }}>
+                    <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: findingColor(f.status) }}>{f.status}  {f.invariant}</Text>
+                    {f.note && <Text style={{ fontSize: 12, color: "#64748B" }}>{f.note}</Text>}
+                    {(f.status === "MISMATCH" || f.status === "STALE") && <Text style={{ fontSize: 12, color: "#64748B" }}>expected: {JSON.stringify(f.expected)}  found: {JSON.stringify(f.found)}</Text>}
+                  </View>
+                ))}
+              </SectionCard>
+            </>
+          )}
         </ScrollView>
       </SafeAreaView>
     );
@@ -3195,7 +5037,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <ScrollView ref={resultsScrollRef} contentContainerStyle={s.scrollContent}>
           <View style={s.resTop}>
             <View style={{ flex: 1 }}>
-              <Text style={s.resSpace} numberOfLines={1}>{results.spaceType?.toUpperCase()}</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Text style={s.resSpace} numberOfLines={1}>{getSpaceDisplayName(results)?.toUpperCase()}</Text>
+                {/* Reuses the exact same rename bottom sheet as the merge-
+                    review cards, History's "Rename" action, and Space
+                    Detail's pencil - currentPlanId, not results.id, since
+                    a just-analyzed plan may not have an id on `results`
+                    yet before it's saved (currentPlanId is only ever set
+                    once a real saved plan is being viewed). */}
+                {currentPlanId && (
+                  <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, getSpaceDisplayName(results))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this space" accessibilityRole="button">
+                    <Pencil size={12} color={BRAND.green} strokeWidth={2.25} />
+                  </TouchableOpacity>
+                )}
+              </View>
               <Text style={s.resTitle}>Your Space</Text>
             </View>
             <TouchableOpacity style={s.shareBtn} accessibilityLabel="Share your space" accessibilityRole="button" onPress={() => setTimeout(() => {
@@ -3216,6 +5071,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Ionicons name="share-outline" size={26} color={BRAND.green} />
             </TouchableOpacity>
           </View>
+          {results.photoUrl && (
+            // Same photoUrl source as the History list thumbnails and the
+            // (now-deactivated) Space Detail screen - not a separate field.
+            // Reuses the existing vizModal full-screen viewer (pinch-zoom,
+            // close button) already used for AI visualization images below,
+            // rather than building a second modal pattern.
+            <TouchableOpacity
+              onPress={() => { setVizModal(results.photoUrl); setVizModalKey(k => k + 1); }}
+              activeOpacity={0.9}
+              accessibilityLabel="View original photo full screen"
+              accessibilityRole="button"
+            >
+              <Image source={{ uri: results.photoUrl }} style={s.resPhoto} resizeMode="cover" />
+              <Text style={s.resPhotoHint}>Tap photo to view full screen</Text>
+            </TouchableOpacity>
+          )}
           <View style={s.overviewCard}>
             <Text style={s.overviewText}>{results.overview}</Text>
           </View>
@@ -3350,6 +5221,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.startOverText}>Analyze a New Space</Text>
           </TouchableOpacity>
         </ScrollView>
+        {renderRenameSheet()}
       </SafeAreaView>
     );
   }
@@ -3539,7 +5411,30 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Sparkles size={18} color={BRAND.green} strokeWidth={2.25} />
             <View style={{ flex: 1, marginLeft: 10 }}>
               <Text style={s.companionResumeTitle}>Continue Your Session</Text>
-              <Text style={s.companionResumeSub} numberOfLines={1}>{resumablePlan.spaceType}</Text>
+              <Text style={s.companionResumeSub} numberOfLines={1}>{getSpaceDisplayName(resumablePlan)}</Text>
+            </View>
+            <ChevronRight size={18} color={BRAND.green} strokeWidth={2.25} />
+          </TouchableOpacity>
+        )}
+
+        {/* §12 Migration Part 3, Pass 2 - merge-proposal Home banner
+            (MergeProposalDesign.md Section 3). Same visual weight/pattern as
+            the resumablePlan banner above. Shown for pending candidates
+            only - stale-confirmed candidates are deliberately never
+            proactively surfaced (queryMergeCandidatesForBanner no longer
+            queries them at all, so pendingMergeCandidates is the only
+            count that matters here). Hidden once the user has explicitly
+            deferred ("Not Now"/"Not sure yet") this session - merely
+            opening and leaving the review screen does not set that flag
+            (this pass's explicit test (b)). */}
+        {mergeCandidatesLoaded && !mergeBannerDismissedThisSession && pendingMergeCandidates.length > 0 && (
+          <TouchableOpacity style={s.companionResumeBanner} onPress={() => setShowMergeReview(true)}>
+            <Layers size={18} color={BRAND.green} strokeWidth={2.25} />
+            <View style={{ flex: 1, marginLeft: 10 }}>
+              <Text style={s.companionResumeTitle}>Possible Duplicate Spaces</Text>
+              <Text style={s.companionResumeSub} numberOfLines={1}>
+                {`${pendingMergeCandidates.length} space${pendingMergeCandidates.length === 1 ? "" : "s"} may be the same`}
+              </Text>
             </View>
             <ChevronRight size={18} color={BRAND.green} strokeWidth={2.25} />
           </TouchableOpacity>
@@ -3662,6 +5557,80 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
 }
 
+// Soft update-availability nudge (DecisionLog.md 2026-07-30). Compares the
+// installed version (app.config.js's `version`, read via expo-constants)
+// against `config/appVersion` in Firestore, per platform. Never blocks
+// usage - dismissible, and suppressed for 24h after being shown (which also
+// covers "don't reappear this session" as a side effect, since 24h always
+// exceeds a single session). Only checked for production builds; staging
+// isn't distributed via the App Store/Play Store, so there's nothing
+// meaningful to compare against.
+const UPDATE_NUDGE_LAST_SHOWN_KEY = "lastVersionNudgeShownAt";
+const UPDATE_NUDGE_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// App Store URLs are keyed by numeric App ID, not bundle identifier - no way
+// to derive this at runtime, so it's hardcoded here. Must match eas.json's
+// submit.production.ios.ascAppId if that ever changes.
+const IOS_APP_STORE_URL = "https://apps.apple.com/app/id6781513811";
+
+// Compares two "major.minor.patch"-style version strings (the same shape as
+// app.config.js's `version` field). Returns true only if `current` is
+// strictly behind `latest` - equal or ahead returns false. No semver
+// dependency: both values are always plain dot-separated integers, so a
+// small direct comparison is simpler and adds nothing to install.
+function isVersionBehind(current, latest) {
+  if (!current || !latest) return false;
+  const cur = String(current).split(".").map(n => parseInt(n, 10) || 0);
+  const lat = String(latest).split(".").map(n => parseInt(n, 10) || 0);
+  const len = Math.max(cur.length, lat.length);
+  for (let i = 0; i < len; i++) {
+    const c = cur[i] || 0;
+    const l = lat[i] || 0;
+    if (l > c) return true;
+    if (l < c) return false;
+  }
+  return false;
+}
+
+async function checkForAppUpdate() {
+  if (!IS_PRODUCTION) return;
+  try {
+    const lastShown = await AsyncStorage.getItem(UPDATE_NUDGE_LAST_SHOWN_KEY);
+    if (lastShown && Date.now() - parseInt(lastShown, 10) < UPDATE_NUDGE_MIN_INTERVAL_MS) {
+      return; // shown within the last 24h (including earlier this session) - stay quiet
+    }
+
+    const snap = await getDoc(doc(db, "config", "appVersion"));
+    if (!snap.exists()) return;
+    const data = snap.data();
+    const latest = Platform.OS === "ios" ? data.ios : data.android;
+    const current = Constants.expoConfig?.version;
+    if (!isVersionBehind(current, latest)) return;
+
+    // Recorded before the alert is even shown, not just on "Not Now" - the
+    // 24h suppression is meant to apply regardless of which action the user
+    // takes (or if they dismiss without tapping either), per the "don't show
+    // more than once per day" requirement being a general rule, not a
+    // consequence of the "Not Now" button specifically.
+    await AsyncStorage.setItem(UPDATE_NUDGE_LAST_SHOWN_KEY, Date.now().toString());
+
+    const androidPackage = Constants.expoConfig?.android?.package || "com.mharrison.uncluttrd";
+    const storeUrl = Platform.OS === "ios"
+      ? IOS_APP_STORE_URL
+      : `https://play.google.com/store/apps/details?id=${androidPackage}`;
+
+    Alert.alert(
+      "A new version of Uncluttrd is available",
+      "Update now for the latest features and fixes.",
+      [
+        { text: "Not Now", style: "cancel" },
+        { text: "Update Now", onPress: () => Linking.openURL(storeUrl) },
+      ]
+    );
+  } catch (e) {
+    console.log("Update check error:", e.message);
+  }
+}
+
 // ── ROOT ─────────────────────────────────────────────────────
 function AppRoot() {
   const [user, setUser] = useState(null);
@@ -3732,6 +5701,13 @@ function AppRoot() {
     logEvent(getAnalytics(), "analytics_test")
       .then(() => console.log("analytics_test event sent"))
       .catch(e => console.log("Analytics test event error:", e.message));
+  }, []);
+
+  useEffect(() => {
+    // Soft update-availability nudge - see checkForAppUpdate's own comment.
+    // Runs once per app launch, independent of auth state (this is a
+    // dismissible nudge about the app itself, not account data).
+    checkForAppUpdate();
   }, []);
 
   useEffect(() => {
@@ -3971,6 +5947,8 @@ const s = StyleSheet.create({
   resSpace: { fontSize: 12, fontFamily: "Inter_700Bold", color: BRAND.green, letterSpacing: 0.8, marginBottom: 3 },
   resTitle: { fontSize: 24, fontFamily: "Inter_700Bold", color: BRAND.ink },
   overviewCard: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 14, padding: 16, marginBottom: 16 },
+  resPhoto: { width: "100%", height: 220, borderRadius: 14, backgroundColor: BRAND.stone },
+  resPhotoHint: { fontSize: 11, color: BRAND.mist, textAlign: "center", marginTop: 6, marginBottom: 16, fontFamily: "Inter_400Regular" },
   overviewText: { fontSize: 14, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 22 },
   tcard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderRadius: 16, padding: 18, marginBottom: 12 },
   tcardHead: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6, paddingBottom: 12, borderBottomWidth: 1, marginBottom: 12 },
@@ -4071,6 +6049,33 @@ const s = StyleSheet.create({
   companionResumeBanner: { flexDirection: "row", alignItems: "center", backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 14, marginBottom: 16 },
   companionResumeTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   companionResumeSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
+  // §12 Migration Part 3, Pass 2 - merge-proposal review screen styles.
+  mergeCandidateSignal: { fontSize: 12, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 },
+  mergeCandidateInstruction: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4, lineHeight: 20 },
+  mergeCandidateSupportCopy: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 17 },
+  mergeEvidenceCardWrap: { width: "47%", borderRadius: 12, borderWidth: 2, borderColor: "transparent", padding: 2, position: "relative" },
+  mergeEvidenceCardWrapSelected: { borderColor: BRAND.green },
+  mergeEvidenceCard: { backgroundColor: "#F8FAFC", borderRadius: 10, padding: 8 },
+  mergeEvidencePhoto: { width: "100%", height: 110, borderRadius: 8 },
+  mergeEvidenceLabel: { fontSize: 12, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 6, paddingRight: 26, flexWrap: "wrap" },
+  mergeEvidenceMeta: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 4 },
+  mergeCheckbox: { position: "absolute", top: 8, right: 8, width: 22, height: 22, borderRadius: 11, backgroundColor: "rgba(255,255,255,0.9)", borderWidth: 2, borderColor: BRAND.mist, alignItems: "center", justifyContent: "center" },
+  mergeCheckboxChecked: { backgroundColor: BRAND.green, borderColor: BRAND.green },
+  mergeSecondaryBtn: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 8, alignItems: "center" },
+  mergeSecondaryBtnText: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate, textAlign: "center" },
+  mergeAllCaughtUpTitle: { fontSize: 18, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 6 },
+  mergeAllCaughtUpSub: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginBottom: 20 },
+  // TEMPORARY DIAGNOSTIC - remove alongside the debug badges in the
+  // render chain once the View Full Plan -> Results bug is confirmed fixed.
+  mergeRenameLink: { flexDirection: "row", alignItems: "center", gap: 4, marginBottom: 6, alignSelf: "flex-start" },
+  mergeRenameLinkText: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.green },
+  renameSheetBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", justifyContent: "flex-end" },
+  renameSheetCard: { backgroundColor: "white", borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 34 },
+  renameSheetTitle: { fontSize: 17, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 14 },
+  renameSheetInput: { borderWidth: 1, borderColor: BRAND.stone, borderRadius: 12, padding: 14, fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 16 },
+  renameSuggestionsLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate, marginBottom: 8 },
+  renameSuggestionChip: { backgroundColor: BRAND.greenLight, borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14 },
+  renameSuggestionChipText: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green },
   shareBtn: { padding: 12, minWidth: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
   vizBtn: { borderWidth: 1.5, borderRadius: 8, padding: 13, alignItems: "center", justifyContent: "center", marginTop: 12 },
   vizModalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.95)", justifyContent: "center", alignItems: "center" },
@@ -4107,7 +6112,7 @@ const s = StyleSheet.create({
   upgradeBtn: { backgroundColor: BRAND.green, margin: 12, borderRadius: 8, padding: 13, alignItems: "center" },
   upgradeBtnText: { color: "white", fontFamily: "Inter_700Bold", fontSize: 14 },
   historyItem: { flexDirection: "row", gap: 12, backgroundColor: BRAND.white, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: BRAND.stone, alignItems: "flex-start" },
-  historyIcon: { width: 40, height: 40, backgroundColor: BRAND.greenLight, borderRadius: 10, alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  historyIcon: { width: 66, height: 66, backgroundColor: BRAND.greenLight, borderRadius: 16, alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden" },
   historySpace: { fontSize: 14, fontFamily: "Inter_700Bold", color: BRAND.ink },
   historyDate: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
   historyOverview: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 18 },
