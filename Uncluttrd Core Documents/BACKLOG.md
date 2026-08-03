@@ -21,6 +21,15 @@ Priority levels:
 
 ## Open Items
 
+### 🔴 mergeCandidates history subcollection must be handled before Pass 2 ships history writes
+**Context:** §12 Migration Part 3, Pass 1 follow-up verification (2026-08-02). `detectAndPersistMergeCandidatesForUser` (`scripts/runSpaceMigration.js`) deletes superseded/invalidated `mergeCandidates` documents with plain `.delete()` calls at three sites (pending superseded, dismissed/confirmed-merge invalidated, pending invalidated below 2 members) - none of them check for, migrate, or copy a `history` subcollection first. Firestore does not cascade-delete subcollections, so any existing `history/{eventId}` entries under a deleted document become orphaned (unreachable from any current-state document, though still technically present at their old path).
+
+**Confirmed safe today:** grepped the entire repo (`App.js`, `shared/*.js`, `scripts/*.js`) for any code path that writes to `mergeCandidates/{id}/history/*` - there is none. MergeProposalDesign.md Section 7's history subcollection is a design record only; Part 3's actual implementation (Pass 1) never writes to it. No real user history exists yet, so today's deletions orphan nothing.
+
+**Must be resolved before Pass 2 ships any history-writing code** (e.g., recording "Not now" deferrals, per MergeProposalDesign.md Section 5/7) - otherwise the very first deferral on a candidate that later gets superseded or invalidated by a reconciliation re-run would silently orphan real user decision history. Resolve via one of the three options already identified in MergeProposalDesign.md Section 10's write-sequence discussion: confirm history genuinely doesn't need preserving across these specific deletions, add a migrate-then-delete step, or replace deletion with a terminal status that preserves the subcollection.
+
+---
+
 ### 🟡 Batch item cards: title + explanation restructuring
 **Context:** Task-card polish (Jul 19, 2026) - restructure each checklist item's text from one long sentence into a short bold title + a smaller explanatory sentence (e.g. "Organize your writing tools" / "Place your pens and markers into a single container or drawer to keep the surface clear."), instead of "Route the visible cables behind the desk to keep the surface clear." as one line. Explicitly held out of that polish round for its own discovery/scoping session.
 
@@ -409,6 +418,7 @@ This is reference material for the eventual implementation, not an approved spec
 
 | Item | Closed | Notes |
 |------|--------|-------|
+| Batch Identity Alignment — Unify Shadow Batch ID Derivation | Aug 2026 | `computeShadowBatchId(planId, batchIndex)` is now the single shared derivation across App.js and the CLI; `checkSpaceShadowExists`/`validateSpaceShadowMigration`/Inspector UI/CLI `repairPlan` all made genuinely multi-batch-aware; verified end-to-end against a real plan progressed through a real second-batch-producing mutation |
 | API keys moved to Cloud Functions | Jun 2026 | analyzePhoto + generateVisualization proxy |
 | Firebase Security Rules locked down | Jun 2026 | Firestore + Storage scoped to uid |
 | RevenueCat iOS configured | Jun 2026 | appl_SIucLbhCtkbSMSuMrhGyxsfWmxx |

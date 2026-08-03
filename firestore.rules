@@ -30,6 +30,39 @@ service cloud.firestore {
         allow read, write: if request.auth != null && request.auth.uid == userId;
       }
 
+      // Space/Project/Session/Batch shadow structure (Space Implementation
+      // Slice 1/2) - same ownership pattern as plans/{planId} above, applied
+      // at every nesting level. Added 2026-08-02 after live testing showed
+      // the shadow write (writeSpaceShadowStructure, App.js) was silently
+      // denied for real authenticated clients with no rule present here.
+      match /spaces/{spaceId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+        match /projects/{projectId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+          match /sessions/{sessionId} {
+            allow read, write: if request.auth != null && request.auth.uid == userId;
+            match /batches/{batchId} {
+              allow read, write: if request.auth != null && request.auth.uid == userId;
+            }
+          }
+        }
+      }
+
+      // §12 Migration Part 2/3 merge candidates - same ownership pattern as
+      // spaces/{spaceId} above. Previously had ZERO rule coverage (flagged
+      // during Part 3 scoping, MergeProposalDesign.md) - only the Admin SDK
+      // migration runner could touch this collection; a real authenticated
+      // client would have been silently denied on both read and write, the
+      // same failure mode already seen once for the shadow structure above.
+      // Added ahead of the comparison/resolution UI (Part 3) so that work
+      // is never blocked on a rules gap discovered late.
+      match /mergeCandidates/{candidateId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+        match /history/{eventId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
+      }
+
       // Server (Admin SDK) only - Admin SDK bypasses rules entirely, so this
       // is purely a statement of intent: no client ever has a legitimate
       // reason to read or write its own idempotency records directly.
@@ -52,6 +85,17 @@ service cloud.firestore {
     // has a legitimate reason to read or write these directly.
     match /deletionAudit/{uid} {
       allow read, write: if false;
+    }
+
+    // App-wide, non-user config (e.g. config/appVersion, the soft
+    // update-nudge's latest-released-version values - DecisionLog.md
+    // 2026-07-30). Public read, since the update check runs on app launch
+    // before a user may have signed in. Never client-writable - set only by
+    // the developer (Firebase Console or an Admin SDK script) after each
+    // release.
+    match /config/{document} {
+      allow read: if true;
+      allow write: if false;
     }
   }
 }

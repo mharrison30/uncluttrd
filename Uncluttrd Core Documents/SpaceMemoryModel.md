@@ -122,9 +122,35 @@ Users should be able to see and control what's been remembered about their home.
 - How much of memory is stored as structured fields versus a summarized AI-generated understanding.
 - Session/Plan naming and lifecycle mechanics.
 - Billing/pricing mechanics.
-- Firestore schema and migration mechanics - though the migration principle "every existing Plan becomes exactly one Space, no customer loses data, history, or access" is already decided and belongs in the future Object Model/migration plan. It does not need to control this document's content.
+- Firestore schema and migration *implementation* mechanics - still deferred. The migration *invariant* (what a correct migration must produce, as distinct from how to build it) is no longer deferred as of 2026-08-01; see "Migration Invariant" immediately below. This bullet now refers only to implementation mechanics, not to the ownership shape migration must satisfy.
 
 None of these questions should be considered accidentally resolved by any example or wording used elsewhere in this document.
+
+### Restartability Principle (Settled 2026-08-02)
+
+[Decision] Migration must be restartable at any arbitrary point without requiring knowledge of previous runs.
+
+[Rationale] This is stronger than idempotency. It means: no resume-from-checkpoint tracking, no "last processed user" state, no migration ledger, no ordered dependency between users or plans. This is the direct architectural consequence of separating checkMigrationCompleteness (determines whether work is needed) from forceFullReprojection (performs the work when explicitly told to): if every plan can be independently evaluated against reality and acted on only if incomplete, migration never needs to know what happened in any prior run - it only needs to know the current true state of each plan, which it can always determine fresh.
+
+[Consequences] The migration execution model is exactly: for every plan, if checkMigrationCompleteness reports complete, skip; otherwise, invoke forceFullReprojection. This holds regardless of whether this is the first run, a retry after partial failure, or a rerun days later. No coordination between plans or users is required or should ever be introduced - a future implementer adding "track which users have been processed" for efficiency would silently violate this principle and should be pointed back to this decision.
+
+### Migration Invariant (Settled 2026-08-01)
+
+[Decision] This is no longer an open migration design question - it is an invariant the migration implementation must satisfy, established as a direct consequence of this session's Project/Persistent Work/Session ownership decisions. The ownership model is authoritative; migration conforms to it, it does not redefine it.
+
+Migration invariant: Every migrated legacy plan SHALL become exactly one active Project within exactly one migrated Space. Migration SHALL preserve ownership by assigning the legacy plan's Starting Evidence, Persistent Work, currentBatch, and companionComplete state to that Project - not directly to the Space. Migration SHALL further reconstruct Session boundaries from the legacy plan's existing batchHistory timestamps wherever they are distinguishable, rather than collapsing all historical activity into one undifferentiated record.
+
+[Rationale] After tonight's ownership decisions, a migrated Space without a Project would be structurally incomplete - Persistent Work, Starting Evidence, and Sessions all belong to a Project, not directly to a Space, so a Space alone cannot honestly hold a legacy plan's state. This is not synthesizing a new object during migration: a legacy plan was already someone's ongoing transformation effort, it simply didn't have that name yet. Migration makes the implicit explicit, it does not invent something that wasn't conceptually there.
+
+[Consequences] §12's actual implementation must be scoped and resolved once persistent Space's implementation shape is concrete - this invariant defines what a correct migration must produce, not how to build it. Flag this explicitly as blocked on persistent Space's implementation, not something that can be finalized independently of it.
+
+[Decision] Merge-proposal capability is REQUIRED as part of the initial Space implementation, not a deferred follow-up. This supersedes any earlier assumption that "one Space per legacy plan, no merging" was an acceptable initial default.
+
+[Rationale] A direct count against production Firestore (2026-08-01: 159 plans, 16 users) found 13 of 16 users have 2 or more plans (81%); excluding one confirmed developer-testing account, 12 of the remaining 15 real users still have 2+ plans (80%). This is not a rare edge case - most real users have multiple plan documents on record, some plausibly representing the same physical space revisited over time. Shipping migration with no merge path would visibly fragment history for the majority of real users at launch.
+
+[Consequences] Migration must, for any pair of plans belonging to the same user with similar characteristics (matching or similar spaceType label, plausible timeframe - exact matching criteria to be determined during implementation, not specified here), propose a candidate merge to the user rather than silently creating separate permanent Spaces. This reuses the same propose-then-user-confirms pattern already established for Persistent Work item matching (this session's earlier work) - applied here at Space-identity level. Plans cannot be confidently auto-merged today: no existing field or mechanism links separate plan documents as the same physical space, so any merge must be proposed and confirmed by the user, never silently automated.
+
+Candidate detection (implementation), the full candidate state machine, surfacing/resolution UX, and the handoff contract to merge execution are specified in **MergeProposalDesign.md**, not restated here.
 
 ---
 

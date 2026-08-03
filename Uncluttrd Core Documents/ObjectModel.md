@@ -33,37 +33,110 @@ Inclusion in this document does not imply equal confidence. Each statement's tie
 
 ```
 User
- └── Space
+ └── Space (durable owner: identity, metadata, Project History)
        ├── Durable Memory
-       ├── Persistent Work
        ├── Location References
        ├── Remembered Statements
-       └── Snapshots
+       ├── Snapshots
+       └── Project History (one active Space-scoped Project, OR several concurrent active Location-Reference-scoped Projects, never both on overlapping ground + many historical)
+             └── Project (scopeType: Space | LocationReference; scopeId)
+                   ├── Starting Evidence
+                   ├── Current Evidence
+                   ├── Persistent Work
+                   ├── Sessions (Project-owned, stable identity - see Session, Section 4)
+                   │     └── Session (id, projectId, startedAt, endedAt, status)
+                   │           ├── Batches
+                   │           │     └── Photos
+                   │           └── Session-scoped decisions
+                   └── Decision/History log (Project-scoped)
 ```
 
-Sessions and Observations interact with this graph and may affect its contents, but are not themselves durable members of it (see Temporary Concepts).
+Observation interacts with this graph and may affect its contents, but is not itself a durable member of it (see Temporary Concepts). [Observation] Session was previously grouped with Observation in this caveat as "not themselves durable members." That is superseded as of 2026-08-01: Session is now a Settled Object with stable identity (Section 4), promoted out of Temporary Concepts - see DecisionLog.md, "Session Given Stable Identity, Project Remains the Durable Owner." This line is corrected rather than silently left inconsistent with that promotion.
+
+Association between a new analysis and a Space is established only through explicit user confirmation (see Space, Section 4) - never inferred from the analysis itself.
 
 ---
 
 ## 4. Settled Objects
 
-The following objects have settled architectural definitions. Each object's owner (Space or Session) is stated explicitly.
+The following objects have settled architectural definitions. Each object's owner (Space, Project, or Session) is stated explicitly.
 
 ### Space
 
 - The root object of the organizing domain.
 - Owns the durable understanding and product activity associated with one real-world space.
+- Has identity, ownership, and lifecycle independent of any individual photo, analysis, plan, recommendation set, Companion session, or progress record.
+- Every new analysis is associated with a Space only through explicit user confirmation: selecting an existing Space or creating a new one.
+- Creating a new Space always creates a distinct identity, even if another Space shares the same name or type.
+- Selecting an existing Space extends that Space's history. It never overwrites or replaces prior records.
+
+Clarifications:
+- Space identity is never established through visual similarity, room type, name, recency, AI confidence, device/capture location, or "only one Space of that type."
+- The system may suggest a likely Space using signals such as name, type, most recent photo, last activity date, or an existing active session, but the suggestion remains unconfirmed until the user explicitly selects it.
+- Data-model requirement only: the model must not make it structurally impossible to later move an analysis from one Space to another without deleting the analysis or merging the two Spaces.
+- Space association is a distinct mechanism from the Decision-Dimension Taxonomy. It establishes identity/association before any Recommendation exists and is not itself a user preference that influences recommendations.
+
+### Project
+
+- The long-running effort to transform a Space, spanning multiple Sessions, from Starting Evidence to a terminal state.
+- A Space may have Project History: many completed, abandoned, or superseded Projects over its lifetime.
+- Scope fields: `scopeType` (Space | LocationReference), `scopeId` (the identifier of the Space or Location Reference this Project covers).
+
+Prior framing (superseded 2026-08-01): "A Space has at most one Active Project at a time (0 or 1 constraint)." This is replaced outright, not left standing alongside the new rule - see DecisionLog.md, "Project Scope Model - Space or Location Reference, Not Space-Only."
+
+[Decision] A Space may have either one active Space-scoped Project, or several concurrent active Location-Reference-scoped Projects (each covering a distinct Location Reference within that Space), but never both simultaneously covering overlapping ground.
+
+[Rationale] A Space is the largest addressable unit (e.g., "Kitchen"); real organizing work often happens at a finer grain (Coffee Station, under-sink cabinets) that the user may want to address independently and out of order. Scoping Project to either level, with an explicit overlap constraint, supports both a broad first-time effort before any sub-locations are identified, and later focused, independently-trackable efforts, without their memories blurring together.
+
+Owns:
+- Starting Evidence - the first evidence for this transformation specifically, not the Space's lifetime evidence.
+- Current Evidence.
+- Persistent Work (see Persistent Work below).
+- Sessions, which own Batches, which own Photos.
+- A Decision/History log scoped to this Project.
+
+[Inference] Starting Evidence and Persistent Work share the same ownership logic: both come into existence when a Project begins and reach a terminal state when the Project does, so both are owned by the object that shares their lifecycle - the Project - not by the Space, whose own lifecycle outlives any single transformation effort.
+
+[Consequences] Sessions, photos, Batches, Starting Evidence, and Persistent Work all inherit their owning Project's scope. A photo/batch scoped to one Location Reference must not update a different Project's Persistent Work, even within the same Space.
+
+Narrowing from broad to focused: when a broad Space-scoped Project needs to narrow into one or more Location-Reference-scoped Projects (e.g., a general Kitchen effort splitting into a focused Coffee Station effort), this is handled through the existing Superseded mechanism - the broad Project must close (marked Superseded, with explicit user acknowledgment) as the focused Project begins. This is not a new transition type.
+
+Terminal states (three):
+- **Completed** - all Persistent Work has reached a terminal disposition (Completed or Accepted-as-is), and no unresolved memory questions remain. This is the only state that triggers full celebration ("You transformed this Space.").
+- **Abandoned** - the user explicitly ends the effort without resolving everything. [Decision] Must be an explicit user statement, never inferred from inactivity or elapsed time - inferring abandonment from time alone would violate the already-adopted "Observation Does Not Establish Evaluation" principle. Uses the same "Not now"-family explicit-exit pattern already established elsewhere in the product, scoped to the Project level.
+- **Superseded** - a new Project begins on a scope (Space or Location Reference) that already has an unfinished active Project on the same or overlapping ground. [Decision] Resolved 2026-08-01 (previously recorded Open in Section 9): starting a new Project on a scope that already has an unfinished active Project ALWAYS requires explicit user acknowledgment before the new Project begins - never silent, never inferred from inactivity, consistent with the same requirement already governing Abandoned.
 
 ### Persistent Work
 
-- A Space-owned object with stable identity.
-- Survives beyond the Session that created it.
+- A Project-owned object with stable identity. [Decision] Ownership changed from Space to Project on lifecycle-alignment grounds: Persistent Work comes into existence when a Project begins and reaches a terminal state when the Project completes, so it is owned by whatever shares its lifecycle.
+- The Project-owned durable record of work jointly considered by Companion and the user for this transformation effort, including disposition - not just active/unfinished items.
+- Survives beyond the Session that created it, within the Project that owns it.
 - Persists as the exact item, not a summarized version of it.
-- Can resurface in later Sessions for the same Space.
-- Lifecycle states: pending, deferred, completed, removed.
+- Can resurface in later Sessions within the same Project.
+- Status model: Active / Carried / Completed / Accepted-as-is / Needs-Review (Resurfaced). [Inference] Completed and Accepted-as-is are different claims: Completed is a physical-world claim, falsifiable by evidence; Accepted-as-is is a user-intent claim, not falsifiable by evidence alone.
+- Each item retains both a concrete suggestion (what Companion actually proposed) and an abstracted goal (the underlying work, used for matching - see DecisionLog.md, "Persistent Work Item Identity and Matching").
 - Deferral evidence (count/history) is preserved without yet assigning behavioral meaning to it.
-- Remove terminates the exact item and prevents resurfacing. It does not, by itself, create a durable preference against similar future suggestions.
+- Remove terminates the exact item and prevents resurfacing. It does not, by itself, create a durable preference against similar future suggestions. [Observation] The five-state status model above does not obviously include this prior "Remove" state - whether Remove now maps onto Accepted-as-is, remains a distinct sixth state, or needs its own reconciliation is not resolved here; recorded as open in Section 9.
 - Does not become globally independent merely by persisting.
+
+Clarifications:
+- Resurfacing language ("this came back around") is scoped to within one Project only. If a Project has genuinely completed and later evidence shows the same area needs attention again, that is a new Project's concern, not a contradiction of the prior one - different phrasing applies ("looks like this could use another pass"), since nothing is being contradicted; the world simply changed after a real completion.
+
+### Session
+
+[Decision] Session is a stable-identity, Project-owned event representing one bounded period of Companion interaction. It owns the evidence, Batches, and decisions produced during that period, but it does NOT own Persistent Work or Project completion. Multiple Sessions may advance one Project.
+
+Fields: stable `id`, owning `projectId`, start timestamp, end timestamp (nullable while active), lifecycle status.
+
+Lifecycle states: active | paused | ended | interrupted. [Rationale] Deliberately excludes "completed" - that word already carries a specific, weighted meaning at the Project level (all Persistent Work resolved, triggers real celebration). Reusing it for a Session simply ending for the day would recreate the exact vocabulary collision the Project/Session split was designed to fix, one level down. A Session just stops ("ended"), with no completion claim implied.
+
+Resume-boundary rule: [Decision] A brief/technical interruption (e.g., app backgrounded briefly) may resume the SAME Session. A deliberate stop-for-now ends that Session; returning later begins a NEW Session within the same Project. [Consequences] This reconciles two mechanisms already built independently this project without requiring rework of either: Journey 3's mid-batch pause is the same-Session-continuation case; Journey 4's Return Decision interstitial (which only appears after a real departure) is the new-Session case. The exact technical threshold for "brief" vs. "deliberate stop" is left as an implementation policy, not specified architecturally here.
+
+Clarifications - what Session identity does NOT mean, stated explicitly to prevent future misreading:
+- Unfinished work does not belong to the Session - it belongs to Persistent Work, owned by the Project.
+- A Session does not need to persist as an active object forever.
+- Resuming later does not necessarily mean reopening the identical Session.
+- Project completion never depends on any single Session completing.
 
 ### Location Reference
 
@@ -196,6 +269,8 @@ Once a term or symbol has a precise architectural meaning, it may not be reused 
 | Basis | Recommendation | The current-session observation supporting a recommendation. Not the same as a Remembered Statement's Evidence. | No |
 | Applies To | Recommendation | The location or object the recommendation concerns. Not the same as a Remembered Statement's Scope. | No |
 | ✓ (checkmark) | Whatever object carries completed task state (e.g. a batch checklist item) | Task or capability completion. | No - must not be reused for preference-acceptance acknowledgment or any other confirmation. |
+| Project | Project object | The long-running effort to transform a Space, spanning multiple Sessions, from Starting Evidence to a terminal state. | No - must not be used loosely (e.g. "the Companion project") when referring to architecture. |
+| Session | Session object | A stable-identity, Project-owned event representing one bounded period of Companion interaction. | No - must not be used loosely for any interaction boundary in general prose when referring to architecture. |
 
 Rule: Before introducing a new architectural term or symbol, verify it isn't already reserved. If an existing one seems applicable but means something different, create a new term instead of overloading it.
 
@@ -203,11 +278,7 @@ Rule: Before introducing a new architectural term or symbol, verify it isn't alr
 
 ## 7. Temporary Concepts
 
-### Session
-
-- A temporary interaction boundary.
-- Consumes evidence and existing understanding, produces immediate guidance, and may create or update persistent records.
-- Is not itself durable memory.
+**Session, superseded 2026-08-01:** previously recorded here as "a temporary interaction boundary... not itself durable memory." Promoted to a full Settled Object with stable identity - see Session, Section 4, and DecisionLog.md, "Session Given Stable Identity, Project Remains the Durable Owner." Left here as a marker, not deleted, so the correction is visible.
 
 ### Observation
 
@@ -249,6 +320,8 @@ A lifecycle event recorded on Persistent Work, not a separate object. See Decisi
 - Whether repeated deferral of Persistent Work should independently produce behavioral memory (data is being preserved specifically to allow this to be answered later from evidence).
 - Cross-cutting deletion behavior (Space deletion, account deletion) for each of the four durable responsibilities - explicitly deferred to LifecycleModel.md, not answered here.
 - Claim Identity for Remembered Statements: how Companion determines whether two explicit statements concern the same claim, overlapping claims, or independently scoped claims, and what relationship, if any, exists between them. Deferred to Journey 5.1. Recency alone does not establish supersession.
+- Project Superseded terminal state: whether starting a new Project on a scope with a still-Active prior Project requires the user to first acknowledge the old one is being abandoned/superseded, or whether this can happen silently. **Resolved 2026-08-01** - always requires explicit acknowledgment, never silent. See the Project entry in Section 4 and DecisionLog.md, "Project Scope Model - Space or Location Reference, Not Space-Only." Left here, marked resolved rather than deleted, so the history of this question is visible.
+- Persistent Work's Remove state versus its new five-state status model (Active / Carried / Completed / Accepted-as-is / Needs-Review): whether Remove now maps onto Accepted-as-is, remains a distinct state, or needs its own reconciliation is unresolved.
 
 ---
 
@@ -259,4 +332,5 @@ A lifecycle event recorded on Persistent Work, not a separate object. See Decisi
 - **SpaceMemoryModel.md** - what Durable Memory means and its categories.
 - **LifecycleModel.md (forthcoming)** - how these objects change over time.
 - **PersistenceModel.md (forthcoming)** - how this model is stored.
+- **SpaceImplementation.md** - the implementation-facing contract for Space specifically (fields, ownership classification, Firestore topology, lifecycle flows, migration requirements). This document states Space's settled invariants; SpaceImplementation.md translates them into an implementation contract without amending them.
 - **DecisionLog.md** - the reasoning, evidence, and revisit conditions behind every decision in this document. This document states conclusions; DecisionLog.md explains why they were reached.

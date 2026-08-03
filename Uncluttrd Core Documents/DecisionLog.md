@@ -9,7 +9,162 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ---
 
+## 2026-08
+
+### 2026-08-01 — Session Given Stable Identity, Project Remains the Durable Owner
+[Decision] Session is promoted from an informal/implicit boundary to a stable-identity Project-owned event object.
+
+[Rationale] A Session must answer concrete later questions - which photos/batches occurred during a specific visit, which items were completed/carried/dismissed/resurfaced during it, when it started and ended, what triggered its end. Without a stable Session ID, these events are only loosely groupable by timestamp or by whatever happens to sit in currentBatch at a given moment, risking one visit's evidence or decisions being misattributed to another.
+
+[Consequences] MatchCandidate (from the item-identity/matching mechanism, already committed) and Persistent Work status transitions must carry a sessionId field alongside their existing fields, so "which Session produced this specific change" remains answerable. This was not part of the original matching-mechanism specification and is being added here as a required field, not a new mechanism.
+
+---
+
+### 2026-08-01 — Project Scope Model — Space or Location Reference, Not Space-Only
+[Decision] Every Project has an explicit scope (Space or one Location Reference). Overlapping active Projects on the same physical area are not permitted: a Space may have either one active Space-scoped Project, or several concurrent active Location-Reference-scoped Projects, but never both covering the same ground at once. Superseding an active Project - whether by direct conflict on the same scope, or by narrowing scope (e.g., Kitchen → Coffee Station) - always requires explicit user acknowledgment, never silent inference. This supersedes the earlier "0 or 1 active Project per Space" framing outright; that framing is marked superseded, not deleted, in ObjectModel.md's Project entry and Section 9.
+
+[Rationale] The earlier Space-only framing didn't account for a real case: a user may legitimately want to run a focused Coffee Station effort and a separate under-sink-cabinets effort at the same time, without either blocking the other or being forced to share one undifferentiated memory. The overlap problem this raises is real - two active Projects could, in principle, both touch the same physical area and produce conflicting Persistent Work - but nothing in the repository yet demonstrates that problem needs a general conflict-resolution system to handle it. The simpler rule adopted here (one broad Project OR several non-overlapping focused Projects, never both on the same ground, with any conflict resolved through the existing Superseded mechanism rather than a new one) fully closes the overlap gap for the cases actually described, without inventing new machinery ahead of evidence that anything more complex is warranted. This is the same discipline already applied elsewhere this session: prefer the smaller model that closes the known gap, revisit only if a real case demonstrates it's insufficient.
+
+[Consequences] This entire model - Space, Location Reference, Project - currently exists only as architecture. Direct code verification this session confirmed Space itself has no implementation (no `spaceId` field, no `spaces` collection, no linkage between multiple analyses of the same physical space), and Location Reference has zero implementation anywhere either. This architecture is the target to build toward, not a description of current behavior. Implementing persistent Space is the actual prerequisite for any of this becoming real - Project's scope model, in particular, cannot be meaningfully built before Space and Location Reference themselves exist in code.
+
+---
+
+### 2026-08-01 — Persistent Work Item Identity and Matching
+[Decision] Persistent Work item identity is preserved automatically only when identity has already been established, either through stable ID lineage (e.g., explicitly carried-forward items) or prior user confirmation. Semantic or visual similarity between a new Recommendation and existing Persistent Work may only PROPOSE a match - it may not merge histories, inherit status, reopen completed work, or resurrect accepted-as-is work without structured user confirmation.
+
+[Rationale] Prevents the same category of overreach already disallowed elsewhere (AI silently judging item independence, AI silently reconciling completion mismatches) - an AI's informal judgment that two things are "the same" is inference, not established fact, and applicability must be established through structured capture, not assumed from similarity.
+
+Match candidate states: proposed, confirmed_same, confirmed_different, deferred. If deferred (user selects "not now" / ignores it), the new item remains its own separate active item - no merge occurs, no timeout auto-resolves it. Companion should not re-ask during the same Session; revisit only when the unresolved relationship creates a real user-facing consequence (both items appearing together, one being completed/dismissed).
+
+Matching inputs: owning Space/Location Reference, abstracted goal, original and later suggestion text, relevant objects/area, prior disposition, current visual evidence - text similarity alone is insufficient.
+
+[Consequences] This is the technical prerequisite that makes the resurfacing UX (both directions - contradicted-done and satisfied-undone) honestly deliverable. Without it, "this came back around" cannot be truthfully claimed, since nothing currently links a new AI-generated suggestion back to a specific prior item.
+
+---
+
+### 2026-08-01 — Match and Memory Resolution Happens at Project/Session Boundary, Not Mid-Work
+[Decision] Any unresolved match candidates, ambiguous dismissals, or other "what should Companion remember" questions are batched and resolved at the end of a working Session (after the completion/encouragement moment, not before it), not interrupted into the middle of active organizing work.
+
+[Rationale] Separates "helping the user make progress" (the Session's job) from "keeping Companion's memory accurate" (bookkeeping). Interrupting active work to ask identity-matching questions is friction unrelated to the task at hand. Presented as a simple batched review ("A few things need your input before I remember today's progress"), not multiple modal interruptions.
+
+[Consequences] This ordering is a Session-level pattern for how unresolved memory questions get surfaced. It is explicitly NOT yet generalized into a formal governing principle for other kinds of unresolved state - noted as a real, working pattern worth testing against future cases before promoting it into ArchitecturalReasoningStandard.md.
+
+---
+
 ## 2026-07
+
+### 2026-07-31 — Journey 3 — Batch Is the Unit of Recommendation Applicability
+[Decision] The batch, not the individual item, is Companion's unit of recommendation applicability. Once a batch is generated and presented, all its items remain actionable for the duration of the session without requiring a new photo between individual completions. Applicability is re-established, for the batch as a whole, at the next natural evidence boundary (the next progress photo).
+
+[Rationale] This is adopted directly as a product decision, not derived as a logical necessity from the Class 1 principles alone - a prior architectural investigation into whether AI-instructed item independence could itself satisfy the Evidence Boundary was suspended without a conclusion (see the unresolved first-order/second-order inference question). This decision doesn't require that question to be resolved: rather than attempting to prove in advance that sibling items are independent, the system instead commits (see the companion decision below) to honestly detecting and surfacing cases where that assumption turns out to be wrong, rather than silently absorbing the discrepancy. This resolves the underlying Evidence Boundary concern through correction rather than advance proof.
+
+[Consequences] Resolves Journey3.md's O15 (evidence-first vs. trust-then-verify pacing question): trust-then-verify, bounded by the batch's own next photo, same shape as the already-shipped batch-to-batch mechanism, now deliberately adopted at this grain too, for this stated reason. Journey 4's "historical session context" language is confirmed consistent with this decision - Journey 4 already treated the resumed batch as one coherent unit, matching this decision's grain exactly. No amendment to Journey4Reconciliation.md is required.
+
+---
+
+### 2026-07-31 — Journey 3 — Mismatched Items Must Be Surfaced, Not Silently Reconciled (Supersedes Prior Silent-Reconciliation Instruction)
+[Decision] This explicitly supersedes the "don't call out the discrepancy" instruction in the batch-generation AI prompt (established by the 2026-07-18 "Companion batch workflow" decision). Going forward: if a fresh progress photo shows an item previously marked "checked" was not actually addressed, Companion must resurface that item rather than silently generating around it. The resurfaced item must reach one of two explicit terminal states before it is treated as resolved: (a) the user confirms it's acceptable as-is (explicit dismissal), or (b) the user completes it. Until either occurs, the item continues to be resurfaced at future evidence checkpoints.
+
+[Rationale] Adopted directly as a product decision. Not treating this as a Provenance Addendum - the original "don't call out the discrepancy" instruction wasn't factually wrong when written, it was a legitimate design choice being deliberately changed here, not corrected.
+
+[Consequences] A session's completion state (the celebratory "you're done" moment) is withheld while any resurfaced item remains unresolved. This does NOT block navigation, pausing, or leaving the session at any point - the user can always exit freely, consistent with every other flow in this product (Journey 1's "Not right now," Journey 3's own "Pause Session," Journey 4's return choice). Only the completion trigger itself waits on resolution. Implementation will need to identify existing item-status machinery (carried/skipped statuses already exist in currentBatch.items) and determine whether they already support this behavior or need extension - flagged for implementation, not decided here.
+
+---
+
+### 2026-07-31 — Journey 2: Recovery Escalation Governing Principle
+**Decision:** A recovery flow may escalate only when Companion has learned something new and user-relevant since the prior stage - repetition of the same failure is itself new evidence exactly once (that the attempt is not resolving), but escalation is never justified by failure count alone once no further new evidence exists. Further escalation requires genuinely new evidence, not merely additional attempts.
+**Rationale:** This generalizes the reasoning already applied separately to Journey 2's two recovery flows into a single, explicit test, rather than leaving each flow's stopping point as an unexplained coincidence. It follows directly from the Evidence Boundary: Companion may act on what repetition itself establishes (that the failure is persisting, not resolving), but attempt count beyond that point is not itself evidence of anything - it is just more attempts. Treating failure count alone as license to keep escalating would let the UI imply an evaluation ("this is getting worse," "we should try something different") that no observation actually supports.
+**Evidence considered:** Journey2.md Section 5's now-settled Upload Failure and Recovery Lifecycle entries, both of which independently stopped at a single escalation step; the 2026-07-31 "Journey 2: Upload Failure Escalation and Recovery" decision; the project's Evidence Boundary and Observation ≠ Evaluation principles.
+**Consequences:** Observed, not defined by this rule: applied to both of Journey 2's recovery flows, this test currently produces exactly one escalation each. That is a fact about the evidence available in those two flows today, not a hard cap this principle imposes on future recovery flows - a flow with a genuinely different evidence profile could justify a different number of stages under the same test. Separately: pause ("Not now") must remain an explicit, first-class option in any recovery flow, never an implicit escape the user has to discover on their own.
+**Related artifacts:** Journey2.md (Section 5, Upload Failure and Recovery Lifecycle settled entries), "2026-07-31 — Journey 2: Upload Failure Escalation and Recovery."
+
+---
+
+### 2026-07-31 — Journey 2: Upload Failure Escalation and Recovery
+**Decision:** Journey 2's "Upload failed" recovery flow (O18) escalates its messaging based on attempt count, not elapsed time. Attempts 1-2 use the original wireframe copy unchanged: "We couldn't upload your photo. Check your connection and try again." Beginning at attempt 3, the copy changes to: "We're still having trouble uploading your photo. It doesn't look like this is resolving. You can try again in a moment, or come back to this later." This attempt-3 copy reports only the observed fact of persistence - it makes no diagnosis of cause and does not imply eventual success. Escalation stops at attempt 3; no further copy changes occur on attempts 5, 8, 12, or beyond, since repetition beyond confirmed persistence adds no new evidence. Starting at attempt 3, a secondary "Not now" text-link action appears alongside "Try Again," matching the pattern already established by Journey 1's "Not right now" and Journey 3's "Pause Session." "Not now" pauses the upload attempt only: it exits the upload flow, leaves the current organizing session intact, preserves existing progress, and lets the user resume later exactly where they left off. It is not a cancellation.
+**Rationale:** Attempt-based triggering (rather than time-based) treats repetition itself as the evidence Companion is entitled to act on, consistent with the Evidence Boundary - persistence across attempts is something Companion can honestly observe, while elapsed time alone establishes nothing about cause. The attempt-3 copy is deliberately restricted to reporting persistence rather than diagnosing cause (no "check your connection," no speculation about Wi-Fi or signal) for the same reason: Companion has no basis to know the actual cause of an upload failure, and asserting one would violate the same Evidence Boundary already governing Insufficient Evidence Recovery. Escalation is capped at one step, not a ladder, because after persistence is confirmed at attempt 3, no additional attempt count produces new information - there is nothing further to honestly say. The "Not now" action is required, not optional, because without it a user stuck on a persistently failing upload has no honest exit that preserves their session progress; forcing continued retries or an implicit abandonment would both be worse than an explicit, honest pause.
+**Evidence considered:** Journey2.md Section 5 (Upload Failure item and its prior candidate-principle observation, not yet adopted); Journey2.md O18 (original wireframe copy for "Upload failed"); the established "Not now"/"Pause Session" pattern from Journey 1 and Journey 3; the project's Evidence Boundary and Observation ≠ Evaluation principles.
+**Consequences:** Client implementation must track a per-upload-attempt counter (not a timestamp) to select between the two copy variants. The "Not now" action must route through the same pause mechanism already used elsewhere in Companion (exits the current flow, preserves session state, resumable later), not a distinct or ad hoc implementation. This decision does not extend to Insufficient Evidence Recovery's escalation, which remains a separate, not-yet-decided design question per Journey2.md Section 5's existing dependency note (cause-specific coaching copy is gated on a trigger mechanism that does not yet exist).
+**Related artifacts:** Journey2.md (Section 5, Upload Failure item and its closing Observation).
+
+---
+
+### 2026-07-30 — Soft Update-Availability Nudge
+**Decision:** The client checks the installed app version against `config/appVersion` (Firestore, per-platform `ios`/`android` fields) once per app launch, and shows a dismissible nudge, "A new version of Uncluttrd is available," with "Update Now" (deep-links to the correct App Store/Play Store listing) and "Not Now" (dismisses). This is explicitly a soft nudge, never blocking app usage - no minimum-required-version or forced-update mechanism exists or is planned as part of this decision.
+**Rationale:** Users on stale builds miss fixes silently, with no existing signal telling them a newer build exists. A soft, dismissible nudge closes that gap without the cost/risk of a forced-update flow, which is a materially bigger decision (server-enforced minimum versions, blocking screens) explicitly out of scope here.
+**Implementation notes:** Version comparison is plain dot-separated-integer comparison (`isVersionBehind`, App.js) - no semver dependency added. The nudge is suppressed for 24h after being shown, tracked via a single AsyncStorage timestamp (`lastVersionNudgeShownAt`) written the moment the alert is shown, not only on "Not Now" - this also covers "don't reappear this session" as a side effect, since 24h always exceeds one session. Gated on `IS_PRODUCTION`; staging builds aren't distributed via the stores, so there's nothing to compare against. `config/appVersion` is public-read, never client-writable (firestore.rules) - it must be updated manually (Firebase Console or an Admin SDK script) after each store release, or the nudge will never fire.
+**Consequences:** `config/appVersion` must be kept current after every App Store/Play Store release, or the feature silently does nothing (never a false positive - a missing/stale doc just means no nudge, a safe failure mode, but a real operational dependency). No new npm dependency, no new native module - stays OTA-eligible.
+**Related artifacts:** App.js (`checkForAppUpdate`, `isVersionBehind`), firestore.rules (`config/{document}`).
+
+---
+
+### 2026-07-30 — Product Scope Decision: Insufficient-Evidence Recovery Capability
+**Decision:** Companion intentionally includes a recovery path for cases where it cannot obtain sufficient evidence to perform a trustworthy analysis, defined by the trustworthiness of the resulting analysis (can Companion justify making observations from this evidence), not by specific image-quality heuristics like blur or darkness — those are one possible cause among several (extreme close-up, near-total obstruction, a blank/black frame, etc.). The triggering mechanism is explicitly left undecided as an implementation detail — client-side heuristic, AI-judged, or otherwise.
+**Rationale:** This decision is motivated by, and consistent with, the project's existing Evidence Boundary principle (Companion should not assert what it hasn't established), extended to cover analysis inputs, not just output claims. It is recorded here as a deliberate product choice in that spirit, not as something the Evidence Boundary as previously defined strictly required — attempting analysis on any input and producing appropriately hedged output would not, on its own, have violated the existing principle. This decision chooses the more conservative path deliberately.
+**Evidence considered:** Journey2.md Section 5 (confirmed: no corresponding implementation exists anywhere in functions/index.js or App.js — this is a genuine gap, not an undocumented existing behavior); the project's Evidence Boundary and Observation ≠ Evaluation principles.
+**Consequences:** A real recovery flow must be designed and implemented; none currently exists. Trigger mechanism and the recovery flow's UX (Journey2.md's Questions 3 and 4) remain separate, later decisions.
+**Related artifacts:** Journey2.md, DecisionLog.md's Evidence Boundary entries.
+
+---
+
+### 2026-07-30 — Architecture Decision: Active Location Persists Across Inter-Journey Handoffs
+**Decision:** An active Location is preserved across inter-journey handoffs by default, unless a subsequent journey intentionally changes or exits that context.
+**Rationale:** The original Journey 1 → Journey 2 decision was scoped narrowly to that one handoff, but its underlying reasoning, protecting continuity of user intent and context across a workflow boundary, was never actually specific to that pair of journeys. The repository first established the rule for Journey 1 → Journey 2; this entry recognizes that reasoning as an instance of a broader architectural rule, rather than claiming the general rule existed all along.
+**Evidence considered:** "2026-07-30 — Journey 1: Take Photo Transition" and its Provenance Addendum; Journey2.md Section 5 (Question 2, confirmed NOT SETTLED as a general rule prior to this entry).
+**Consequences:** The Journey 2 → Journey 3 handoff, and any future inter-journey handoff, must preserve the active Location by default. A future journey that intentionally changes or exits Location context must do so explicitly.
+**Related artifacts:** "2026-07-30 — Journey 1: Take Photo Transition," its Provenance Addendum, Journey2.md.
+
+---
+
+### 2026-07-30 — Journey 1: Session Screen Heading and Carry-Forward Language
+**Decision:** The Journey 1 resumption screen's heading communicates continuity of work, not ownership or calendar time (leading candidate: "Picking up where you left off," or wording in the same emotional register — exact final copy remains flexible within that register). The carry-forward items are described as "You asked to come back to..." — reflecting an established historical fact, not inventory framing ("chose to keep" was rejected for this reason).
+**Rationale:** The heading should do the same job "Welcome back" does on Screen 1 — evocative and functionally clear at once, not a screen label. "Your Session" and "Today's Session" (the artifact's own internal inconsistency) both fail this test. "Today's Focus" was considered and explicitly rejected as a candidate here — it originated later, during Journey 3's design work, and was never adopted as a Journey 1 decision (verified via a Stage 1 check against DecisionLog.md and ObjectModel.md); using it now would need to be a deliberate, separate decision, not an unconscious carryover.
+**Evidence considered:** Journey1.md Section 3 (O9, "Welcome back" as the Screen 1 precedent); Journey1.md Section 5 (the internal "Your Session"/"Today's Session" and "asked to come back to"/"chose to keep" inconsistencies); the project's Evidence Boundary principle and Observation ≠ Evaluation.
+**Consequences:** Final heading copy for Journey 1's second screen must be selected from the "continuation" register, not the "commitment" or "place" register (see the 2026-07-30 Growing Kept-Items List Behavior entry below for why those registers were named and ruled out for a different, related case).
+**Related artifacts:** Journey1.md, DecisionLog.md's Evidence Boundary entries.
+
+---
+
+### 2026-07-30 — Journey 1: Space/Location Relationship (Kitchen ↔ Coffee Station)
+**Decision:** The user returns to a Space and resumes work at a recurring Location within that Space. The Space provides continuity and context; the Location provides the immediate focus of the organizing session. The transition from Space to Location must be communicated explicitly to the user, never assumed or left implicit.
+**Rationale:** Users think "I'm back in my Kitchen" first, and "I'm working at the Coffee Station" second — a nested mental model, not a flat one and not one where the Location supersedes the Space. This independently converges with ObjectModel.md's existing Location Reference definition ("a recurring, user-recognizable sub-location... does not require promotion into an independent Area object") without having been designed with that definition in mind.
+**Evidence considered:** Journey1.md Section 3 (O11 "Current Space: Kitchen," O16/O25 "Coffee Station" with no stated relationship); ObjectModel.md's Location Reference definition.
+**Consequences:** Future UI must show the Kitchen→Coffee Station zoom explicitly (exact copy/typography not yet decided — remains open). This also resolves how a growing kept-items list could later group by Location without promoting any Location to Space-equivalent status (relevant to the Growing Kept-Items List Behavior entry below).
+**Related artifacts:** Journey1.md, ObjectModel.md (Location Reference).
+
+---
+
+### 2026-07-30 — Journey 1: Take Photo Transition
+**Decision:** The transition from Journey 1 to Journey 2 should communicate uninterrupted forward momentum. Tapping "Take Photo" should lead directly into the camera experience without introducing additional instructional, explanatory, or ceremonial steps. Any transition motion should serve only as immediate interaction feedback, not as a separate stage in the journey. The transition must also preserve the active Location context (e.g., Coffee Station) so that the camera experience begins with the correct location already established, consistent with Journey 2's documented expectation of a known location context.
+**Rationale:** Journey 2's own wireframe explicitly states its happy path as "Camera opens immediately... One calm instruction. No explanation. No ceremony," which rules out instructional or ceremonial transition content — that responsibility already belongs to Journey 2, not to this handoff. Journey 2's wireframe also displays a persistent Location badge on every screen, meaning it already assumes the active Location is known at camera-open — the transition must carry that context forward, not just get the user to the camera.
+**Evidence considered:** Journey 2 wireframe (happy path description; persistent Location/Coffee Station badge present on every screen of the happy path, reshoot loop, and insufficient-evidence recovery flow).
+**Consequences:** Journey 1's implementation must pass the active Location through to Journey 2's entry point as part of this transition.
+**Related artifacts:** Journey1.md, Journey 2 wireframe (once its own transcription/reconciliation happens).
+
+---
+
+### 2026-07-30 — Provenance Addendum
+**Addends:** 2026-07-30 — Journey 1: Take Photo Transition.
+Direct inspection during the creation of Journey2.md found that the Journey 2 wireframe contains a single page-level Coffee Station / Location badge rather than a repeated badge on every individual screen, contrary to the wording used in that entry's rationale. This finding does not affect the underlying decision that Journey 1 must preserve the active Location across the transition into Journey 2; it only narrows the supporting UI observation. See Journey2.md Section 3 (O3) for the verified artifact transcription, and Section 6 for the direct comparison against this entry's original wording.
+
+---
+
+### 2026-07-30 — Journey 1: Growing Kept-Items List Behavior
+**Decision:** The interface communicates a starting point, not a priority ordering, regardless of how many carry-forward items exist. A structure in the shape of "We'll start here" (one or a small set of items that continue the session) plus "More to come back to later" (the remainder, mechanism not yet decided — expandable, scrollable, or otherwise) preserves this. The lower items must never be implied to be less important — only that they aren't where today's session begins.
+**Rationale:** Journey1.md's own Screen 2 rationale (O22) states "'We'll start with' is an intention, not a priority" — this already rules out any design that implies sequence-as-importance (sorting by priority/urgency/age, "X remaining," "overdue," etc.) for a single item, and that same principle extends to a full list. "Visible accumulation" as an emotional target was also explicitly rejected — it conflicts with the artifact's own "No scores / No percentages" callout (O7).
+**Evidence considered:** Journey1.md O7, O22.
+**Consequences:** Whatever specific list-behavior implementation is chosen (collapsible sections, scrolling, progressive disclosure, etc.) must be evaluated against this principle before being finalized.
+**Open Design Detail (explicitly NOT part of this decision, left for implementation):** whether the "start here" set is always exactly one item or can be a small set of two or three — this is an implementation detail of the decision above, not a separate design decision.
+**Related artifacts:** Journey1.md.
+
+---
+
+### 2026-07-29 — Space Promoted to Persistent First-Class Object
+**Decision:** Approved: Space is a persistent first-class object with independent identity, ownership, lifecycle, and relationships. Every new analysis must be associated with a Space through explicit user confirmation, by selecting an existing Space or creating a new one. The system may suggest an association but may not establish or merge Space identity through inference.
+**Reason:** Space association is separate from the Decision-Dimension Taxonomy because it establishes identity before any Recommendation exists.
+**Outcome:** Approved.
+
+---
 
 ### 2026-07-27 — Recommendation Promoted to First-Class Object
 **Decision:** Recommendation is promoted to a first-class object.
@@ -148,6 +303,12 @@ Consequences: Pause can remain low-friction, since no classification question is
 
 **Use instead:** The interface may show Today's Focus, the current action, practical guidance for that action, Retake or refresh evidence controls where required, Pause or adjust controls, and the next action once it becomes trustworthy. The interface must not show a complete numbered plan, a fixed step count, an upfront execution roadmap, or future actions presented as settled commitments.
 **Revisit when:** Revisit only if the product later gains reliable, user-visible evidence that can support stable future actions, such as continuous visual observation or explicit user confirmation of the complete session strategy. Until then, Journey 3 must use reveal-as-you-go presentation.
+
+---
+
+### 2026-07-30 — Provenance Addendum
+**Addends:** 2026-07-26 — Session Generation and Session Presentation Are Separate Architectural Concerns.
+Verification conducted 2026-07-30 found that this entry's language - "recommend one trustworthy action, observe again" - uses "action" to mean a single discrete item, consistent with the repository's usage since the 2026-07-13 founding design ("Companion Experience, Session 1"). This does not match shipped behavior: the 2026-07-18 "Companion batch workflow" decision (predating this entry by 8 days) established that both analyzePhoto and generateNextAction shifted to multi-item batches, with no stated exception preserving single-item behavior for the first reveal - confirmed directly against firstActionBatch's shipped prompt instructions ("a small checklist... not a single tiny step"). This entry's singular "one trustworthy action" language does not reflect that already-adopted architecture. This finding does not resolve what "single-trustworthy-action" should mean going forward - see the separately planned investigation into that principle's current status.
 
 ---
 
@@ -624,6 +785,12 @@ The free funnel has no `planId` to correlate against, since free-tier plans are 
 **Outcome:** Approved. Session 1 architecture is final. Reference: `Uncluttrd Core Documents/CompanionDesignPrinciples.md`, created alongside this decision as the standing filter for evaluating this and future features.
 
 **Impact:** Product, Architecture, Monetization, Brand voice
+
+---
+
+### 2026-07-31 — Provenance Addendum
+**Addends:** 2026-07-13 — Companion Experience (Session 1): Free/Pro Split and Design Principles.
+The full Single-Trustworthy-Action Principle investigation (2026-07-31) found that this entry's Decision field — "the app surfaces one personalized action" — no longer matches shipped code at the UI-presentation level: BatchChecklist's first reveal (firstActionBatch) presents a multi-item checklist, not a single action, per the 2026-07-18 batch-workflow decision, which took no exception for this founding entry. This entry's other content (the guided-loop structure, the progress-photo invitation, the Free/Pro split, the standing implementation constraint) is unaffected by this finding and remains current. This addendum corrects only the "one personalized action" presentation claim. It does not propose replacement wording — the investigation found that "single-trustworthy-action" names at least four distinct claims (UI rendering, session-scope boundary, interaction pacing, cognitive load) that have drifted apart since 2026-07-18, at different rates and to different degrees; a full restatement, if warranted, is deferred to its own separate session, not undertaken here.
 
 ---
 
