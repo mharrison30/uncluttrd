@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -89,70 +89,52 @@ const SHADOW_SCHEMA_VERSION = 1;
 // failed). Kept separate from writeSpaceShadowStructure specifically so
 // it can be unit-tested (idempotency, field-mapping correctness)
 // without a Firestore connection.
+//
+// Delegates to deriveFullReprojectionDocs - the same shared derivation
+// forceFullReprojection/syncPlanToSpaceGraph already use
+// (MigrationSyncAlignmentDesign.md) - rather than keeping its own
+// separate inline shape. Discovered during Remembered Home v1 Step 1
+// testing (required test g) that this creation-time path had never been
+// brought into that alignment: it built its own single-Session,
+// bare-planId-named session document and never wrote migrationVersion,
+// so checkMigrationCompleteness reported every freshly-created plan as
+// incomplete from the moment of creation - self-correcting only once a
+// live mutation happened to sync it (via syncPlanToSpaceGraph), which
+// left the original bare-planId Session document orphaned behind (never
+// deleted, since Firestore writes don't delete siblings). Fixed by using
+// the exact same derivation everywhere, not a second copy of it.
 function buildShadowDocs({ planId, entry, photoUrl }) {
-  // entry is always a brand-new plan here (savePlanToHistory just wrote
-  // it), so entry.canonicalSpaceId is always absent - passed through
-  // anyway for consistency with every other computeShadowIds call site.
-  const ids = computeShadowIds(planId, entry);
-  const hasBatch = !!entry.currentBatch;
-  const batchIndex = hasBatch ? entry.currentBatch.batchIndex : 1;
-  const batchId = computeShadowBatchId(planId, batchIndex);
-  // creationStatus is "created" always - it is the only state a
-  // *persisted* shadow document can ever carry, since writeBatch's
-  // atomicity guarantees structural completeness (all four docs, or
-  // none). It is not a signal about evidence completeness - that's
-  // evidenceStatus, tracked independently, since photoUrl availability
-  // has nothing to do with whether the shadow structure itself is whole.
-  // A write that doesn't complete at all persists no document, so
-  // "failed" is never something a document could carry either - it's
-  // operational telemetry (a dlog line in writeSpaceShadowStructure's
-  // catch block), not document state.
-  const creationStatus = "created";
-  const evidenceStatus = photoUrl ? "complete" : "unavailable";
-  const provenance = { sourcePlanId: planId, shadowSchemaVersion: SHADOW_SCHEMA_VERSION, creationStatus, evidenceStatus };
+  // entry.canonicalSpaceId is absent for an ordinary first-time plan, and
+  // present for a Remembered Home v1 returning visit (RememberedHomeDesign.md
+  // §3 Point 3) - passed through either way so computeShadowIds resolves
+  // the correct target.
+  //
+  // entry itself does not yet carry photoUrl (the upload happens after
+  // the plan doc write that produces entry) - merged in here just for
+  // this derivation call, same as the pre-existing photoUrl parameter.
+  const derived = deriveFullReprojectionDocs(planId, { ...entry, photoUrl: photoUrl || entry.photoUrl || null });
+  // RememberedHomeDesign.md §3 Point 3: a returning visit (canonicalSpaceId
+  // present) targets a Space that ALREADY EXISTS and is already canonical -
+  // that's what Step 1 Point 2's validation, run before this is ever
+  // called, guarantees. The Space document write is therefore omitted
+  // entirely for a returning visit, not merged or partially overwritten -
+  // writeSpaceShadowStructure below never calls set() on it at all in that
+  // case. This is what makes the new Project purely additive: there is
+  // structurally no path left by which a Project-level creation can alter
+  // the Space's own displayName/createdAt/any other field. For a genuine
+  // first-time plan (canonicalSpaceId absent), this Space IS being created
+  // for the first time, so writing it here is correct and unchanged.
+  const isReturningVisit = !!entry.canonicalSpaceId;
   return {
-    ids: { ...ids, batchId },
-    space: {
-      ...provenance,
-      createdAt: entry.createdAt,
-      displayName: getSpaceDisplayName(entry),
-      activeProjectId: ids.projectId,
-    },
-    project: {
-      ...provenance,
-      scopeType: "Space",
-      scopeId: ids.spaceId,
-      status: "active",
-      // Preserves the plan.shadowSourceVersion -> project.sourceVersion
-      // relationship from the moment of creation, not just from the first
-      // later mutation - derived from entry's own field, never hardcoded,
-      // so this stays correct even if a plan is ever created with a
-      // starting version other than 1. This is the only field this fix
-      // adds; nothing else in this document, or the other three, changes.
-      sourceVersion: entry.shadowSourceVersion ?? 1,
-      startingEvidence: { photoUrl: photoUrl || null, capturedAt: entry.createdAt },
-      currentEvidence: { photoUrl: photoUrl || null, capturedAt: entry.createdAt },
-      createdAt: entry.createdAt,
-      completedAt: null,
-      abandonedAt: null,
-      supersededAt: null,
-    },
-    session: {
-      ...provenance,
-      projectId: ids.projectId,
-      startedAt: entry.createdAt,
-      endedAt: null,
-      status: "active",
-    },
-    batch: {
-      ...provenance,
-      batchIndex,
-      items: hasBatch ? entry.currentBatch.items : [],
-      suggestedAt: hasBatch ? entry.currentBatch.suggestedAt : entry.createdAt,
-      completedAt: null,
-      originalPhotoUrl: photoUrl || null,
-      progressPhotoUrl: null,
-    },
+    ids: derived.ids,
+    space: isReturningVisit ? null : derived.space,
+    project: derived.project,
+    // [{ id, data, batches: [{ id, data }] }] - reconstructSessionClusters
+    // applied to a brand-new entry (empty batchHistory, at most one
+    // currentBatch) always collapses to exactly zero or one Session,
+    // never more - multi-Session only arises later, from a real gap
+    // between subsequent batches.
+    sessions: derived.sessions,
   };
 }
 
@@ -171,15 +153,28 @@ function buildShadowDocs({ planId, entry, photoUrl }) {
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
   try {
     const shadow = buildShadowDocs({ planId, entry, photoUrl });
-    const { spaceId, projectId, sessionId, batchId } = shadow.ids;
+    const { spaceId, projectId } = shadow.ids;
     const batch = writeBatch(db);
-    batch.set(doc(db, "users", uid, "spaces", spaceId), shadow.space);
-    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId), shadow.project);
-    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId), shadow.session);
-    batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionId, "batches", batchId), shadow.batch);
+    // shadow.space is null for a returning visit (RememberedHomeDesign.md
+    // §3 Point 3) - the established Space document is never touched by a
+    // Project-level creation, purely additive by construction.
+    if (shadow.space) {
+      batch.set(doc(db, "users", uid, "spaces", spaceId), shadow.space);
+    }
+    const projectRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId);
+    batch.set(projectRef, shadow.project);
+    let batchCount = 0;
+    for (const session of shadow.sessions) {
+      const sessionRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id);
+      batch.set(sessionRef, session.data);
+      for (const b of session.batches) {
+        batch.set(doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id, "batches", b.id), b.data);
+        batchCount++;
+      }
+    }
     await batch.commit();
-    dlog(`[SPACE SHADOW] wrote shadow structure for plan ${planId} (evidenceStatus: ${shadow.project.evidenceStatus})`);
-    return { outcome: "written", evidenceStatus: shadow.project.evidenceStatus };
+    dlog(`[SPACE SHADOW] wrote shadow structure for plan ${planId} (sessionCount: ${shadow.sessions.length}, batchCount: ${batchCount})`);
+    return { outcome: "written", sessionCount: shadow.sessions.length, batchCount };
   } catch (e) {
     // A genuine atomic-write failure. No shadow docs exist for this plan
     // at all (writeBatch is all-or-nothing) - there is no document to
@@ -570,7 +565,11 @@ async function syncPlanToSpaceGraph(uid, planId) {
     const spaceRef = doc(db, "users", uid, "spaces", spaceId);
     const projectRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId);
 
-    const projectSnap = await tx.get(projectRef);
+    // Read the Space alongside the Project - both reads happen before any
+    // write, as every Firestore transaction requires. Whether the Space
+    // already exists decides which of the two payloads below gets written
+    // (Canonical Space Preservation - see deriveFullReprojectionDocs).
+    const [spaceSnap, projectSnap] = await Promise.all([tx.get(spaceRef), tx.get(projectRef)]);
     const existingVersion = projectSnap.exists() && typeof projectSnap.data().sourceVersion === "number"
       ? projectSnap.data().sourceVersion
       : -1; // no shadow yet - always proceed
@@ -587,7 +586,16 @@ async function syncPlanToSpaceGraph(uid, planId) {
     // file header). Added here, once, exactly as forceFullReprojection
     // does it.
     const now = serverTimestamp();
-    tx.set(spaceRef, { ...derived.space, syncedAt: now });
+    // Canonical Space Preservation: a brand-new Space gets the full
+    // document (creation); an already-existing Space is merge-written
+    // with ONLY the field(s) projection legitimately owns, leaving every
+    // creation-owned/user-owned/merge-owned field - including a retired
+    // Space's own tombstone fields - completely untouched.
+    if (spaceSnap.exists()) {
+      tx.set(spaceRef, { ...derived.spaceProjectionUpdate, syncedAt: now }, { merge: true });
+    } else {
+      tx.set(spaceRef, { ...derived.space, syncedAt: now });
+    }
     tx.set(projectRef, { ...derived.project, syncedAt: now });
 
     let batchCount = 0;
@@ -751,20 +759,30 @@ async function forceFullReprojection(uid, planId) {
     const spaceRef = doc(db, "users", uid, "spaces", spaceId);
     const projectRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId);
 
+    // Read before write, as every Firestore transaction requires -
+    // whether the Space already exists decides which payload gets
+    // written (Canonical Space Preservation - see deriveFullReprojectionDocs).
+    const spaceSnap = await tx.get(spaceRef);
+
     // syncedAt uses this SDK's own serverTimestamp() sentinel - the shared
     // derivation deliberately omits it, since the client and admin SDKs'
     // sentinels are different, incompatible objects. See
     // shared/spaceMigration.js's file header.
-    tx.set(spaceRef, { ...derived.space, syncedAt: serverTimestamp() });
-    tx.set(projectRef, { ...derived.project, syncedAt: serverTimestamp() });
+    const now = serverTimestamp();
+    if (spaceSnap.exists()) {
+      tx.set(spaceRef, { ...derived.spaceProjectionUpdate, syncedAt: now }, { merge: true });
+    } else {
+      tx.set(spaceRef, { ...derived.space, syncedAt: now });
+    }
+    tx.set(projectRef, { ...derived.project, syncedAt: now });
 
     let batchCount = 0;
     derived.sessions.forEach((session) => {
       const sessionRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id);
-      tx.set(sessionRef, { ...session.data, syncedAt: serverTimestamp() });
+      tx.set(sessionRef, { ...session.data, syncedAt: now });
       session.batches.forEach((batch) => {
         const batchRef = doc(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", session.id, "batches", batch.id);
-        tx.set(batchRef, { ...batch.data, syncedAt: serverTimestamp() });
+        tx.set(batchRef, { ...batch.data, syncedAt: now });
         batchCount++;
       });
     });
@@ -843,7 +861,25 @@ async function queryMergeCandidatesForBanner(uid) {
 // (shared/spaceMigration.js): the user's name becomes canonical: display,
 // detection, comparison, merge-candidate grouping.
 async function renameSpace(uid, planId, newName) {
+  // Canonical Space Preservation: read first so canonicalSpaceId (if this
+  // plan is a returning-visit Project) resolves the SAME target Space
+  // syncPlanToSpaceGraph below will - a rename must land on the shared
+  // established Space, not some other path.
+  const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+  const canonicalSpaceId = planSnap.exists() ? planSnap.data().canonicalSpaceId : null;
   await updateDoc(doc(db, "users", uid, "plans", planId), { spaceName: newName, shadowSourceVersion: increment(1) });
+  // displayName is user-owned (see deriveFullReprojectionDocs) - written
+  // here, directly and explicitly, never through the generic projection
+  // sync below, which deliberately excludes displayName from what it
+  // writes to an already-existing Space. Without this direct write, a
+  // rename would only ever "stick" until some OTHER Project under the
+  // same Space next syncs with its own, different spaceType/spaceName -
+  // silently reverting it. updateDoc (not set) so a missing Space
+  // document fails loudly into the catch below rather than being
+  // silently created as a malformed partial document.
+  const { spaceId } = computeShadowIds(planId, { canonicalSpaceId });
+  updateDoc(doc(db, "users", uid, "spaces", spaceId), { displayName: newName })
+    .catch((e) => dlog(`[SPACE RENAME] displayName propagation failed for space ${spaceId}: ${e.message}`));
   syncPlanToSpaceGraph(uid, planId).catch((e) => dlog(`[SPACE SHADOW SYNC] rename sync failed for plan ${planId}: ${e.message}`));
   return { outcome: "renamed", planId, spaceName: newName };
 }
@@ -1158,16 +1194,16 @@ const SLIDES = [
   },
   {
     icon: "✦",
-    title: "Get Your Space",
+    title: "Get Your Plan",
     subtitle: "Three budgets, endless possibilities",
-    desc: "Receive a personalized step-by-step organization space across Budget, Mid-Range, and Premium tiers. Or enter your exact budget.",
+    desc: "Receive a personalized step-by-step organization plan across Budget, Mid-Range, and Premium tiers. Or enter your exact budget.",
     bg: "#F3EEF9",
   },
   {
     icon: "🛍️",
     title: "Shop the Look",
     subtitle: "Curated products at every price",
-    desc: "Every space includes hand-picked product recommendations with direct product links. One tap and you're ready to transform your space.",
+    desc: "Every plan includes hand-picked product recommendations with direct product links. One tap and you're ready to transform your room.",
     bg: "#E6F7EE",
   },
 ];
@@ -2113,6 +2149,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // render, so a rename (which already patches `history` in place) is
   // reflected immediately with no separate patch target to keep in sync.
   const [spaceDetailPlanId, setSpaceDetailPlanId] = useState(null);
+  // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1): set by
+  // startOrganizeAgain when the user taps "Organize Again" from either
+  // entry point (History row, Space Detail's own button) - carries the
+  // target Space's id plus the specific plan item navigated from (its
+  // data captured once, here, in memory - so it survives that prior plan
+  // being deleted before analyze() runs, since nothing re-reads it from
+  // Firestore; see analyze()'s prior-context section). null means "this
+  // is an ordinary first-time analysis," the default, unchanged path.
+  // Consumed and explicitly cleared inside analyze() the moment it's
+  // used (success OR an invalid-target-space outcome) - deliberately NOT
+  // cleared on an earlier failure (network error, unparseable response),
+  // so retrying the same photo after a transient failure still targets
+  // the same Space. Also cleared by goHome()/reset(), same as `photo`/
+  // `results`/every other in-flight flow flag. Accepted edge case,
+  // consistent with how `photo` itself already behaves: if a user starts
+  // "Organize Again," cancels the photo picker without picking anything,
+  // and - without ever navigating through goHome() in between - later
+  // taps the same upload button for an unrelated fresh photo, that photo
+  // would still be attached to the earlier target Space. Not guarded
+  // against explicitly (doing so would also break the legitimate case of
+  // retaking/reselecting a photo mid-Organize-Again, which reuses this
+  // exact same button); recoverable in the worst case by
+  // validateTargetSpace, since the plan lands under a real, still-valid
+  // Space, not a corrupted one.
+  const [organizeAgainContext, setOrganizeAgainContext] = useState(null); // { spaceId, priorItem } | null
   // Results/Companion screen split (DecisionLog.md 2026-07-18). `results`
   // truthy still gates "we're viewing a plan at all" - this just selects
   // which of the two screens to render within that context. Pure view
@@ -2139,7 +2200,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     "Studying your space layout...",
     "Identifying what needs to stay and what can go...",
     "Selecting storage solutions for your budget...",
-    "Building your three-tier organization space...",
+    "Building three options for your room...",
     "Almost ready...",
   ];
 
@@ -2510,7 +2571,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // completion judgment behind it, so there's nothing to summarize
       // specifically (DecisionLog.md 2026-07-19). No accomplishment bullets
       // either - simple beats fabricated specifics.
-      celebrationHeadline: isOverride ? "You created a space that works better for you." : companionCompletionHeadline,
+      celebrationHeadline: isOverride ? "You created a room that works better for you." : companionCompletionHeadline,
       accomplishments: isOverride ? [] : companionCompletionAccomplishments,
       taskCount: completedTaskCountRef.current,
     };
@@ -2817,7 +2878,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== "granted") {
-        Alert.alert("Photos Permission Required", "Cluttrd needs access to your photos to analyze your space. Please go to Settings → Uncluttrd → Photos and allow access.", [{ text: "OK" }]);
+        Alert.alert("Photos Permission Required", "Cluttrd needs access to your photos to analyze your room. Please go to Settings → Uncluttrd → Photos and allow access.", [{ text: "OK" }]);
         return;
       }
       const result = await ImagePicker.launchImageLibraryAsync({
@@ -2872,15 +2933,60 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // The free-plan monthly limit (functions/index.js's analyzePhoto) is
   // enforced entirely via analysisCount/analysisCountMonth on the user doc,
   // independent of this write, so saving here doesn't interact with it.
-  const savePlanToHistory = async (plan) => {
+  // Remembered Home v1 (RememberedHomeDesign.md §3): the ONLY creation
+  // implementation for both first-time and returning plans - the sole
+  // structural difference is whether canonicalSpaceId is supplied.
+  // Deliberately not a separate createReturningPlan function with its own
+  // copy of this logic (see createReturningPlan below, which delegates
+  // here rather than duplicating) - the same consolidation principle
+  // already applied to computeShadowBatchId/getSpaceDisplayName/
+  // deriveFullReprojectionDocs elsewhere in this codebase.
+  //
+  // options.canonicalSpaceId: when supplied, this save targets an
+  // EXISTING, already-established Space (established via navigation -
+  // Section 1 - or explicit user confirmation - Section 2 - never by this
+  // function inferring identity on its own). Validated fresh, here, every
+  // time - never trusted from the caller and never a cached/stored
+  // "eligible" flag - Section 1's governing principle applied to plan
+  // creation, not just merge execution. An invalid or missing target
+  // (Step 1 Point 2: not found, or retired: true) means NO plan is
+  // created at all - options.onInvalidTarget, if supplied, is called with
+  // the specific reason, and this function returns null exactly as it
+  // already does for any other failure, preserving its existing
+  // string-planId-or-null contract for the two existing call sites, which
+  // never supply this option and are therefore entirely unaffected.
+  const savePlanToHistory = async (plan, { canonicalSpaceId = null, onInvalidTarget } = {}) => {
     try {
       console.log("Saving plan for user:", user.uid);
+      let inheritedSpaceName = null;
+      if (canonicalSpaceId) {
+        const targetSpaceSnap = await getDoc(doc(db, "users", user.uid, "spaces", canonicalSpaceId));
+        const validation = validateTargetSpace(targetSpaceSnap.exists() ? targetSpaceSnap.data() : null);
+        if (!validation.valid) {
+          dlog(`[SPACE ASSOCIATION] target Space ${canonicalSpaceId} rejected: ${validation.reason}`);
+          onInvalidTarget?.(validation.reason);
+          return null;
+        }
+        // RememberedHomeDesign.md §3 Point 4 / Implementation Step 1 Point 3:
+        // the returning plan inherits the Space's own current, user-owned
+        // display name - not the fresh AI label - so getSpaceDisplayName
+        // continues returning the name the user already trusts everywhere
+        // (History, Companion, etc.), regardless of what this new photo's
+        // analysis called the room.
+        inheritedSpaceName = targetSpaceSnap.data().displayName || null;
+      }
       const entry = {
         schemaVersion: 1,
         shadowSourceVersion: 1,
         createdAt: new Date().toISOString(),
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+        // spaceType is always the fresh AI classification for THIS photo,
+        // stored as-is, unchanged, whether or not this is a returning
+        // visit - the AI's own label is never suppressed, only
+        // getSpaceDisplayName's PREFERRED source (spaceName) is set below
+        // when a canonical name already exists to inherit.
         spaceType: plan.spaceType,
+        ...(canonicalSpaceId ? { canonicalSpaceId, spaceName: inheritedSpaceName } : {}),
         overview: plan.overview,
         itemsFound: plan.itemsFound,
         tiers: plan.tiers,
@@ -2941,6 +3047,27 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       console.log("Save history error:", e.message, e.code);
       return null;
     }
+  };
+
+  // Remembered Home v1 (RememberedHomeDesign.md §3 Point (f) / Implementation
+  // Step 1 Point 1): a thin wrapper, not a second creation implementation -
+  // delegates entirely to savePlanToHistory for plan fields, photo upload,
+  // shadowSourceVersion, analytics-adjacent bookkeeping, creation-time
+  // shadow writes, and error handling. Its only job is turning
+  // savePlanToHistory's existing string-or-null contract (preserved
+  // exactly, unchanged, for its two pre-existing call sites) into a richer,
+  // discriminated outcome for the NEW returning-visit call sites (Sections
+  // 1 and 2), which need to distinguish "created" from "target Space was
+  // invalid" to recover honestly rather than just failing silently.
+  const createReturningPlan = async (plan, targetSpaceId) => {
+    let invalidReason = null;
+    const planId = await savePlanToHistory(plan, {
+      canonicalSpaceId: targetSpaceId,
+      onInvalidTarget: (reason) => { invalidReason = reason; },
+    });
+    if (planId) return { outcome: "created", planId };
+    if (invalidReason) return { outcome: "invalid-target-space", planId: null, reason: invalidReason };
+    return { outcome: "failed", planId: null, reason: "save-error" };
   };
 
   // Reacts to isPro transitioning false -> true mid-session (e.g. a purchase
@@ -3150,11 +3277,65 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       analysisIdRef.current = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     }
     setLoading(true); setErr(null); setResults(null); setCurrentPlanId(null); startLoadMessages();
+    // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1e): snapshot
+    // once, here, rather than reading organizeAgainContext again later in
+    // this function - this function is async and organizeAgainContext is
+    // consumed and cleared partway through (see below), so every later
+    // reference in this function uses this same captured value, never the
+    // live state.
+    const returningContext = organizeAgainContext;
     try {
       const budgetNote = budget
         ? `The user has a specific budget of $${budget}. Highlight which tier best fits their budget, but still show all three.`
         : `Show all three tiers: Budget (under $50), Mid-Range ($50-$200), and Premium ($200+).`;
-      const prompt = `You are a warm expert home organizer. Analyze this photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1e): exactly
+      // the two justified context items, nothing else - full past
+      // overview/proTip text, session history, and completed items are
+      // deliberately excluded (§1e's own rejection list). Unresolved =
+      // "carried" or the last batch's still-"pending" items - the design
+      // doc's own precise two-value definition, not every status other
+      // than "checked" (which would also sweep in "skipped" items the
+      // user already explicitly decided against, not left unresolved).
+      let priorContextNote = "";
+      let priorPhotoBase64 = null;
+      if (returningContext?.priorItem) {
+        const priorItem = returningContext.priorItem;
+        const unresolvedItems = (priorItem.currentBatch?.items || [])
+          .filter(i => i.status === "carried" || i.status === "pending")
+          .map(i => i.text)
+          .filter(Boolean);
+        if (unresolvedItems.length) {
+          priorContextNote = `\n\nThis space was organized before. From the user's last session here, these specific items were left unresolved: ${unresolvedItems.map(t => `"${t}"`).join(", ")}. If any of these are still visible and relevant in today's photo, fold them into this session's checklist once, correctly, rather than re-discovering or re-suggesting them as if new. If one no longer applies, don't mention it.`;
+        }
+        const lastProgressUrl = priorItem.progressPhotos?.length
+          ? priorItem.progressPhotos[priorItem.progressPhotos.length - 1].url
+          : (priorItem.photoUrl || null);
+        if (lastProgressUrl) {
+          try {
+            const localUri = FileSystem.cacheDirectory + `organize_again_prior_${analysisIdRef.current}.jpg`;
+            const { uri: priorUri } = await FileSystem.downloadAsync(lastProgressUrl, localUri);
+            const compressedPrior = await manipulateAsync(priorUri, [{ resize: { width: 768 } }], { compress: 0.5, format: SaveFormat.JPEG, base64: true });
+            priorPhotoBase64 = compressedPrior.base64;
+          } catch (priorPhotoErr) {
+            // Non-fatal - proceed without the prior photo rather than
+            // blocking this analysis over a download failure. Matches this
+            // file's existing tolerance for photo-pipeline failures
+            // elsewhere (e.g. compressPhoto's own try/catch).
+            console.log("Prior progress photo fetch failed (proceeding without it):", priorPhotoErr.message);
+          }
+        }
+      }
+      // Same prompt as today, byte-for-byte, when priorPhotoBase64 is null
+      // (every first-time analysis, and any returning visit whose prior
+      // plan happened to have no progress photo) - priorPhotoPreamble and
+      // priorContextNote are both "" in that case, so this template
+      // literal reduces to exactly today's string. See generateNextAction
+      // (functions/index.js) for the proven precedent of narrating a fixed
+      // multi-image order in the prompt text itself.
+      const priorPhotoPreamble = priorPhotoBase64
+        ? `You are shown two photos, in this exact order. Photo 1 is how this space looked during the last organizing session - prior evidence only, not something to re-describe. Photo 2 is how it looks right now, today. Base every recommendation on what is genuinely visible in Photo 2 (today's photo) - Photo 1 is only for noticing what has changed since last time, never a substitute for looking freshly at today's photo.\n\n`
+        : "";
+      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -3188,7 +3369,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       let raw = "";
       let analysesRemaining = null; // server's real count, per this analysis - not a local guess
       try {
-        const result = await analyzePhotoFn({ imageBase64, prompt, analysisId: analysisIdRef.current });
+        const result = await analyzePhotoFn({ imageBase64, prompt, analysisId: analysisIdRef.current, priorPhotoBase64 });
         raw = result.data?.text || "";
         analysesRemaining = typeof result.data?.analysesRemaining === "number" ? result.data.analysesRemaining : null;
         dlog(`[COMPANION DEBUG 1] raw analyzePhotoFn response: ${raw}`);
@@ -3229,7 +3410,32 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // real planId is available for batch_shown/batch_generation_failed below -
       // currentPlanId itself doesn't reflect the new doc until a re-render,
       // and every batch event is now planId-correlated (see Analytics.md).
-      const newPlanId = await savePlanToHistory(parsed);
+      // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
+      // returning visit (organizeAgainContext set) creates its plan via
+      // createReturningPlan - the Step 1 wrapper around this exact same
+      // savePlanToHistory, with canonicalSpaceId supplied - rather than a
+      // second, parallel creation path. Consumed and cleared here,
+      // immediately, the moment this attempt reaches a save outcome
+      // (created OR invalid-target-space) - see organizeAgainContext's own
+      // declaration for why an earlier failure (before this point) leaves
+      // it uncleared for a retry instead.
+      let newPlanId;
+      if (returningContext) {
+        const returningResult = await createReturningPlan(parsed, returningContext.spaceId);
+        newPlanId = returningResult.planId;
+        setOrganizeAgainContext(null);
+        if (returningResult.outcome === "invalid-target-space") {
+          // Point 2 (Step 1) working as designed: the target Space became
+          // invalid (retired by a merge, or otherwise gone) between
+          // navigating here and finishing analysis. The analysis itself
+          // (results, already set above) is not thrown away - surfaced
+          // honestly instead of silently creating an unrelated new Space,
+          // per the governing principle.
+          Alert.alert("This room is no longer available", "It may have been merged with another room. Your new photo was still analyzed, but couldn't be saved to that room.");
+        }
+      } else {
+        newPlanId = await savePlanToHistory(parsed);
+      }
       const validBatch = Array.isArray(parsed.firstActionBatch) && parsed.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
       if (validBatch) {
         logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
@@ -3318,7 +3524,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         ${makeHeader(false)}
         <div class="page">
           <div style="font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;margin-top:8px;">${getSpaceDisplayName(results)}</div>
-          <div style="font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:10px;">Your Organization Space</div>
+          <div style="font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:10px;">Your Organization Plan</div>
           <div style="background:#E6E9EE;border:1px solid #D7DCE3;border-radius:10px;padding:14px;margin-bottom:14px;font-size:13px;color:#64748B;line-height:1.6;">${results.overview}</div>
           ${pdfBudget ? buildTier(pdfBudget) : ""}
           ${pdfMid ? buildTier(pdfMid) : ""}
@@ -3351,7 +3557,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const generateVisualization = async (tier) => {
     if (!isPro) { setShowPaywall(true); return; }
     if (!photo?.uri) {
-      Alert.alert("Photo unavailable", "We couldn't find the original photo for this space. Please reopen it from My Spaces and try again.");
+      Alert.alert("Photo unavailable", "We couldn't find the original photo for this room. Please reopen it from My Rooms and try again.");
       return;
     }
     setVizLoading(prev => ({ ...prev, [tier.id]: true }));
@@ -3442,8 +3648,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const shareResults = async () => {
     if (!results) return;
     try {
-      let text = "✨ Uncluttrd Organization Space\n";
-      text += "Space: " + getSpaceDisplayName(results) + "\n\n";
+      let text = "✨ Uncluttrd Organization Plan\n";
+      text += "Room: " + getSpaceDisplayName(results) + "\n\n";
       text += results.overview + "\n\n";
       results.tiers?.forEach(t => {
         text += "--- " + t.label + " (" + t.range + ") ---\n";
@@ -3455,7 +3661,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (results.proTip) text += "💡 Pro Tip: " + results.proTip + "\n";
       text += "\nGenerated by Uncluttrd. More Space. More Time. More You.";
 
-      await Share.share({ message: text, title: "My Uncluttrd Organization Space" });
+      await Share.share({ message: text, title: "My Uncluttrd Organization Plan" });
     } catch (e) {
       Alert.alert("Share failed", e.message);
     }
@@ -3715,7 +3921,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       <View style={s.renameSheetBackdrop}>
         <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
         <View style={s.renameSheetCard}>
-          <Text style={s.renameSheetTitle}>Rename Space</Text>
+          <Text style={s.renameSheetTitle}>Rename Room</Text>
           <TextInput
             style={s.renameSheetInput}
             value={renameSheetValue}
@@ -3826,6 +4032,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setSpaceDetailPlanId(null);
     restorePhotoFromPlan(item);
   };
+  // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): the one flow
+  // behind both entry points - the History row's "Organize Again" Alert
+  // action and Space Detail's own button - not two separate flows, same
+  // pattern as this file's one renderRenameSheet()/openRenameSheet() bottom
+  // sheet serving four call sites. Resolves the target Space id the same
+  // way computeShadowIds does (this item's own canonicalSpaceId if it's
+  // itself a returning-visit plan, else its own id), stores it plus the
+  // item itself (§1c/1e's prior context) in organizeAgainContext, clears
+  // every other screen flag via goHome() first (same discipline every nav
+  // helper in this file follows), then reuses the exact same photo-picker
+  // Alert the Home screen's own camera button opens - no second picker.
+  const startOrganizeAgain = (item) => {
+    const targetSpaceId = item.canonicalSpaceId || item.id;
+    goHome();
+    setOrganizeAgainContext({ spaceId: targetSpaceId, priorItem: item });
+    showPhotoOptions();
+  };
   const clearCompanionRevealState = () => {
     if (companionRevealTimer.current) clearTimeout(companionRevealTimer.current);
     setCompanionRevealBefore(null);
@@ -3833,8 +4056,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -3898,7 +4121,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const handleDeleteAccount = () => {
     Alert.alert(
       "Delete Account",
-      "This permanently deletes your account and all your saved data, including your space history and visualizations. This cannot be undone.",
+      "This permanently deletes your account and all your saved data, including your room history and visualizations. This cannot be undone.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -4073,7 +4296,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <View style={s.paywallHeader}>
             <View style={{ alignItems: "center", marginBottom: 12 }}><DrawerIcon size={80} dark={false} /></View>
             <Text style={s.paywallTitle}>Go Unlimited</Text>
-            <Text style={s.paywallSubtitle}>AI visualizations, branded PDFs, and full space history.</Text>
+            <Text style={s.paywallSubtitle}>AI visualizations, branded PDFs, and full room history.</Text>
           </View>
 
           {/* Free vs Pro comparison */}
@@ -4083,7 +4306,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <View style={[s.compareCol, { borderColor: BRAND.stone }]}>
                 <Text style={s.compareColHeader}>Free</Text>
                 {[
-                  "3 spaces/month",
+                  "3 rooms/month",
                   "Text sharing",
                   "Great for getting started",
                 ].map((t, i) => (
@@ -4096,9 +4319,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <View style={[s.compareCol, { borderColor: BRAND.green, backgroundColor: "#F8FBF9", borderWidth: 2 }]}>
                 <Text style={[s.compareColHeader, { color: BRAND.green }]}>Pro</Text>
                 {[
-                  "Unlimited spaces",
+                  "Unlimited rooms",
                   "AI visualizations",
-                  "Full space history",
+                  "Full room history",
                   "Branded PDF exports",
                   "Priority results",
                 ].map((t, i) => (
@@ -4242,7 +4465,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Spaces Remaining`}</Text>
+            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(false)} style={{ padding: 8 }}>
             <X size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -4253,11 +4476,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
           {[
             { icon: Home, label: "Home", action: goHome },
-            { icon: Folder, label: "My Spaces", action: () => { setShowMenu(false); setShowHistory(true); } },
+            { icon: Folder, label: "My Rooms", action: () => { setShowMenu(false); setShowHistory(true); } },
             // §12 Migration Part 3, Pass 2 - always reachable regardless of
             // banner state (MergeProposalDesign.md Section 3 / this pass's
             // "Menu access" requirement), not gated on pendingMergeCandidates.length.
-            { icon: Layers, label: "Review Duplicate Spaces", action: () => { setShowMenu(false); setShowMergeReview(true); } },
+            { icon: Layers, label: "Review Duplicate Rooms", action: () => { setShowMenu(false); setShowMergeReview(true); } },
             { icon: User, label: "Account", action: () => { setShowMenu(false); setShowAccount(true); } },
             { icon: Star, label: "Upgrade to Pro", action: () => { setShowMenu(false); setShowPaywall(true); }, hide: isPro },
             { icon: HelpCircle, label: "Help & FAQ", action: () => { setShowMenu(false); setShowFaq(true); } },
@@ -4298,8 +4521,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrPageName}>My Spaces</Text>
-            <Text style={s.hdrTag}>{history.length} saved {history.length === 1 ? "space" : "spaces"}</Text>
+            <Text style={s.hdrPageName}>My Rooms</Text>
+            <Text style={s.hdrTag}>{history.length} saved {history.length === 1 ? "room" : "rooms"}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => { setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMenu(true); }} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -4309,21 +4532,33 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           {history.length === 0 ? (
             <View style={{ alignItems: "center", paddingTop: 60 }}>
               <Text style={{ fontSize: 48, marginBottom: 16 }}>📋</Text>
-              <Text style={[s.resTitle, { textAlign: "center", marginBottom: 8 }]}>No spaces yet</Text>
-              <Text style={[s.heroP, { textAlign: "center" }]}>Your analyzed spaces will appear here after you get your first organization space.</Text>
+              <Text style={[s.resTitle, { textAlign: "center", marginBottom: 8 }]}>No rooms yet</Text>
+              <Text style={[s.heroP, { textAlign: "center" }]}>Your analyzed rooms will appear here after you get your first organization plan.</Text>
             </View>
           ) : (
             history.map((item) => (
               <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
                 Alert.alert(getSpaceDisplayName(item), "What would you like to do?", [
-                  // "View Plan" goes straight to Results (budget tiers,
-                  // products, visualization, rename pencil) - Space Detail
-                  // is no longer the default stop, since it doesn't offer
-                  // anything actionable beyond what Results already shows.
-                  // Space Detail itself stays in the codebase (still
-                  // reachable via spaceDetailPlanId elsewhere) for future
-                  // use, just not on this default tap path.
-                  { text: "View Plan", onPress: () => { setShowHistory(false); openSpaceResults(item); } },
+                  // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a):
+                  // Space Detail is reactivated as the destination for
+                  // tapping a Space - "View Plan" now opens it instead of
+                  // going straight to Results, so photo/status/history show
+                  // first (Space Detail's own "View Full Plan" button still
+                  // reaches Results in exactly one more tap, unchanged).
+                  // Deviation from RememberedHomeDesign.md 1a's own exact
+                  // wording, disclosed in the implementation report: the
+                  // design doc's 1a keeps "View Plan" going straight to
+                  // Results and would add "Organize Again" as a bare fifth
+                  // option instead; this implementation repoints "View Plan"
+                  // itself at Space Detail (rather than bypassing this Alert
+                  // entirely on a raw row tap) specifically so Rename/Share
+                  // as PDF/Delete Plan - each reachable from nowhere else in
+                  // the app - are never silently lost.
+                  { text: "View Plan", onPress: () => { setShowHistory(false); setSpaceDetailPlanId(item.id); } },
+                  // Remembered Home v1 Step 2: the other entry point to the
+                  // exact same startOrganizeAgain flow Space Detail's own
+                  // button below triggers - two entry points, one flow.
+                  { text: "Organize Again", onPress: () => startOrganizeAgain(item) },
                   // Opens the exact same bottom sheet used by the merge-
                   // review screen's rename affordance and the Space Detail
                   // screen below - no new mechanism, no duplicate sheet.
@@ -4378,11 +4613,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
-  // SPACE DETAIL SCREEN - on-device UX fix. Reached only from My Spaces
-  // ("View Plan"). Shows the Space's own content (photos, status,
-  // history) rather than dropping the user straight into the Companion
-  // journey - that journey is still one tap away ("Continue Organizing"/
-  // "View Full Plan" below), just no longer the forced default. Reuses
+  // SPACE DETAIL SCREEN. Reactivated as the primary destination for
+  // tapping a Space (Remembered Home v1 Step 2, RememberedHomeDesign.md
+  // §1a) - reached from My Spaces' "View Plan" Alert action, or directly
+  // via "Organize Again" from either that same Alert or this screen's own
+  // button (startOrganizeAgain). This comment was previously stale (said
+  // "reached only from... View Plan" back when View Plan went straight to
+  // Results instead) - corrected per the design doc's own §3 gap #3.
+  // Shows the Space's own content (photos, status, history) rather than
+  // dropping the user straight into the Companion journey - that journey
+  // is still one tap away ("Continue Organizing"/"View Full Plan" below),
+  // just no longer the forced default. Reuses
   // the exact same rename bottom sheet as the merge-review screen and
   // History's own "Rename" action (renderRenameSheet, openRenameSheet) -
   // no second sheet built. Structurally modeled on the Space Inspector
@@ -4404,14 +4645,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </TouchableOpacity>
             <View style={{ flex: 1 }}>
               <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-              <Text style={s.hdrPageName}>Space Not Found</Text>
+              <Text style={s.hdrPageName}>Room Not Found</Text>
             </View>
-            <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Spaces" accessibilityRole="button">
+            <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
               <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={s.scrollContent}>
-            <Text style={{ fontSize: 14, color: "#64748B" }}>This space could no longer be found.</Text>
+            <Text style={{ fontSize: 14, color: "#64748B" }}>This room could no longer be found.</Text>
           </ScrollView>
         </SafeAreaView>
       );
@@ -4441,13 +4682,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <Text style={s.hdrPageName} numberOfLines={1}>{getSpaceDisplayName(item)}</Text>
-              <TouchableOpacity onPress={() => openRenameSheet(item.id, getSpaceDisplayName(item))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this space" accessibilityRole="button">
+              <TouchableOpacity onPress={() => openRenameSheet(item.id, getSpaceDisplayName(item))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
                 <Pencil size={14} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
               </TouchableOpacity>
             </View>
             <Text style={s.hdrTag}>{item.date}</Text>
           </View>
-          <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Spaces" accessibilityRole="button">
+          <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
@@ -4489,11 +4730,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             ))}
           </SpaceDetailSectionCard>
 
+          {/* Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): "the
+              primary new interaction" - the user is saying "I want to
+              organize this room again." Styled as the top, primary
+              (green) action; View Full Plan below is demoted to secondary
+              styling to make room for it - its function (one tap to
+              Results) is completely unchanged, only its visual weight. */}
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => startOrganizeAgain(item)}>
+            <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
+          </TouchableOpacity>
           {/* Always available, always leads to Results (budget tiers,
               product recommendations, visualization) - never
-              conditionally rerouted to Companion. Primary action. */}
-          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => openSpaceResults(item)}>
-            <Text style={[s.startOverText, { color: "white" }]}>View Full Plan</Text>
+              conditionally rerouted to Companion. */}
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openSpaceResults(item)}>
+            <Text style={s.mergeSecondaryBtnText}>View Full Plan</Text>
           </TouchableOpacity>
           {/* Companion is reached ONLY through this explicit, separately-
               labeled secondary action, and only when there's genuinely an
@@ -4512,14 +4762,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // FAQ SCREEN
   if (showFaq) {
     const faqs = [
-      { q: "How does Uncluttrd work?", a: "Take a photo of any space: a closet, garage, kitchen, or room. Uncluttrd's AI analyzes what it sees and creates a personalized organization space across three budget levels with specific product recommendations." },
-      { q: "What spaces can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
-      { q: "What's the difference between the budget tiers?", a: "Budget (under $50) uses quick wins and items you may already have. Mid-Range ($50-$200) adds quality organizers and storage systems. Premium ($200+) features custom solutions and high-end products for a fully transformed space." },
+      { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and creates a personalized organization plan across three budget levels with specific product recommendations." },
+      { q: "What can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
+      { q: "What's the difference between the budget tiers?", a: "Budget (under $50) uses quick wins and items you may already have. Mid-Range ($50-$200) adds quality organizers and storage systems. Premium ($200+) features custom solutions and high-end products for a fully transformed room." },
       { q: "Can I enter my own budget?", a: "Yes! Below the budget tier buttons you'll find a custom budget field. Enter any dollar amount and Uncluttrd will highlight which tier best fits your budget." },
-      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full space history saved to your account, AI visualization of your transformed space, and branded PDF sharing. Free users get 3 free transformations per month." },
-      { q: "What is the AI Visualization feature?", a: "After getting your organization space, tap 'See the transformation' on any tier to generate an AI-created image showing what your space could look like after organizing. This is a Pro feature." },
-      { q: "How do I share my organization space?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full space." },
-      { q: "Where are my saved spaces?", a: "Tap the ☰ menu and select 'My Spaces' to see all your past organization spaces, synced across devices via your account. Pro members also get unlimited continuing guidance on each space and can share a branded PDF." },
+      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
+      { q: "What is the AI Visualization feature?", a: "After getting your organization plan, tap 'See the transformation' on any tier to generate an AI-created image showing what your room could look like after organizing. This is a Pro feature." },
+      { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
+      { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. Pro members also get unlimited continuing guidance on each room and can share a branded PDF." },
       { q: "How do I cancel my subscription?", a: "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
       { q: "Is my data secure?", a: "Yes. Your photos are sent securely to our AI for analysis and are not stored on our servers. Your account data is secured through Firebase, Google's enterprise-grade platform." },
       { q: "The product links aren't working. What do I do?", a: "Make sure you have a stable internet connection. The product links open Google Shopping with a search for the recommended item." },
@@ -4604,7 +4854,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const statusLabel = plan.companionComplete ? "Completed" : (plan.currentBatch ? "In progress" : "Not started");
       return (
         <View style={s.mergeEvidenceCard}>
-          <Text style={s.mergeEvidenceLabel}>{getSpaceDisplayName(plan) || "Space"}</Text>
+          <Text style={s.mergeEvidenceLabel}>{getSpaceDisplayName(plan) || "Room"}</Text>
           {onRename && (
             // A TouchableOpacity nested inside another TouchableOpacity
             // (this card's own checkbox-select wrapper, in
@@ -4612,7 +4862,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             // Native's responder system without also triggering the
             // parent's onPress - unlike DOM event bubbling, no
             // stopPropagation is needed for this to work correctly.
-            <TouchableOpacity onPress={onRename} style={s.mergeRenameLink} accessibilityLabel="Rename this space" accessibilityRole="button" hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+            <TouchableOpacity onPress={onRename} style={s.mergeRenameLink} accessibilityLabel="Rename this room" accessibilityRole="button" hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
               <Pencil size={11} color={BRAND.green} strokeWidth={2.25} />
               <Text style={s.mergeRenameLinkText}>Rename</Text>
             </TouchableOpacity>
@@ -4638,10 +4888,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const loading = mergeActionLoadingId === candidate.id;
       return (
         <MergeSectionCard key={candidate.id}>
-          <Text style={s.mergeCandidateSignal}>These spaces currently share the name "{candidate.spaceType}".</Text>
-          <Text style={s.mergeCandidateInstruction}>Select all of the records that belong to the same physical space.</Text>
+          <Text style={s.mergeCandidateSignal}>These rooms currently share the name "{candidate.spaceType}".</Text>
+          <Text style={s.mergeCandidateInstruction}>Select all of the records that belong to the same physical room.</Text>
           <Text style={s.mergeCandidateSupportCopy}>Records you leave unselected will not be included in this group. You can review the remaining records separately.</Text>
-          <Text style={[s.mergeCandidateSupportCopy, { marginTop: 4 }]}>If that's not correct, you can rename either space before deciding whether they're the same place.</Text>
+          <Text style={[s.mergeCandidateSupportCopy, { marginTop: 4 }]}>If that's not correct, you can rename either room before deciding whether they're the same place.</Text>
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: 10, marginBottom: 12 }}>
             {candidate.planIds.map((planId) => {
               const isSelected = selected.has(planId);
@@ -4668,7 +4918,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             disabled={!canConfirm || loading}
             onPress={() => handleConfirmSameSpace(candidate)}
           >
-            <Text style={[s.startOverText, { color: "white" }]}>{loading ? "Saving..." : "These are the same space"}</Text>
+            <Text style={[s.startOverText, { color: "white" }]}>{loading ? "Saving..." : "These are the same room"}</Text>
           </TouchableOpacity>
           <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
             <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} disabled={loading} onPress={() => handleKeepSeparate(candidate)}>
@@ -4704,7 +4954,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrPageName}>Review Duplicate Spaces</Text>
+            <Text style={s.hdrPageName}>Review Duplicate Rooms</Text>
             <Text style={s.hdrTag}>{pendingMergeCandidates.length} to review</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => { setShowMergeReview(false); setShowMenu(true); }} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
@@ -4718,7 +4968,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           {pendingMergeCandidates.length === 0 && !stillLoadingPlans && (
             <View style={{ alignItems: "center", paddingTop: 40 }}>
               <Text style={s.mergeAllCaughtUpTitle}>All caught up!</Text>
-              <Text style={s.mergeAllCaughtUpSub}>No duplicate spaces need your review right now.</Text>
+              <Text style={s.mergeAllCaughtUpSub}>No duplicate rooms need your review right now.</Text>
               <TouchableOpacity style={[s.startOverBtn, { backgroundColor: BRAND.green, borderWidth: 0, paddingHorizontal: 32 }]} onPress={goHome}>
                 <Text style={[s.startOverText, { color: "white" }]}>Back to Home</Text>
               </TouchableOpacity>
@@ -5028,7 +5278,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Spaces Remaining`}</Text>
+            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -5046,16 +5296,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                     yet before it's saved (currentPlanId is only ever set
                     once a real saved plan is being viewed). */}
                 {currentPlanId && (
-                  <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, getSpaceDisplayName(results))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this space" accessibilityRole="button">
+                  <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, getSpaceDisplayName(results))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
                     <Pencil size={12} color={BRAND.green} strokeWidth={2.25} />
                   </TouchableOpacity>
                 )}
               </View>
-              <Text style={s.resTitle}>Your Space</Text>
+              <Text style={s.resTitle}>Your Room</Text>
             </View>
-            <TouchableOpacity style={s.shareBtn} accessibilityLabel="Share your space" accessibilityRole="button" onPress={() => setTimeout(() => {
+            <TouchableOpacity style={s.shareBtn} accessibilityLabel="Share your room" accessibilityRole="button" onPress={() => setTimeout(() => {
               Alert.alert(
-                "Share Your Space",
+                "Share Your Room",
                 isPro ? "How would you like to share?" : "Upgrade to Pro for a beautiful branded PDF",
                 isPro ? [
                   { text: "📄 Share as PDF", onPress: generatePDF },
@@ -5218,7 +5468,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </TouchableOpacity>
           )}
           <TouchableOpacity style={s.startOverBtn} onPress={reset}>
-            <Text style={s.startOverText}>Analyze a New Space</Text>
+            <Text style={s.startOverText}>Analyze a New Room</Text>
           </TouchableOpacity>
         </ScrollView>
         {renderRenameSheet()}
@@ -5280,12 +5530,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               parity). TEMP DEBUG: long-press exports the [COMPANION DEBUG]
               log via the share sheet - remove with the rest of the debug
               instrumentation once the bug is found. */}
-          <TouchableOpacity onPress={() => setShowCompanion(false)} onLongPress={debugShareLog} style={{ padding: 8 }} accessibilityLabel="Back to your space" accessibilityRole="button">
+          <TouchableOpacity onPress={() => setShowCompanion(false)} onLongPress={debugShareLog} style={{ padding: 8 }} accessibilityLabel="Back to your room" accessibilityRole="button">
             <ChevronLeft size={26} color="rgba(255,255,255,0.9)" strokeWidth={2.25} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Spaces Remaining`}</Text>
+            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -5392,7 +5642,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             ) : (
               <View style={s.freeBadge}>
                 <View style={s.freeBadgeDot} />
-                <Text style={s.freeBadgeText}>{Math.max(0, 3 - (analyses || 0))} Free Spaces Remaining</Text>
+                <Text style={s.freeBadgeText}>{Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining</Text>
               </View>
             )}
           </TouchableOpacity>
@@ -5431,9 +5681,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <TouchableOpacity style={s.companionResumeBanner} onPress={() => setShowMergeReview(true)}>
             <Layers size={18} color={BRAND.green} strokeWidth={2.25} />
             <View style={{ flex: 1, marginLeft: 10 }}>
-              <Text style={s.companionResumeTitle}>Possible Duplicate Spaces</Text>
+              <Text style={s.companionResumeTitle}>Possible Duplicate Rooms</Text>
               <Text style={s.companionResumeSub} numberOfLines={1}>
-                {`${pendingMergeCandidates.length} space${pendingMergeCandidates.length === 1 ? "" : "s"} may be the same`}
+                {`${pendingMergeCandidates.length} room${pendingMergeCandidates.length === 1 ? "" : "s"} may be the same`}
               </Text>
             </View>
             <ChevronRight size={18} color={BRAND.green} strokeWidth={2.25} />
@@ -5540,7 +5790,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <ActivityIndicator color="white" />
               <Text style={s.ctaText}>Analyzing…</Text>
             </View>
-            : <Text style={s.ctaText}>{photo ? "Generate My Space" : "Add a Photo to Continue"}</Text>
+            : <Text style={s.ctaText}>{photo ? "Generate My Plan" : "Add a Photo to Continue"}</Text>
           }
         </TouchableOpacity>
 
