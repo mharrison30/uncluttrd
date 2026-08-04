@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -2174,6 +2174,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // validateTargetSpace, since the plan lands under a real, still-valid
   // Space, not a corrupted one.
   const [organizeAgainContext, setOrganizeAgainContext] = useState(null); // { spaceId, priorItem } | null
+  // Remembered Home v1 Step 3 (RememberedHomeDesign.md §2): non-empty
+  // triggers the recognition proposal screen, ahead of Results in the
+  // if-chain. recognitionPendingRef holds { parsed, analysesRemaining }
+  // for the duration - a ref, not state, since it doesn't need to trigger
+  // its own render, only be available once the user taps an action. Both
+  // cleared together, always, by whichever of
+  // confirmRecognitionCandidate/declineRecognitionCandidates/goHome/reset
+  // fires first - never left set once the screen is no longer showing.
+  const [recognitionCandidates, setRecognitionCandidates] = useState([]);
+  const recognitionPendingRef = useRef(null);
+  // Remembered Home v1 Step 3, Phase D (RememberedHomeDesign.md §4): set
+  // only by confirmRecognitionCandidate, read only by the Results screen's
+  // own orientation banner. Not a separate timed sequence of screens (5s/
+  // 30s/60s) - this app has no existing mechanism for timed UI reveals,
+  // and Results already appears within a couple of seconds of confirming
+  // (the save happens in the background, same pattern as every other
+  // creation path in this file) - so the "Welcome back"/orientation
+  // content is combined into one banner rather than staged across
+  // separate screens. The "first minute" momentum beat needs no separate
+  // code at all: it's simply the checklist Results already renders,
+  // already informed by the enriched prompt (Step 2).
+  const [justConfirmedRecognition, setJustConfirmedRecognition] = useState(null);
   // Results/Companion screen split (DecisionLog.md 2026-07-18). `results`
   // truthy still gates "we're viewing a plan at all" - this just selects
   // which of the two screens to render within that context. Pure view
@@ -3070,6 +3092,53 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     return { outcome: "failed", planId: null, reason: "save-error" };
   };
 
+  // ---- Remembered Home v1 Step 3: Generic Camera Recognition ----
+  // Named as a recognition engine entry point (RememberedHomeDesign.md §2 /
+  // Implementation Step 3) even though exact getSpaceDisplayName match is
+  // the only signal it has today - governing principle: recognition
+  // proposes, never asserts, and exact-match is the only v1 signal.
+  //
+  // Cache-first, query-as-fallback: checks the already-loaded `history`
+  // array (zero new reads, covers the common case - a user's 20 most
+  // recent plans) via the shared pure resolveRecognitionCandidates.
+  // Only if that finds nothing does it run the two targeted single-field
+  // queries (spaceType, spaceName - each auto-indexed, no deployment
+  // needed) to catch a Room organized 6+ months ago, outside the cache.
+  // Deliberate deviation from RememberedHomeDesign.md §2a, which said to
+  // run the query unconditionally in parallel with the cache check: doing
+  // that would mean two extra Firestore reads on EVERY analysis,
+  // including the common first-time-user case with no history at all to
+  // match against. Conditional-on-cache-miss still catches exactly the
+  // case §2a's own reasoning cared about (an older Room the 20-item cache
+  // missed) - it just avoids paying the query's cost when the cache
+  // already has a real answer. Flagged explicitly, not silently changed.
+  //
+  // Never throws - a recognition failure must never block the fresh-start
+  // path it's proposing something in front of (§2d's structural
+  // guarantee). Returns [] on any query error, identical to "no match."
+  const findRecognitionCandidates = async (freshLabel, historyList, forUid) => {
+    if (!freshLabel) return [];
+    const cachePlans = (historyList || []).map((h) => ({ id: h.id, data: h }));
+    const cacheCandidates = resolveRecognitionCandidates(freshLabel, cachePlans);
+    if (cacheCandidates.length) return cacheCandidates;
+
+    try {
+      const plansRef = collection(db, "users", forUid, "plans");
+      const [byType, byName] = await Promise.all([
+        getDocs(query(plansRef, where("spaceType", "==", freshLabel))),
+        getDocs(query(plansRef, where("spaceName", "==", freshLabel))),
+      ]);
+      const merged = new Map();
+      [...byType.docs, ...byName.docs].forEach((d) => {
+        if (!merged.has(d.id)) merged.set(d.id, { id: d.id, data: d.data() });
+      });
+      return resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+    } catch (e) {
+      dlog(`[RECOGNITION] targeted query failed, proceeding with no candidates: ${e.message}`);
+      return [];
+    }
+  };
+
   // Reacts to isPro transitioning false -> true mid-session (e.g. a purchase
   // completed partway through a free-tier Companion loop). Free plans now
   // save immediately (see savePlanToHistory), so currentPlanId is normally
@@ -3260,6 +3329,119 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
+  // Remembered Home v1 Step 3: shared save+bookkeeping tail, used by
+  // analyze()'s own first-time/Organize-Again paths AND by the recognition
+  // proposal's confirm/decline handlers below - one implementation of
+  // save-plan/batch-analytics/scroll-reset/analyses-remaining, not three
+  // copies of it. canonicalSpaceId null means an ordinary fresh-start save
+  // (savePlanToHistory); non-null means a returning visit
+  // (createReturningPlan), handling the invalid-target-space race exactly
+  // as Step 2 already does.
+  const finalizeAnalysisResult = async (parsedResult, canonicalSpaceId, analysesRemaining) => {
+    let newPlanId;
+    if (canonicalSpaceId) {
+      const returningResult = await createReturningPlan(parsedResult, canonicalSpaceId);
+      newPlanId = returningResult.planId;
+      if (returningResult.outcome === "invalid-target-space") {
+        // Point 2 (Step 1) working as designed: the target Room became
+        // invalid (retired by a merge, or otherwise gone) between
+        // proposing/navigating and finishing analysis. The analysis itself
+        // (results, already set by the caller) is not thrown away -
+        // surfaced honestly instead of silently creating an unrelated new
+        // Room.
+        Alert.alert("This room is no longer available", "It may have been merged with another room. Your new photo was still analyzed, but couldn't be saved to that room.");
+      }
+    } else {
+      newPlanId = await savePlanToHistory(parsedResult);
+    }
+    const validBatch = Array.isArray(parsedResult.firstActionBatch) && parsedResult.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+    if (validBatch) {
+      logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
+    } else {
+      logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
+    }
+    setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+    // analysesRemaining is the server's real count (null means Pro/unlimited)
+    // - AsyncStorage is now a display cache only, never authoritative.
+    if (typeof analysesRemaining === "number") {
+      const newCount = Math.max(0, 3 - analysesRemaining);
+      setAnalyses(newCount);
+      await AsyncStorage.setItem("analysisCount", newCount.toString());
+    }
+    return newPlanId;
+  };
+
+  // Remembered Home v1 Step 3: the two outcomes of the recognition proposal
+  // screen. Both consume recognitionPendingRef exactly once, then clear it
+  // - the same "clear the moment it's used" discipline organizeAgainContext
+  // already follows, see that state's own declaration.
+  // Remembered Home v1 Step 3 (Implementation task, Companion hand-off /
+  // test k): the recognition path cannot enrich its own initial
+  // analyzePhoto prompt with prior context the way Step 2's Organize Again
+  // does - recognition depends on spaceType, which only exists once that
+  // same call has already returned (Question 5's own timing conclusion),
+  // so there is no point before the call where the target Room, and
+  // therefore its prior context, is knowable. Instead, prior unresolved
+  // items are carried forward directly onto the new plan's own first
+  // checklist immediately after creation - literal text carry-over, the
+  // same mechanism (not AI-mediated) already used for in-session
+  // batch-to-batch carry-over elsewhere in this file - guaranteeing the
+  // original wording survives rather than a paraphrase. Placed first in
+  // the list (ahead of the AI's fresh suggestions), matching the "pick up
+  // where you left off" framing. Non-fatal: a failure here never
+  // invalidates the plan/shadow write that already succeeded.
+  const carryForwardUnresolvedItems = async (uid, planId, unresolvedItemTexts) => {
+    if (!unresolvedItemTexts?.length) return;
+    try {
+      const planRef = doc(db, "users", uid, "plans", planId);
+      const snap = await getDoc(planRef);
+      if (!snap.exists() || !snap.data().currentBatch) return;
+      const carriedItems = unresolvedItemTexts.map(text => ({ id: makeItemId(), text, status: "carried" }));
+      const updatedItems = [...carriedItems, ...(snap.data().currentBatch.items || [])];
+      await updateDoc(planRef, { "currentBatch.items": updatedItems });
+      setHistory(prev => prev.map(h => h.id === planId ? { ...h, currentBatch: { ...h.currentBatch, items: updatedItems } } : h));
+      // Safe to patch unconditionally: this function is only ever called
+      // synchronously from confirmRecognitionCandidate, immediately after
+      // it set `results` to this exact plan - nothing else can have
+      // changed `results` to a different plan in between.
+      setResults(prev => prev ? { ...prev, currentBatch: { ...prev.currentBatch, items: updatedItems } } : prev);
+    } catch (e) {
+      console.log("Carry-forward unresolved items error (non-fatal):", e.message);
+    }
+  };
+
+  const confirmRecognitionCandidate = async (candidate) => {
+    const pending = recognitionPendingRef.current;
+    if (!pending) return; // defensive - not reachable while the screen isn't showing, since that's gated on the same ref being set
+    setRecognitionCandidates([]);
+    recognitionPendingRef.current = null;
+    setResults(pending.parsed);
+    setJustConfirmedRecognition({ displayName: candidate.displayName, lastOrganizedAt: candidate.lastOrganizedAt, workSummary: candidate.workSummary });
+    logEvent(getAnalytics(), "plan_completed");
+    logEvent(getAnalytics(), "recognition_confirmed");
+    const newPlanId = await finalizeAnalysisResult(pending.parsed, candidate.canonicalSpaceId, pending.analysesRemaining);
+    if (newPlanId && candidate.unresolvedItems?.length) {
+      await carryForwardUnresolvedItems(user.uid, newPlanId, candidate.unresolvedItems);
+    }
+  };
+
+  // reason: "new-room" | "not-sure" - same code path either way
+  // (RememberedHomeDesign.md §2c: "No" and "Not sure" are deliberately the
+  // same code path, not two answers to two different questions), reason is
+  // used only for analytics, never to alter behavior. Nothing is recorded
+  // about the decline itself - no Firestore write, no rejection ledger -
+  // the same match can be proposed again on a future photo.
+  const declineRecognitionCandidates = async (reason) => {
+    const pending = recognitionPendingRef.current;
+    if (!pending) return;
+    setRecognitionCandidates([]);
+    recognitionPendingRef.current = null;
+    setResults(pending.parsed);
+    logEvent(getAnalytics(), "plan_completed");
+    logEvent(getAnalytics(), "recognition_declined", { reason });
+    await finalizeAnalysisResult(pending.parsed, null, pending.analysesRemaining);
+  };
+
   const analyze = async () => {
     setVizImage({});
     setVizLoading({});
@@ -3404,52 +3586,48 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const parsed = sanitizeAiText(JSON.parse(match[0]));
       dlog(`[COMPANION DEBUG 3] parsed.firstActionBatch: ${JSON.stringify(parsed.firstActionBatch)} | isArray: ${Array.isArray(parsed.firstActionBatch)}`);
       lastFailedAnalysisRef.current = null; // this analysisId succeeded - never reuse it, a later reuse would just replay this cached result
+
+      // Remembered Home v1 Step 3 (RememberedHomeDesign.md §2 / Implementation
+      // Step 3): recognition only applies to the generic-camera path - a
+      // returning visit via Organize Again (Step 2) already knows its target
+      // through navigation, so a recognition check here would be redundant
+      // and would risk proposing something when identity is already
+      // established through the stronger mechanism (navigation). Governing
+      // principle: exact getSpaceDisplayName match is the only v1 signal; no
+      // match means zero added friction, straight through the path below,
+      // byte-identical to pre-Step-3 behavior.
+      const recognitionMatches = returningContext ? [] : await findRecognitionCandidates(getSpaceDisplayName(parsed), history, user.uid);
+      if (recognitionMatches.length) {
+        // Pause here - the proposal screen (recognitionCandidates truthy)
+        // takes over on the next render, ahead of Results in the if-chain.
+        // Nothing is saved yet. parsed/analysesRemaining are held in a ref,
+        // not state, since they don't need to trigger a render themselves -
+        // only to be available to confirmRecognitionCandidate/
+        // declineRecognitionCandidates once the user acts.
+        recognitionPendingRef.current = { parsed, analysesRemaining };
+        setRecognitionCandidates(recognitionMatches);
+        setLoading(false);
+        stopLoadMessages();
+        return;
+      }
+
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
-      // Awaited (unlike the old fire-and-forget savePlanToHistory call) so the
-      // real planId is available for batch_shown/batch_generation_failed below -
-      // currentPlanId itself doesn't reflect the new doc until a re-render,
-      // and every batch event is now planId-correlated (see Analytics.md).
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
       // returning visit (organizeAgainContext set) creates its plan via
       // createReturningPlan - the Step 1 wrapper around this exact same
       // savePlanToHistory, with canonicalSpaceId supplied - rather than a
       // second, parallel creation path. Consumed and cleared here,
-      // immediately, the moment this attempt reaches a save outcome
-      // (created OR invalid-target-space) - see organizeAgainContext's own
-      // declaration for why an earlier failure (before this point) leaves
-      // it uncleared for a retry instead.
-      let newPlanId;
-      if (returningContext) {
-        const returningResult = await createReturningPlan(parsed, returningContext.spaceId);
-        newPlanId = returningResult.planId;
-        setOrganizeAgainContext(null);
-        if (returningResult.outcome === "invalid-target-space") {
-          // Point 2 (Step 1) working as designed: the target Space became
-          // invalid (retired by a merge, or otherwise gone) between
-          // navigating here and finishing analysis. The analysis itself
-          // (results, already set above) is not thrown away - surfaced
-          // honestly instead of silently creating an unrelated new Space,
-          // per the governing principle.
-          Alert.alert("This room is no longer available", "It may have been merged with another room. Your new photo was still analyzed, but couldn't be saved to that room.");
-        }
-      } else {
-        newPlanId = await savePlanToHistory(parsed);
-      }
-      const validBatch = Array.isArray(parsed.firstActionBatch) && parsed.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
-      if (validBatch) {
-        logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
-      } else {
-        logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
-      }
-      setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
-      // analysesRemaining is the server's real count (null means Pro/unlimited)
-      // - AsyncStorage is now a display cache only, never authoritative.
-      if (typeof analysesRemaining === "number") {
-        const newCount = Math.max(0, 3 - analysesRemaining);
-        setAnalyses(newCount);
-        await AsyncStorage.setItem("analysisCount", newCount.toString());
-      }
+      // immediately, the moment this attempt reaches a save outcome - see
+      // organizeAgainContext's own declaration for why an earlier failure
+      // (before this point) leaves it uncleared for a retry instead.
+      if (returningContext) setOrganizeAgainContext(null);
+      // Awaited (unlike the old fire-and-forget savePlanToHistory call) so
+      // the real planId is available for batch_shown/batch_generation_failed
+      // inside finalizeAnalysisResult - currentPlanId itself doesn't reflect
+      // the new doc until a re-render, and every batch event is
+      // planId-correlated (see Analytics.md).
+      await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining);
     } catch (e) {
       lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
@@ -4004,6 +4182,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setShowMergeReview(false);
     setShowSpaceInspector(false);
     setShowAccount(false);
+    setJustConfirmedRecognition(null); // browsing to a plan via History/Space Detail is not a fresh confirmation - no stale banner
     setResults(item);
     setShowCompanion(false);
     setVizImage(item.vizImages || {});
@@ -4024,6 +4203,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setShowSpaceInspector(false);
     setShowAccount(false);
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "space_detail" });
+    setJustConfirmedRecognition(null);
     setResults(item);
     setShowCompanion(true);
     setVizImage(item.vizImages || {});
@@ -4056,8 +4236,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRecognitionCandidates([]); recognitionPendingRef.current = null; setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRecognitionCandidates([]); recognitionPendingRef.current = null; setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -4079,6 +4259,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // Reached only from My Spaces (History) - back returns there, not
       // to Menu, matching the drill-down it actually came from.
       if (spaceDetailPlanId) { setSpaceDetailPlanId(null); setShowHistory(true); return true; }
+      // Remembered Home v1 Step 3: backing out of the recognition proposal
+      // is a decline, not a no-op or an accidental exit - same "No"/"Not
+      // sure" code path (declineRecognitionCandidates), nothing recorded.
+      if (recognitionCandidates.length) { declineRecognitionCandidates("back-button"); return true; }
       // Checked before the Companion branch below, same reasoning as
       // History/FAQ/Account above it - the wrap-up screen (DecisionLog.md
       // 2026-07-19) is a step within Companion, not its own destination, so
@@ -4096,7 +4280,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, results, showCompanion, unresolvedReview]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, recognitionCandidates, results, showCompanion, unresolvedReview]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -5263,6 +5447,82 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
+  // RECOGNITION PROPOSAL SCREEN (Remembered Home v1 Step 3,
+  // RememberedHomeDesign.md §2). Shown only when findRecognitionCandidates
+  // found at least one exact getSpaceDisplayName match for the fresh photo's
+  // AI label - governing principle: recognition proposes, never asserts, so
+  // this screen never appears silently folded into Results; it's its own
+  // explicit stop, ahead of Results in the if-chain, exactly like every
+  // other interstitial in this file (paywall, merge review).
+  if (recognitionCandidates.length) {
+    const daysAgo = (iso) => {
+      if (!iso) return null;
+      const ms = Date.now() - Date.parse(iso);
+      const days = Math.max(0, Math.round(ms / (24 * 60 * 60 * 1000)));
+      return days;
+    };
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
+          </TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrPageName}>Have we organized this room before?</Text>
+          </View>
+        </View>
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          {recognitionCandidates.map((candidate) => {
+            const days = daysAgo(candidate.lastOrganizedAt);
+            return (
+              <View key={candidate.canonicalSpaceId} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
+                <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+                  <View style={{ flex: 1 }}>
+                    <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                      {candidate.priorPhotoUrl && <Image source={{ uri: candidate.priorPhotoUrl }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                      <Text style={s.beforeAfterStackLabel}>LAST TIME</Text>
+                    </View>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                      {photo?.uri && <Image source={{ uri: photo.uri }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                      <Text style={s.beforeAfterStackLabel}>TODAY</Text>
+                    </View>
+                  </View>
+                </View>
+                <Text style={{ fontSize: 15, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 2 }}>{candidate.displayName}</Text>
+                <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
+                  {days !== null ? `Last organized ${days} day${days === 1 ? "" : "s"} ago` : "Last organized a while ago"}
+                  {candidate.workSummary ? ` · ${candidate.workSummary}` : ""}
+                </Text>
+                <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => confirmRecognitionCandidate(candidate)}>
+                  <Text style={[s.startOverText, { color: "white" }]}>{`Yes, this is my ${candidate.displayName}`}</Text>
+                </TouchableOpacity>
+                <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
+                  {/* No/Not sure on a multi-candidate screen dismiss the
+                      ENTIRE screen, not just this one card - the user has
+                      already indicated this isn't a returning visit at
+                      all, per the task's own recommendation; re-showing
+                      the remaining cards would imply "maybe try again,"
+                      contradicting a decline that was about the new photo,
+                      not about any one specific candidate. */}
+                  <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={() => declineRecognitionCandidates("new-room")}>
+                    <Text style={s.mergeSecondaryBtnText}>No, this is a new room</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={() => declineRecognitionCandidates("not-sure")}>
+                    <Text style={s.mergeSecondaryBtnText}>Not sure</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          })}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   // RESULTS SCREEN (photo, visualization, tiers - "inspiration/vision mode",
   // see DecisionLog.md 2026-07-18 for the split from the Companion screen)
   if (results && !showCompanion) {
@@ -5321,6 +5581,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Ionicons name="share-outline" size={26} color={BRAND.green} />
             </TouchableOpacity>
           </View>
+          {/* Remembered Home v1 Step 3, Phase D (RememberedHomeDesign.md
+              §4): the first-5-seconds/first-30-seconds beats, combined into
+              one banner rather than staged across timed screens - see
+              justConfirmedRecognition's own declaration. Reinforces what
+              the proposal card already showed a moment earlier, doesn't
+              repeat a data dump. Only ever shown once, right after
+              confirming - cleared by every navigation helper. */}
+          {justConfirmedRecognition && (
+            <View style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}>
+              <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{`Welcome back to your ${justConfirmedRecognition.displayName}.`}</Text>
+              {justConfirmedRecognition.workSummary && (
+                <Text style={{ fontSize: 13, color: "#64748B" }}>{justConfirmedRecognition.workSummary}</Text>
+              )}
+            </View>
+          )}
           {results.photoUrl && (
             // Same photoUrl source as the History list thumbnails and the
             // (now-deactivated) Space Detail screen - not a separate field.
