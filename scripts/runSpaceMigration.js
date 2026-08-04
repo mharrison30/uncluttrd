@@ -290,8 +290,18 @@ async function savePlanToHistoryAdmin(db, uid, plan, { canonicalSpaceId = null, 
     shadowSourceVersion: 1,
     createdAt: now,
     date: new Date(now).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
-    spaceType: plan.spaceType,
-    ...(canonicalSpaceId ? { canonicalSpaceId, spaceName: inheritedSpaceName } : {}),
+    // Room-First Identity Phase A/C - mirrors App.js's savePlanToHistory
+    // 1:1: spaceType sourced from suggestedRoomName (the AI no longer
+    // returns a flat spaceType field), areaName/areaScope from the
+    // CONFIRMED result (Phase C's confirmedPlan construction), spaceName
+    // written directly for a new Room too (not just inherited on a
+    // returning visit) when the caller explicitly provides it.
+    spaceType: plan.suggestedRoomName,
+    areaName: plan.areaName !== undefined ? plan.areaName : (plan.suggestedAreaName ?? null),
+    areaScope: plan.areaScope ?? null,
+    ...(canonicalSpaceId
+      ? { canonicalSpaceId, spaceName: inheritedSpaceName }
+      : (plan.spaceName ? { spaceName: plan.spaceName } : {})),
     overview: plan.overview || "test",
     itemsFound: plan.itemsFound || [],
     tiers: plan.tiers || [],

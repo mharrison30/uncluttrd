@@ -104,7 +104,7 @@ const currentMonthUTC = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
 exports.analyzePhoto = onCall(
   { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
   async (request) => {
-    const { imageBase64, prompt, analysisId } = request.data || {};
+    const { imageBase64, prompt, analysisId, priorPhotoBase64 } = request.data || {};
 
     if (!imageBase64 || !prompt) {
       throw new HttpsError("invalid-argument", "Missing image or prompt.");
@@ -166,23 +166,35 @@ exports.analyzePhoto = onCall(
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
     let text;
     try {
+      // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1e):
+      // priorPhotoBase64 is optional and absent for every first-time
+      // analysis - the content array is then exactly today's single-image
+      // shape, byte-identical to before this change. When present (a
+      // returning visit to an existing Space), it's placed FIRST, ahead of
+      // the new photo - same fixed, prompt-narrated multi-image ordering
+      // already proven by generateNextAction below (original/before/after),
+      // not a new pattern.
+      const content = [];
+      if (priorPhotoBase64) {
+        content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: priorPhotoBase64 } });
+      }
+      content.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/jpeg",
+          data: imageBase64,
+        },
+      });
+      content.push({ type: "text", text: prompt });
+
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
         max_tokens: 1500,
         messages: [
           {
             role: "user",
-            content: [
-              {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/jpeg",
-                  data: imageBase64,
-                },
-              },
-              { type: "text", text: prompt },
-            ],
+            content,
           },
         ],
       });

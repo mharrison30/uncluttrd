@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -2174,16 +2174,57 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // validateTargetSpace, since the plan lands under a real, still-valid
   // Space, not a corrupted one.
   const [organizeAgainContext, setOrganizeAgainContext] = useState(null); // { spaceId, priorItem } | null
-  // Remembered Home v1 Step 3 (RememberedHomeDesign.md §2): non-empty
-  // triggers the recognition proposal screen, ahead of Results in the
-  // if-chain. recognitionPendingRef holds { parsed, analysesRemaining }
-  // for the duration - a ref, not state, since it doesn't need to trigger
-  // its own render, only be available once the user taps an action. Both
+  // Room-First Identity, Phase B (supersedes Step 3's single-outcome
+  // recognition proposal - RoomFirstIdentityDesign.md §2). Non-null
+  // triggers the Room confirmation screen, ahead of Results in the
+  // if-chain. Shape while active:
+  //   {
+  //     routing: <output of routeRoomConfirmation - {outcome, ...}>,
+  //     knownRooms: <output of dedupeToKnownRooms - the user's existing Rooms>,
+  //     view: "main" | "picker" | "freeform",
+  //     pickerContext: null | "b1-decline" | "b2-inside" | "b3-inside" | "c-secondary",
+  //     freeformContext: null | "c-tertiary" | "b2-own-zero" | "b2-parent-zero" | "b2-freeform-zero",
+  //   }
+  // routing.outcome starts as one of "a"/"b1"/"b2"/"b3"/"c" (routeRoomConfirmation's
+  // decision); "view"/"pickerContext"/"freeformContext" track in-flow
+  // navigation (e.g. tapping "Choose another Room" opens the picker
+  // without re-running recognition). Declining outcome (a)/(b1)/(b2)/(b3)
+  // falls through by replacing `routing` with { outcome: "c" } in place,
+  // matching RoomFirstIdentityDesign.md's own "decline -> outcome (c)"
+  // rule for every declinable path.
+  // recognitionPendingRef holds { parsed, analysesRemaining } for the
+  // duration - a ref, not state, since it doesn't need to trigger its own
+  // render, only be available once the user completes confirmation. Both
   // cleared together, always, by whichever of
-  // confirmRecognitionCandidate/declineRecognitionCandidates/goHome/reset
-  // fires first - never left set once the screen is no longer showing.
-  const [recognitionCandidates, setRecognitionCandidates] = useState([]);
+  // completeRoomConfirmation/goHome/reset fires first - never left set
+  // once the screen is no longer showing.
+  const [roomConfirmation, setRoomConfirmation] = useState(null);
   const recognitionPendingRef = useRef(null);
+  // Controlled input for whichever freeform Room-name entry is currently
+  // open (roomConfirmation.freeformContext) - cleared whenever freeform
+  // mode closes, opens, or the whole flow resets.
+  const [roomFreeformInput, setRoomFreeformInput] = useState("");
+  // Room-First Identity, Phase B (Constraint per the task: Phase B does
+  // NOT persist anything - Phase C consumes this). Holds the resolved
+  // confirmation result object once the user completes any outcome, purely
+  // for local display (a preview of what Phase C will eventually save) and
+  // for dev inspection - never written to Firestore by Phase B itself.
+  const [pendingRoomConfirmationResult, setPendingRoomConfirmationResult] = useState(null);
+  // Room-First Identity, Phase C: in-flight save state for the Room
+  // confirmation screen. roomConfirmationSaving disables the action
+  // buttons while a save is outstanding (prevents a double-tap firing two
+  // creates). roomConfirmationError, when set, renders an inline error +
+  // retry banner on whichever confirmation view is currently showing -
+  // per the task's error-handling contract, a failed save must NOT clear
+  // roomConfirmation/recognitionPendingRef, so the user's selection stays
+  // intact and "try again" re-attempts without re-doing confirmation.
+  const [roomConfirmationSaving, setRoomConfirmationSaving] = useState(false);
+  const [roomConfirmationError, setRoomConfirmationError] = useState(null);
+  // Holds { resolvedResult, sourceCandidate } for whichever action was
+  // last attempted, so retryRoomConfirmation can re-invoke the exact same
+  // completeRoomConfirmation call after a failure - a ref, not state,
+  // since it doesn't need its own render.
+  const lastRoomConfirmationAttemptRef = useRef(null);
   // Remembered Home v1 Step 3, Phase D (RememberedHomeDesign.md §4): set
   // only by confirmRecognitionCandidate, read only by the Results screen's
   // own orientation banner. Not a separate timed sequence of screens (5s/
@@ -3006,9 +3047,49 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // stored as-is, unchanged, whether or not this is a returning
         // visit - the AI's own label is never suppressed, only
         // getSpaceDisplayName's PREFERRED source (spaceName) is set below
-        // when a canonical name already exists to inherit.
-        spaceType: plan.spaceType,
-        ...(canonicalSpaceId ? { canonicalSpaceId, spaceName: inheritedSpaceName } : {}),
+        // when a canonical name already exists to inherit. Room-First
+        // Identity (Implementation Phase A, Constraint 1): sourced from
+        // suggestedRoomName now - the AI no longer returns a flat
+        // spaceType field at all, so this is a field-source change, not
+        // just a rename. suggestedRoomName/suggestedAreaName themselves
+        // are never persisted (they exist only in the AI response/pending
+        // state) - only their confirmed-into-fields results are: spaceType
+        // (below), areaName/areaScope (below), and, when applicable,
+        // spaceName (via inheritance, unchanged). roomReason/areaReason
+        // (Constraint 2) are never referenced here at all - this object is
+        // built from an explicit field list, so there is no path by which
+        // either of the four ephemeral/evaluation-only fields could reach
+        // Firestore.
+        spaceType: plan.suggestedRoomName,
+        // areaName/areaScope: the CONFIRMED area-level classification
+        // (Room-First Identity Phase C) - plan.areaName/plan.areaScope are
+        // set by completeRoomConfirmation's confirmedPlan construction
+        // from the resolved confirmation result, not read directly off the
+        // AI's raw suggestedAreaName/areaScope (which may have been
+        // overridden by the user - e.g. "its own Room" always resolves to
+        // areaScope "whole-room" regardless of what the AI originally
+        // guessed). Falls back to the raw AI fields only for a caller that
+        // predates Phase C's confirmedPlan shape (defensive, not expected
+        // on any current call path). Descriptive metadata only (Room and
+        // Space Model.md's "Option A: plan only" - no Location Reference
+        // document, no sub-area UI, not durable identity yet).
+        areaName: plan.areaName !== undefined ? plan.areaName : (plan.suggestedAreaName ?? null),
+        areaScope: plan.areaScope ?? null,
+        // spaceName: the CONFIRMED Room name (Phase C). For a returning
+        // visit (canonicalSpaceId set), inheritedSpaceName - re-read fresh
+        // from the target Space's own displayName - always wins, exactly
+        // as before Room-First Identity (Step 1's own established
+        // contract: the Space's already-trusted name, not whatever this
+        // one photo's confirmation happened to say). For a NEW Room,
+        // plan.spaceName (the user-confirmed identity from Phase B/C) is
+        // written directly if provided - previously spaceName was never
+        // set at creation time for a first-time plan (only added later via
+        // an explicit rename); Room-First Identity changes this, since
+        // Room confirmation now IS that explicit identity act, just
+        // happening at creation time instead of afterward.
+        ...(canonicalSpaceId
+          ? { canonicalSpaceId, spaceName: inheritedSpaceName }
+          : (plan.spaceName ? { spaceName: plan.spaceName } : {})),
         overview: plan.overview,
         itemsFound: plan.itemsFound,
         tiers: plan.tiers,
@@ -3371,10 +3452,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     return newPlanId;
   };
 
-  // Remembered Home v1 Step 3: the two outcomes of the recognition proposal
-  // screen. Both consume recognitionPendingRef exactly once, then clear it
-  // - the same "clear the moment it's used" discipline organizeAgainContext
-  // already follows, see that state's own declaration.
+  // Room-First Identity, Phase B: NOT currently called anywhere - Phase B
+  // never creates a plan (identity-capture only, zero Firestore writes),
+  // so there is no planId yet for this to carry items onto. Left defined,
+  // unchanged, for Phase C to call once real persistence exists (after
+  // createReturningPlan/savePlanToHistory returns a real newPlanId) -
+  // exactly the role it already played in Step 3, unaffected by Phase B's
+  // routing changes.
   // Remembered Home v1 Step 3 (Implementation task, Companion hand-off /
   // test k): the recognition path cannot enrich its own initial
   // analyzePhoto prompt with prior context the way Step 2's Organize Again
@@ -3410,36 +3494,208 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
-  const confirmRecognitionCandidate = async (candidate) => {
+  // ---- Room-First Identity, Phase C: Room confirmation -> persistence ----
+  // The single completion point for every outcome (a/b1/b2/b3/c, and every
+  // sub-path within them): builds the normalized confirmedPlan payload
+  // from the CONFIRMED facts (resolvedResult), never the raw AI
+  // suggestions directly, then persists it via createReturningPlan (an
+  // existing Room) or savePlanToHistory (a new one) - the same two
+  // functions every other creation path in this file already uses, not a
+  // third, parallel save implementation. sourceCandidate (optional) is the
+  // full recognition-candidate object when this confirmation came directly
+  // from a matched candidate (outcome a, or a b1 card) - it carries
+  // unresolvedItems for carry-forward; b2/b3/picker/freeform paths don't
+  // have this (dedupeToKnownRooms's Room shape doesn't carry it), so
+  // carry-forward simply doesn't fire there - a disclosed, low-stakes
+  // limitation, not a silent gap (flagged in the implementation report).
+  const completeRoomConfirmation = async (resolvedResult, sourceCandidate) => {
     const pending = recognitionPendingRef.current;
-    if (!pending) return; // defensive - not reachable while the screen isn't showing, since that's gated on the same ref being set
-    setRecognitionCandidates([]);
-    recognitionPendingRef.current = null;
-    setResults(pending.parsed);
-    setJustConfirmedRecognition({ displayName: candidate.displayName, lastOrganizedAt: candidate.lastOrganizedAt, workSummary: candidate.workSummary });
-    logEvent(getAnalytics(), "plan_completed");
-    logEvent(getAnalytics(), "recognition_confirmed");
-    const newPlanId = await finalizeAnalysisResult(pending.parsed, candidate.canonicalSpaceId, pending.analysesRemaining);
-    if (newPlanId && candidate.unresolvedItems?.length) {
-      await carryForwardUnresolvedItems(user.uid, newPlanId, candidate.unresolvedItems);
+    if (!pending) return; // defensive - not reachable while the screen isn't showing
+    lastRoomConfirmationAttemptRef.current = { resolvedResult, sourceCandidate };
+    setRoomConfirmationError(null);
+    setRoomConfirmationSaving(true);
+
+    // Room-First Identity Phase C, point 1: the confirmation result, not
+    // the transient AI suggestion, determines persisted identity.
+    // suggestedRoomName/suggestedAreaName/roomReason/areaReason survive on
+    // this object only as inputs to savePlanToHistory's own explicit field
+    // list (which never spreads them into what's written - see its own
+    // declaration) - never persisted themselves (Constraint 1/2).
+    const confirmedPlan = {
+      ...pending.parsed,
+      spaceType: pending.parsed.suggestedRoomName,
+      spaceName: resolvedResult.confirmedRoomName,
+      areaName: resolvedResult.areaName,
+      areaScope: resolvedResult.areaScope,
+    };
+
+    try {
+      let newPlanId = null;
+      if (resolvedResult.outcome === "existing-room") {
+        const returningResult = await createReturningPlan(confirmedPlan, resolvedResult.canonicalSpaceId);
+        if (returningResult.outcome === "invalid-target-space") {
+          // Error handling, point 5: remain on the confirmation flow with
+          // the user's selection intact - roomConfirmation/
+          // recognitionPendingRef are deliberately NOT cleared here.
+          setRoomConfirmationSaving(false);
+          setRoomConfirmationError("This room is no longer available. It may have been merged with another room.");
+          return;
+        }
+        newPlanId = returningResult.planId;
+      } else {
+        newPlanId = await savePlanToHistory(confirmedPlan);
+      }
+
+      if (!newPlanId) {
+        setRoomConfirmationSaving(false);
+        setRoomConfirmationError("We couldn't save your plan. Please try again.");
+        return;
+      }
+
+      // Success - only now clear the pending/confirmation state and
+      // navigate. Everything above this point is retry-safe: a failure
+      // never touched roomConfirmation, recognitionPendingRef, or results.
+      lastRoomConfirmationAttemptRef.current = null;
+      recognitionPendingRef.current = null;
+      setRoomFreeformInput("");
+      setRoomConfirmationSaving(false);
+      setRoomConfirmationError(null);
+      setPendingRoomConfirmationResult(resolvedResult);
+      dlog(`[ROOM-FIRST] resolved confirmation persisted: ${JSON.stringify(resolvedResult)}, planId=${newPlanId}`);
+      logEvent(getAnalytics(), "room_confirmation_resolved", { outcome: resolvedResult.outcome });
+
+      // Point 3: welcome-back fires ONLY for a genuine returning
+      // confirmation - the user explicitly said "yes, I'm returning," so
+      // "Welcome back to your X" is honest, unlike Phase B's transitional
+      // state where nothing was actually confirmed yet.
+      if (resolvedResult.outcome === "existing-room") {
+        setJustConfirmedRecognition({
+          displayName: resolvedResult.confirmedRoomName,
+          lastOrganizedAt: sourceCandidate?.lastOrganizedAt ?? null,
+          workSummary: sourceCandidate?.workSummary ?? null,
+        });
+      }
+
+      setRoomConfirmation(null);
+      setResults(confirmedPlan);
+      logEvent(getAnalytics(), "plan_completed");
+
+      const validBatch = Array.isArray(confirmedPlan.firstActionBatch) && confirmedPlan.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+      if (validBatch) {
+        logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
+      } else {
+        logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
+      }
+      setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+      if (typeof pending.analysesRemaining === "number") {
+        const newCount = Math.max(0, 3 - pending.analysesRemaining);
+        setAnalyses(newCount);
+        await AsyncStorage.setItem("analysisCount", newCount.toString());
+      }
+
+      // Carry-forward (Step 3's existing mechanism) - only when this
+      // confirmation came directly from a matched candidate that actually
+      // carries unresolvedItems (outcome a, or a b1 card).
+      if (sourceCandidate?.unresolvedItems?.length) {
+        await carryForwardUnresolvedItems(user.uid, newPlanId, sourceCandidate.unresolvedItems);
+      }
+    } catch (e) {
+      setRoomConfirmationSaving(false);
+      setRoomConfirmationError("Something went wrong saving your plan. Please try again.");
+      console.log("Room confirmation save error:", e.message);
     }
   };
 
-  // reason: "new-room" | "not-sure" - same code path either way
-  // (RememberedHomeDesign.md §2c: "No" and "Not sure" are deliberately the
-  // same code path, not two answers to two different questions), reason is
-  // used only for analytics, never to alter behavior. Nothing is recorded
-  // about the decline itself - no Firestore write, no rejection ledger -
-  // the same match can be proposed again on a future photo.
-  const declineRecognitionCandidates = async (reason) => {
-    const pending = recognitionPendingRef.current;
-    if (!pending) return;
-    setRecognitionCandidates([]);
-    recognitionPendingRef.current = null;
-    setResults(pending.parsed);
-    logEvent(getAnalytics(), "plan_completed");
-    logEvent(getAnalytics(), "recognition_declined", { reason });
-    await finalizeAnalysisResult(pending.parsed, null, pending.analysesRemaining);
+  const retryRoomConfirmation = () => {
+    const attempt = lastRoomConfirmationAttemptRef.current;
+    if (attempt) completeRoomConfirmation(attempt.resolvedResult, attempt.sourceCandidate);
+  };
+
+  // Declining outcome (a)/(b1)/(b2)/(b3) falls through to outcome (c) IN
+  // PLACE - RoomFirstIdentityDesign.md's own "decline -> outcome (c)" rule
+  // for every declinable path, no new recognition run (the same
+  // knownRooms/pending analysis stay valid).
+  const declineToOutcomeC = () => {
+    setRoomConfirmation(prev => prev ? { ...prev, routing: { outcome: "c" }, view: "main", pickerContext: null, freeformContext: null } : prev);
+  };
+
+  const openRoomPicker = (pickerContext) => {
+    setRoomConfirmation(prev => prev ? { ...prev, view: "picker", pickerContext } : prev);
+  };
+
+  const openRoomFreeform = (freeformContext) => {
+    setRoomFreeformInput("");
+    setRoomConfirmation(prev => prev ? { ...prev, view: "freeform", freeformContext } : prev);
+  };
+
+  const backToRoomConfirmationMain = () => {
+    setRoomFreeformInput("");
+    setRoomConfirmation(prev => prev ? { ...prev, view: "main", pickerContext: null, freeformContext: null } : prev);
+  };
+
+  // Room picker selection - used by b1's decline-fallback, b2/b3's
+  // "choose another Room", and outcome (c)'s existing-Rooms secondary
+  // option. pickerContext decides what the same selection means: a
+  // "-inside" context means the picked Room becomes the PARENT of the
+  // ambiguous label (areaName set, sub-area); every other context is a
+  // plain "this plan belongs to this Room" confirmation, passing the AI's
+  // own area fields through unchanged (same as outcome (a)).
+  const onRoomPickerSelect = (room) => {
+    const parsed = recognitionPendingRef.current?.parsed;
+    const ctx = roomConfirmation?.pickerContext;
+    if (ctx === "b2-inside" || ctx === "b3-inside") {
+      completeRoomConfirmation(resolveExistingRoomConfirmation(room, { areaName: parsed?.suggestedRoomName ?? null, areaScope: "sub-area" }));
+    } else {
+      completeRoomConfirmation(resolveExistingRoomConfirmation(room, { areaName: parsed?.suggestedAreaName ?? null, areaScope: parsed?.areaScope || "whole-room" }));
+    }
+  };
+
+  // b2/b3's "[Label] is its own Room" - checks routing.exactStandaloneMatch
+  // first (RoomFirstIdentityDesign.md §4 b2's own nuance: if a real
+  // existing Room already shares this exact label, confirm THAT Room
+  // rather than creating a duplicate).
+  const onOwnRoom = () => {
+    const routing = roomConfirmation?.routing;
+    const parsed = recognitionPendingRef.current?.parsed;
+    if (routing?.outcome === "b2" && routing.exactStandaloneMatch) {
+      completeRoomConfirmation(resolveExistingRoomConfirmation(routing.exactStandaloneMatch, { areaName: null, areaScope: "whole-room" }));
+      return;
+    }
+    const label = routing?.outcome === "b3" ? routing.candidate.displayName : parsed?.suggestedRoomName;
+    completeRoomConfirmation(resolveNewRoomConfirmation(label, { areaName: null, areaScope: "whole-room" }));
+  };
+
+  // b2/b3's specific "[Label] is inside [Room]" button (the plausibleParent
+  // case, shown only when exactly one plausible parent was found) - same
+  // resolution as picking that same Room from the picker.
+  const onInsideSpecificParent = () => {
+    const parent = roomConfirmation?.routing?.plausibleParent;
+    if (parent) onRoomPickerSelect(parent);
+  };
+
+  // Freeform Room-name entry - covers outcome (c)'s tertiary option, and
+  // the first-time-zero-Rooms b2 variant's two freeform choices.
+  // "b2-parent-zero" ("Create the Room it belongs to"): the typed name
+  // becomes the whole NEW Room; the ambiguous label becomes its area -
+  // this is the one freeform path where areaName/areaScope survive.
+  // Every other freeform path: the typed name IS the whole Room: the user
+  // is asserting this is its own thing under a name they chose, so the
+  // area distinction dissolves (areaName null, whole-room).
+  const onSubmitRoomFreeform = () => {
+    const trimmed = roomFreeformInput.trim();
+    if (!trimmed) return;
+    const parsed = recognitionPendingRef.current?.parsed;
+    if (roomConfirmation?.freeformContext === "b2-parent-zero") {
+      completeRoomConfirmation(resolveNewRoomConfirmation(trimmed, { areaName: parsed?.suggestedRoomName ?? null, areaScope: "sub-area" }));
+    } else {
+      completeRoomConfirmation(resolveNewRoomConfirmation(trimmed, { areaName: null, areaScope: "whole-room" }));
+    }
+  };
+
+  // Outcome (c) primary: accept the AI's own suggestion as-is.
+  const onAcceptSuggestedRoom = () => {
+    const parsed = recognitionPendingRef.current?.parsed;
+    completeRoomConfirmation(resolveNewRoomConfirmation(parsed?.suggestedRoomName, { areaName: parsed?.suggestedAreaName ?? null, areaScope: parsed?.areaScope || "whole-room" }));
   };
 
   const analyze = async () => {
@@ -3517,7 +3773,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const priorPhotoPreamble = priorPhotoBase64
         ? `You are shown two photos, in this exact order. Photo 1 is how this space looked during the last organizing session - prior evidence only, not something to re-describe. Photo 2 is how it looks right now, today. Base every recommendation on what is genuinely visible in Photo 2 (today's photo) - Photo 1 is only for noticing what has changed since last time, never a substitute for looking freshly at today's photo.\n\n`
         : "";
-      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"spaceType":"short label","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      // Room-First Identity (Implementation Phase A): two separate
+      // classification questions, not one flat label - RoomFirstIdentityDesign
+      // (the design pass this implements) §1a. Placed right before the
+      // "never use em dashes"/JSON-contract tail, same position the old
+      // single-field instruction never needed since spaceType had no
+      // classification logic of its own to explain.
+      const roomAreaInstruction = `Before returning your classification, determine two separate things about this photo: (1) SUGGESTED ROOM - what room of the home was this photo taken in? Use a short, common label (Living Room, Kitchen, Garage, Bedroom). (2) SUGGESTED AREA - is this photo the room as a whole, or is it focused on one specific zone or fixture within a larger room? Classify areaScope as exactly one of: "whole-room" (the photo shows the general room - multiple furniture types or zones, not tightly focused on one fixture; suggestedAreaName is null), "sub-area" (the photo is tightly framed on one specific zone or fixture that is clearly part of a larger room not fully shown; set suggestedAreaName to a short label for that zone), or "ambiguous" (the room-level label itself commonly means either a fully independent room or a named zone within a larger room, depending on the specific home - for example Pantry, Closet, Mudroom, Laundry Area, or Home Office - and this one photo does not give you enough context to tell which this home means). When ambiguous, still provide your best suggestedRoomName as the standalone-room interpretation - the app will ask the user to confirm which it actually is. Never invent a numerical confidence score. For roomReason and areaReason, cite the specific visible evidence behind your classification (for example "multiple seating pieces and a TV console visible" or "photo is tightly cropped on a single shelving unit, no other room furniture visible") - never just restate the label itself as its own justification.\n\n`;
+      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -3584,28 +3847,56 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // covers every free-form field the model wrote (overview, proTip,
       // suggestions, firstAction, etc.), not just Companion text.
       const parsed = sanitizeAiText(JSON.parse(match[0]));
+      // Room-First Identity (Implementation Phase A): getSpaceDisplayName
+      // (shared/spaceMigration.js) reads spaceName||spaceType - a stable,
+      // widely-used contract this change deliberately does not touch, since
+      // every SAVED plan document continues to have spaceType populated
+      // (savePlanToHistory now sources it from suggestedRoomName). But
+      // `results`/`parsed` is displayed (Results screen header, share
+      // sheet, image-generation prompt) for a window BEFORE the background
+      // save completes, and the AI no longer returns spaceType directly -
+      // this local alias keeps that window showing the same label it
+      // always has, in memory only, matching exactly what savePlanToHistory
+      // is about to persist a moment later. Not a Constraint 1 violation:
+      // Constraint 1 governs the PERSISTED document (built independently,
+      // explicitly, in savePlanToHistory) - this is a local display
+      // convenience on the transient in-memory object, same value either way.
+      parsed.spaceType = parsed.suggestedRoomName;
       dlog(`[COMPANION DEBUG 3] parsed.firstActionBatch: ${JSON.stringify(parsed.firstActionBatch)} | isArray: ${Array.isArray(parsed.firstActionBatch)}`);
+      // Room-First Identity (Implementation Phase A, Constraint 2):
+      // roomReason/areaReason are evaluation-only - logged here, to this
+      // file's own dev-only debug buffer (debugShareLog, never Firestore),
+      // for staging/prompt-tuning visibility, and never referenced again
+      // after this line. They are NOT added to any object that later
+      // reaches Firestore - savePlanToHistory builds its own explicit
+      // field list and does not spread parsed/plan wholesale, so there is
+      // no code path by which these two fields could leak into a saved
+      // plan document.
+      dlog(`[ROOM-FIRST] suggestedRoomName=${parsed.suggestedRoomName} | suggestedAreaName=${parsed.suggestedAreaName} | areaScope=${parsed.areaScope} | roomReason=${parsed.roomReason} | areaReason=${parsed.areaReason}`);
       lastFailedAnalysisRef.current = null; // this analysisId succeeded - never reuse it, a later reuse would just replay this cached result
 
-      // Remembered Home v1 Step 3 (RememberedHomeDesign.md §2 / Implementation
-      // Step 3): recognition only applies to the generic-camera path - a
-      // returning visit via Organize Again (Step 2) already knows its target
-      // through navigation, so a recognition check here would be redundant
-      // and would risk proposing something when identity is already
-      // established through the stronger mechanism (navigation). Governing
-      // principle: exact getSpaceDisplayName match is the only v1 signal; no
-      // match means zero added friction, straight through the path below,
-      // byte-identical to pre-Step-3 behavior.
-      const recognitionMatches = returningContext ? [] : await findRecognitionCandidates(getSpaceDisplayName(parsed), history, user.uid);
-      if (recognitionMatches.length) {
-        // Pause here - the proposal screen (recognitionCandidates truthy)
-        // takes over on the next render, ahead of Results in the if-chain.
-        // Nothing is saved yet. parsed/analysesRemaining are held in a ref,
-        // not state, since they don't need to trigger a render themselves -
-        // only to be available to confirmRecognitionCandidate/
-        // declineRecognitionCandidates once the user acts.
+      // Room-First Identity, Phase B (RoomFirstIdentityDesign.md §2):
+      // supersedes Step 3's single-outcome recognition check - a returning
+      // visit via Organize Again (Step 2) still knows its target through
+      // navigation and skips this entirely (returningContext), but for the
+      // generic-camera path, Room identity must ALWAYS be established now,
+      // not just when a match happens to exist (revising Step 3's own
+      // "zero friction on no match" principle - flagged explicitly in the
+      // design pass and reaffirmed in the implementation report). Matches
+      // at the ROOM level - parsed.suggestedRoomName; suggestedAreaName
+      // never reaches this call, by construction.
+      if (!returningContext) {
+        const rawMatches = await findRecognitionCandidates(parsed.suggestedRoomName, history, user.uid);
+        const knownRooms = dedupeToKnownRooms(history.map(h => ({ id: h.id, data: h })));
+        const routing = routeRoomConfirmation(parsed, rawMatches, knownRooms);
+        // Pause here - the Room confirmation screen (roomConfirmation
+        // truthy) takes over on the next render, ahead of Results in the
+        // if-chain. Nothing is saved yet, for ANY outcome including (a) -
+        // Phase B produces a resolved result and stops; Phase C persists
+        // it. parsed/analysesRemaining held in a ref, not state, since
+        // they don't need to trigger a render themselves.
         recognitionPendingRef.current = { parsed, analysesRemaining };
-        setRecognitionCandidates(recognitionMatches);
+        setRoomConfirmation({ routing, knownRooms, view: "main", pickerContext: null, freeformContext: null });
         setLoading(false);
         stopLoadMessages();
         return;
@@ -3744,7 +4035,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const productList = tier.products?.map(p => p.name).join(", ");
       const suggestionList = tier.suggestions?.join(". ");
       const itemsFound = results.itemsFound?.join(", ") || "";
-      const prompt = `Reorganize and declutter this exact ${results.spaceType}. Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes. Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the suggestions say to.` : ""} Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.`;
+      // Room-First Identity (Implementation Phase A): results.spaceType is
+      // only populated once a plan is actually saved (savePlanToHistory
+      // sets it from suggestedRoomName) - a freshly-analyzed, not-yet-saved
+      // `results` (the raw parsed AI response) carries suggestedRoomName
+      // directly instead. Both read here since generateVisualization can
+      // run against either shape, depending on how quickly the user taps
+      // "See the transformation" relative to the background save.
+      const roomLabelForViz = results.spaceType || results.suggestedRoomName || "room";
+      const prompt = `Reorganize and declutter this exact ${roomLabelForViz}. Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes. Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the suggestions say to.` : ""} Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.`;
 
       // Use the image EDIT endpoint (not generations) so the model anchors on the
       // user's actual photo instead of inventing an unrelated room from text alone.
@@ -4236,8 +4535,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRecognitionCandidates([]); recognitionPendingRef.current = null; setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRecognitionCandidates([]); recognitionPendingRef.current = null; setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -4259,10 +4558,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // Reached only from My Spaces (History) - back returns there, not
       // to Menu, matching the drill-down it actually came from.
       if (spaceDetailPlanId) { setSpaceDetailPlanId(null); setShowHistory(true); return true; }
-      // Remembered Home v1 Step 3: backing out of the recognition proposal
-      // is a decline, not a no-op or an accidental exit - same "No"/"Not
-      // sure" code path (declineRecognitionCandidates), nothing recorded.
-      if (recognitionCandidates.length) { declineRecognitionCandidates("back-button"); return true; }
+      // Room-First Identity, Phase B: backing out of the Room confirmation
+      // screen steps back through it, never a no-op. Within a sub-view
+      // (picker/freeform), back returns to that outcome's main chooser.
+      // At the main view of a declinable outcome (a/b1/b2/b3), back
+      // declines to outcome (c), same as the explicit decline buttons. At
+      // outcome (c) itself (nothing left to fall through to) or from any
+      // other state, back cancels the whole confirmation - clears
+      // roomConfirmation/recognitionPendingRef with zero residual state
+      // (test k) and returns to the photo-preview Home screen, keeping the
+      // photo so the user can retry rather than losing it entirely.
+      if (roomConfirmation) {
+        if (roomConfirmation.view !== "main") { backToRoomConfirmationMain(); return true; }
+        if (roomConfirmation.routing.outcome !== "c") { declineToOutcomeC(); return true; }
+        recognitionPendingRef.current = null;
+        setRoomFreeformInput("");
+        setRoomConfirmation(null);
+        return true;
+      }
       // Checked before the Companion branch below, same reasoning as
       // History/FAQ/Account above it - the wrap-up screen (DecisionLog.md
       // 2026-07-19) is a step within Companion, not its own destination, so
@@ -4280,7 +4593,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, recognitionCandidates, results, showCompanion, unresolvedReview]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, roomConfirmation, results, showCompanion, unresolvedReview]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -5447,77 +5760,254 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
-  // RECOGNITION PROPOSAL SCREEN (Remembered Home v1 Step 3,
-  // RememberedHomeDesign.md §2). Shown only when findRecognitionCandidates
-  // found at least one exact getSpaceDisplayName match for the fresh photo's
-  // AI label - governing principle: recognition proposes, never asserts, so
-  // this screen never appears silently folded into Results; it's its own
-  // explicit stop, ahead of Results in the if-chain, exactly like every
-  // other interstitial in this file (paywall, merge review).
-  if (recognitionCandidates.length) {
+  // ROOM CONFIRMATION SCREEN (Room-First Identity, Phase B -
+  // RoomFirstIdentityDesign.md §2). Shown for every generic-camera photo
+  // analysis (Organize Again/Step 2 skips it entirely via
+  // navigation-established identity) - Room identity must always be
+  // established now, not just when a match happens to exist. Governing
+  // principle: recognition proposes, never asserts - this screen is
+  // always its own explicit stop, ahead of Results, exactly like every
+  // other interstitial in this file. Phase B produces a resolved
+  // confirmation result and stops - it does NOT save anything; every
+  // action below routes through completeRoomConfirmation, which only
+  // ever touches local React state (see its own declaration above).
+  if (roomConfirmation) {
     const daysAgo = (iso) => {
       if (!iso) return null;
       const ms = Date.now() - Date.parse(iso);
-      const days = Math.max(0, Math.round(ms / (24 * 60 * 60 * 1000)));
-      return days;
+      return Math.max(0, Math.round(ms / (24 * 60 * 60 * 1000)));
     };
-    return (
-      <SafeAreaView style={s.safe}>
-        <StatusBar barStyle="light-content" />
+    const pendingParsed = recognitionPendingRef.current?.parsed;
+    const { routing, knownRooms, view, freeformContext } = roomConfirmation;
+
+    const EvidenceCardForCandidate = ({ candidate, onConfirm, confirmLabel }) => {
+      const days = daysAgo(candidate.lastOrganizedAt);
+      return (
+        <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
+          <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+            <View style={{ flex: 1 }}>
+              <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                {candidate.priorPhotoUrl && <Image source={{ uri: candidate.priorPhotoUrl }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                <Text style={s.beforeAfterStackLabel}>LAST TIME</Text>
+              </View>
+            </View>
+            <View style={{ flex: 1 }}>
+              <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                {photo?.uri && <Image source={{ uri: photo.uri }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                <Text style={s.beforeAfterStackLabel}>TODAY</Text>
+              </View>
+            </View>
+          </View>
+          <Text style={{ fontSize: 15, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 2 }}>{candidate.displayName}</Text>
+          <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
+            {days !== null ? `Last organized ${days} day${days === 1 ? "" : "s"} ago` : "Last organized a while ago"}
+            {candidate.workSummary ? ` · ${candidate.workSummary}` : ""}
+          </Text>
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onConfirm}>
+            <Text style={[s.startOverText, { color: "white" }]}>{confirmLabel}</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    };
+
+    const RoomConfirmationHeader = ({ title }) => (
+      <>
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          <TouchableOpacity onPress={goHome} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+          {/* Cancels the whole confirmation - clears roomConfirmation/
+              recognitionPendingRef with zero residual state (test k),
+              returning to the photo-preview Home screen rather than losing
+              the photo entirely. Same clearing the Android back handler's
+              outcome-(c) branch does. Disabled while a save is outstanding
+              - cancelling mid-save could otherwise orphan a write already
+              in flight. */}
+          <TouchableOpacity disabled={roomConfirmationSaving} onPress={() => { recognitionPendingRef.current = null; setRoomFreeformInput(""); setRoomConfirmation(null); }} style={s.hdrMark} accessibilityLabel="Cancel and go home" accessibilityRole="button">
             <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <View style={{ flex: 1 }}>
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrPageName}>Have we organized this room before?</Text>
+            <Text style={s.hdrPageName}>{title}</Text>
           </View>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
-          {recognitionCandidates.map((candidate) => {
-            const days = daysAgo(candidate.lastOrganizedAt);
-            return (
-              <View key={candidate.canonicalSpaceId} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
-                <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
-                  <View style={{ flex: 1 }}>
-                    <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
-                      {candidate.priorPhotoUrl && <Image source={{ uri: candidate.priorPhotoUrl }} style={s.beforeAfterStackImage} resizeMode="cover" />}
-                      <Text style={s.beforeAfterStackLabel}>LAST TIME</Text>
-                    </View>
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
-                      {photo?.uri && <Image source={{ uri: photo.uri }} style={s.beforeAfterStackImage} resizeMode="cover" />}
-                      <Text style={s.beforeAfterStackLabel}>TODAY</Text>
-                    </View>
-                  </View>
-                </View>
-                <Text style={{ fontSize: 15, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 2 }}>{candidate.displayName}</Text>
-                <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
-                  {days !== null ? `Last organized ${days} day${days === 1 ? "" : "s"} ago` : "Last organized a while ago"}
-                  {candidate.workSummary ? ` · ${candidate.workSummary}` : ""}
-                </Text>
-                <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => confirmRecognitionCandidate(candidate)}>
-                  <Text style={[s.startOverText, { color: "white" }]}>{`Yes, this is my ${candidate.displayName}`}</Text>
+        {/* Error handling, point 5: a failed save leaves roomConfirmation/
+            recognitionPendingRef untouched (see completeRoomConfirmation's
+            own catch/early-return paths) - this banner surfaces the error
+            with a retry that re-attempts the EXACT same resolved result,
+            never asking the user to redo their Room choice. */}
+        {roomConfirmationError && (
+          <View style={{ backgroundColor: "#FEF2F2", borderBottomWidth: 1, borderBottomColor: "#FCA5A5", padding: 12, flexDirection: "row", alignItems: "center", gap: 10 }}>
+            <Text style={{ flex: 1, fontSize: 13, color: "#B91C1C" }}>{roomConfirmationError}</Text>
+            <TouchableOpacity onPress={retryRoomConfirmation} style={{ paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#B91C1C", borderRadius: 8 }}>
+              <Text style={{ color: "white", fontSize: 13, fontFamily: "Inter_600SemiBold" }}>Try Again</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </>
+    );
+
+    // ---- Sub-view: Room picker - reused by b1's decline-fallback, b2/b3's
+    // "choose another Room", and outcome (c)'s existing-Rooms option.
+    // pickerContext (read inside onRoomPickerSelect) decides what
+    // selecting a Room actually means. ----
+    if (view === "picker") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title="Choose a Room" />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            {knownRooms.length === 0 && (
+              <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 12 }}>You don't have any saved Rooms yet.</Text>
+            )}
+            {knownRooms.map((room) => (
+              <TouchableOpacity key={room.canonicalSpaceId} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10 }} onPress={() => onRoomPickerSelect(room)}>
+                <Text style={{ fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink }}>{room.displayName}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
+              <Text style={s.mergeSecondaryBtnText}>Back</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // ---- Sub-view: freeform Room-name entry ----
+    if (view === "freeform") {
+      const isParentFlavor = freeformContext === "b2-parent-zero";
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title={isParentFlavor ? "What's the Room called?" : "Enter a Room name"} />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            <TextInput
+              style={s.renameSheetInput}
+              value={roomFreeformInput}
+              onChangeText={setRoomFreeformInput}
+              placeholder={isParentFlavor ? "e.g. Kitchen" : "e.g. Guest Bedroom"}
+              autoFocus
+            />
+            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: roomFreeformInput.trim() ? 1 : 0.5 }]} disabled={!roomFreeformInput.trim()} onPress={onSubmitRoomFreeform}>
+              <Text style={[s.startOverText, { color: "white" }]}>Save</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
+              <Text style={s.mergeSecondaryBtnText}>Back</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // ---- Main view: outcome-specific chooser ----
+
+    // Outcome (a): one exact Room match, compact confirmation - "nearly
+    // invisible" friction: one tap to confirm, one to decline.
+    if (routing.outcome === "a") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title={`Is this in your ${routing.candidate.displayName}?`} />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            <EvidenceCardForCandidate
+              candidate={routing.candidate}
+              confirmLabel={`Yes, this is my ${routing.candidate.displayName}`}
+              onConfirm={() => completeRoomConfirmation(resolveExistingRoomConfirmation(routing.candidate, { areaName: pendingParsed?.suggestedAreaName ?? null, areaScope: pendingParsed?.areaScope || "whole-room" }), routing.candidate)}
+            />
+            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC}>
+              <Text style={s.mergeSecondaryBtnText}>No, this is a new room</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // Outcome (b1): multiple same-named Rooms - stacked cards, not a
+    // carousel, each with its own evidence.
+    if (routing.outcome === "b1") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title="Have we organized this room before?" />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            {routing.candidates.map((candidate) => (
+              <EvidenceCardForCandidate
+                key={candidate.canonicalSpaceId}
+                candidate={candidate}
+                confirmLabel={`Yes, this is my ${candidate.displayName}`}
+                onConfirm={() => completeRoomConfirmation(resolveExistingRoomConfirmation(candidate, { areaName: pendingParsed?.suggestedAreaName ?? null, areaScope: pendingParsed?.areaScope || "whole-room" }), candidate)}
+              />
+            ))}
+            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC}>
+              <Text style={s.mergeSecondaryBtnText}>None of these - it's a new room</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // Outcome (b2)/(b3): ambiguous chooser - same shape and options
+    // (RoomFirstIdentityDesign.md §4 b3: "same ambiguous chooser as b2"),
+    // different header copy and label source.
+    if (routing.outcome === "b2" || routing.outcome === "b3") {
+      const label = routing.outcome === "b3" ? routing.candidate.displayName : (pendingParsed?.suggestedRoomName || "");
+      const headerTitle = routing.outcome === "b3"
+        ? `"${label}" looks like it might be part of a larger room`
+        : `Is ${label} its own room, or part of another room?`;
+      const insidePickerContext = routing.outcome === "b3" ? "b3-inside" : "b2-inside";
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title={headerTitle} />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            {routing.outcome === "b3" && (
+              <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 14 }}>Is it its own room, or part of an existing room?</Text>
+            )}
+            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onOwnRoom}>
+              <Text style={[s.startOverText, { color: "white" }]}>{`${label} is its own Room`}</Text>
+            </TouchableOpacity>
+            {routing.firstTimeUser ? (
+              <>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-parent-zero")}>
+                  <Text style={s.mergeSecondaryBtnText}>Create the Room it belongs to</Text>
                 </TouchableOpacity>
-                <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
-                  {/* No/Not sure on a multi-candidate screen dismiss the
-                      ENTIRE screen, not just this one card - the user has
-                      already indicated this isn't a returning visit at
-                      all, per the task's own recommendation; re-showing
-                      the remaining cards would imply "maybe try again,"
-                      contradicting a decline that was about the new photo,
-                      not about any one specific candidate. */}
-                  <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={() => declineRecognitionCandidates("new-room")}>
-                    <Text style={s.mergeSecondaryBtnText}>No, this is a new room</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={() => declineRecognitionCandidates("not-sure")}>
-                    <Text style={s.mergeSecondaryBtnText}>Not sure</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            );
-          })}
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-freeform-zero")}>
+                  <Text style={s.mergeSecondaryBtnText}>Enter a different Room name</Text>
+                </TouchableOpacity>
+              </>
+            ) : routing.plausibleParent ? (
+              <>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onInsideSpecificParent}>
+                  <Text style={s.mergeSecondaryBtnText}>{`${label} is inside ${routing.plausibleParent.displayName}`}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)}>
+                  <Text style={s.mergeSecondaryBtnText}>Choose another Room</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)}>
+                <Text style={s.mergeSecondaryBtnText}>{`${label} is inside another Room`}</Text>
+              </TouchableOpacity>
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // Outcome (c): no existing match.
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <RoomConfirmationHeader title={`We think this is your ${pendingParsed?.suggestedRoomName || "room"}. Is that right?`} />
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onAcceptSuggestedRoom}>
+            <Text style={[s.startOverText, { color: "white" }]}>{`Yes, create "${pendingParsed?.suggestedRoomName || ""}"`}</Text>
+          </TouchableOpacity>
+          {knownRooms.length > 0 && (
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker("c-secondary")}>
+              <Text style={s.mergeSecondaryBtnText}>Actually, it's an existing Room</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("c-tertiary")}>
+            <Text style={s.mergeSecondaryBtnText}>Enter a different name</Text>
+          </TouchableOpacity>
         </ScrollView>
       </SafeAreaView>
     );

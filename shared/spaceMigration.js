@@ -342,6 +342,16 @@ const DETECTION_VERSION = 1;
 // the Invariant declared above getSpaceDisplayName's definition:
 // detection must group on the exact same name the user sees, or a
 // rename could leave stale, contradictory clustering behind.
+//
+// Phase D.5: applies the same classifyLegacySpaceType guard recognition
+// already uses. Only room-like and user-confirmed plans are eligible for
+// Room-level candidate generation - area-like/ambiguous plans (structurally
+// sub-area descriptions, not Room names) are excluded from detection
+// entirely until the user explicitly confirms them as a Room through the
+// Room-First confirmation flow. Without this, an area-like legacy plan and
+// an unrelated new plan that happen to share a display name would be
+// proposed as a merge candidate based on a semantic mismatch the system
+// already knows how to identify.
 function detectMergeCandidates(plans) {
   const bySpaceType = new Map();
   for (const plan of plans) {
@@ -357,6 +367,8 @@ function detectMergeCandidates(plans) {
     // it's still a real, independent plan with its own real label, fully
     // eligible to be proposed against a genuinely new same-labeled plan.
     if (plan.data && plan.data.canonicalSpaceId && plan.data.canonicalSpaceId !== plan.id) continue;
+    const legacyClassification = plan.data && classifyLegacySpaceType(plan.data);
+    if (legacyClassification !== "room-like" && legacyClassification !== "user-confirmed") continue;
     const spaceType = plan.data && getSpaceDisplayName(plan.data);
     if (!spaceType) continue;
     if (!bySpaceType.has(spaceType)) bySpaceType.set(spaceType, []);
@@ -589,6 +601,67 @@ function validateTargetSpace(spaceData) {
 // Returns [] when nothing matches - the caller's signal for "no proposal,
 // straight to fresh-start, zero added friction," never a special case
 // this function itself has to represent differently.
+// ---- Room-First Identity: legacy plan classification ----
+// Pure. RoomFirstIdentityDesign §4. Runs on-demand at recognition time
+// against whatever candidate plans resolveRecognitionCandidates already
+// found - never stored, never backfilled. Checked in this order because
+// explicit user intent always outranks a heuristic guess:
+//   1. user-confirmed - the user has already established this plan's
+//      identity themselves (an explicit rename, or an already-confirmed
+//      returning visit). Nothing left to guess.
+//   2. room-like - the label is, on its own, an unambiguous whole-room
+//      noun (Kitchen, Bedroom, ...). Safe to treat as a real Room.
+//   3. area-like - the label is a room-type root plus a fixture/zone
+//      qualifier (Bathroom Cabinet, Kitchen Island, ...) - structurally a
+//      sub-area description, not a room name; must never compete as a
+//      one-tap Room candidate (RoomFirstIdentityDesign §4's own safe
+//      behavior).
+//   4. ambiguous - everything else, including the illustrative
+//      standalone-or-area terms (Pantry, Closet, Mudroom, Home Office)
+//      and any label the other two buckets don't recognize. Deliberately
+//      the default/fallback, not a curated list - a false "ambiguous" is
+//      low-cost (one extra confirmation tap); a false "room-like" is not
+//      (a real area silently becomes a fake top-level Room, the exact
+//      "Display Wall With Shelving" bug this whole design exists to fix).
+const ROOM_LIKE_LABELS = new Set([
+  "kitchen", "bedroom", "master bedroom", "guest bedroom", "bathroom",
+  "master bathroom", "half bathroom", "powder room", "garage",
+  "dining room", "living room", "family room", "basement", "attic",
+  "laundry room", "utility room", "storage room", "sunroom", "playroom",
+  "den", "nursery", "foyer", "entryway", "hallway", "workshop", "studio",
+  "gym", "guest room", "wine cellar", "home theater", "library", "porch",
+  "garden", "yard",
+]);
+
+// Fixture/zone qualifier words that, appended to (or combined with) a room
+// root, mark a label as describing a SUB-AREA rather than the room itself.
+// Matched as a substring of the lowercased label - deliberately loose
+// (matches "Kitchen Island Workspace" via both "island" and "workspace"),
+// since a false area-like match only costs one extra confirmation tap,
+// while a false room-like match creates a fake top-level Room.
+const AREA_QUALIFIER_WORDS = [
+  "cabinet", "corner", "counter", "console", "nook", "shelf", "shelving",
+  "display", "workstation", "desk", "vanity", "drawer", "windowsill",
+  "station", "island", "rack", "wall", "closet organizer",
+  // Phase D.5: storage/workspace/media center generally mark a sub-area
+  // within a Room (Basement Storage Area, Home Office Workspace, Living
+  // Room Media Center), not the Room itself. Safe to add here because the
+  // exact-room-noun check (ROOM_LIKE_LABELS) runs first and still wins for
+  // genuine whole-Room labels like "Storage Room".
+  "storage", "workspace", "media center",
+];
+
+function classifyLegacySpaceType(planData) {
+  if (!planData) return "ambiguous";
+  if (typeof planData.spaceName === "string" && planData.spaceName.trim()) return "user-confirmed";
+  if (planData.canonicalSpaceId) return "user-confirmed";
+  const label = (typeof planData.spaceType === "string" ? planData.spaceType : "").trim().toLowerCase();
+  if (!label) return "ambiguous";
+  if (ROOM_LIKE_LABELS.has(label)) return "room-like";
+  if (AREA_QUALIFIER_WORDS.some((w) => label.includes(w))) return "area-like";
+  return "ambiguous";
+}
+
 function resolveRecognitionCandidates(freshLabel, plans) {
   if (!freshLabel) return [];
   const matches = (plans || []).filter((p) => p && p.data && getSpaceDisplayName(p.data) === freshLabel);
@@ -629,6 +702,10 @@ function resolveRecognitionCandidates(freshLabel, plans) {
         .filter((i) => i.status === "carried" || i.status === "pending")
         .map((i) => i.text)
         .filter(Boolean),
+      // Room-First Identity: computed here, once, from the same
+      // representative plan data already used for every other field above
+      // - not a second pass the caller has to remember to run.
+      legacyClassification: classifyLegacySpaceType(data),
     }));
 }
 
@@ -650,6 +727,142 @@ function summarizeRecognitionCandidateWork(data) {
   if (checkedCount === 0) return `You had ${total} item${total === 1 ? "" : "s"} left to do.`;
   if (checkedCount === total) return `You'd cleared all ${total} item${total === 1 ? "" : "s"}.`;
   return `You'd cleared ${checkedCount} of ${total} items and left the rest for next time.`;
+}
+
+// ---- Room-First Identity: Room confirmation (Phase B) ----
+// Pure. Dedupes a plan list down to the user's distinct known Rooms, by
+// the same canonicalSpaceId resolution every shadow function already
+// uses - not a second one. Feeds the "existing Rooms" picker (outcome
+// b1's decline-fallback, b2's parent-Room picker, outcome c's existing-
+// Rooms list) and findPlausibleParentRoom below.
+function dedupeToKnownRooms(plans) {
+  const byId = new Map();
+  for (const p of (plans || [])) {
+    if (!p || !p.data) continue;
+    const name = getSpaceDisplayName(p.data);
+    if (!name) continue;
+    const id = computeShadowIds(p.id, p.data).spaceId;
+    const createdAtMs = typeof p.data.createdAt === "string" ? Date.parse(p.data.createdAt) : 0;
+    const existing = byId.get(id);
+    if (!existing || createdAtMs > existing.createdAtMs) {
+      byId.set(id, { canonicalSpaceId: id, displayName: name, createdAtMs });
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.createdAtMs - a.createdAtMs);
+}
+
+// Small, explicitly-extensible starting map from an ambiguous label to the
+// room type(s) it's typically found inside - RoomFirstIdentityDesign's own
+// named examples, not a claim of completeness. Low-stakes by design: a
+// miss here only means the generic "choose another Room" picker is shown
+// instead of a specific suggestion - never a wrong Room silently chosen.
+const AMBIGUOUS_TERM_TYPICAL_PARENTS = {
+  pantry: ["kitchen"],
+  closet: ["bedroom", "hallway", "entryway", "master bedroom"],
+  mudroom: ["entryway", "garage", "foyer"],
+  "mudroom nook": ["entryway", "garage", "foyer"],
+  "laundry area": ["basement", "garage", "utility room"],
+  laundry: ["basement", "garage", "utility room"],
+};
+
+// Pure. "Exactly one plausible existing Room candidate" (RoomFirstIdentityDesign
+// §2/§4 b2) - never picks a Room merely because it's most recent; only a
+// semantic type-match against the small map above counts, and only when
+// it resolves to exactly one of the user's real Rooms.
+function findPlausibleParentRoom(label, knownRooms) {
+  const typicalParents = AMBIGUOUS_TERM_TYPICAL_PARENTS[(label || "").trim().toLowerCase()];
+  if (!typicalParents || !typicalParents.length) return null;
+  const matches = (knownRooms || []).filter((r) => typicalParents.includes((r.displayName || "").trim().toLowerCase()));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+// Pure. The single routing decision for the Room-first confirmation flow -
+// which of outcomes a/b1/b2/b3/c to show, given the fresh photo's own
+// classification and whatever candidates findRecognitionCandidates found
+// (each already annotated with legacyClassification by
+// resolveRecognitionCandidates). knownRooms is the user's full deduped
+// Room list (dedupeToKnownRooms) - needed only for b2's plausible-parent
+// lookup and to detect the true first-time (zero Rooms) case.
+//
+// Returns one of:
+//   { outcome: "a", candidate }
+//   { outcome: "b1", candidates }
+//   { outcome: "b2", plausibleParent: candidate|null, firstTimeUser: bool }
+//   { outcome: "b3", candidate }
+//   { outcome: "c" }
+function routeRoomConfirmation(parsed, candidates, knownRooms) {
+  const list = candidates || [];
+  const eligible = list.filter((c) => c.legacyClassification === "room-like" || c.legacyClassification === "user-confirmed");
+  const hasNoExistingRooms = !(knownRooms && knownRooms.length);
+
+  // A single, already-established match resolves any fresh-photo
+  // areaScope ambiguity for THIS user - they've already told the app,
+  // once, that this label means a standalone Room; re-asking on every
+  // subsequent photo would be exactly the friction "nearly invisible"
+  // exists to avoid. Deliberate design decision, not explicit in
+  // RoomFirstIdentityDesign - flagged in the implementation report.
+  if (list.length === 1 && eligible.length === 1) {
+    return { outcome: "a", candidate: eligible[0] };
+  }
+
+  if (parsed && parsed.areaScope === "ambiguous") {
+    const plausibleParent = hasNoExistingRooms ? null : findPlausibleParentRoom(parsed.suggestedRoomName, knownRooms);
+    // If a real, already-recognized Room shares this exact label (found
+    // via the same full cache+query search findRecognitionCandidates
+    // already ran, not just the smaller knownRooms cache), "its own Room"
+    // must confirm THAT existing Room, not create a duplicate -
+    // RoomFirstIdentityDesign §4 b2's own explicit nuance.
+    const exactStandaloneMatch = eligible.length ? eligible[0] : null;
+    return { outcome: "b2", plausibleParent, firstTimeUser: hasNoExistingRooms, exactStandaloneMatch };
+  }
+
+  if (!list.length) {
+    return { outcome: "c" };
+  }
+
+  if (list.length === 1) {
+    // The one candidate is area-like or legacy-ambiguous - never one-tap
+    // eligible (RoomFirstIdentityDesign §4's safe behavior). Reuses b2's
+    // exact same chooser shape ("same ambiguous chooser as b2" per the
+    // task) - plausibleParent computed the same way, keyed off this
+    // candidate's own label rather than the fresh photo's suggestedRoomName
+    // (there is no fresh-photo ambiguity here, this is a legacy collision).
+    return { outcome: "b3", candidate: list[0], plausibleParent: hasNoExistingRooms ? null : findPlausibleParentRoom(list[0].displayName, knownRooms) };
+  }
+
+  // Multiple candidates, any classification mix - human judgment needed
+  // either way (RememberedHomeDesign.md §2e's own principle: ambiguous
+  // evidence must not become identity without the user looking).
+  return { outcome: "b1", candidates: list };
+}
+
+// Pure. The resolved confirmation result for confirming an EXISTING Room -
+// outcome (a), a picked card in b1, b2's "inside X", or outcome (c)'s
+// existing-Room picker. Same shape regardless of which UI path produced
+// it, since the underlying fact (this plan belongs to an existing Room)
+// doesn't depend on how the user got there.
+function resolveExistingRoomConfirmation(candidate, { areaName = null, areaScope = "whole-room" } = {}) {
+  return {
+    outcome: "existing-room",
+    canonicalSpaceId: candidate.canonicalSpaceId,
+    confirmedRoomName: candidate.displayName,
+    areaName,
+    areaScope,
+  };
+}
+
+// Pure. The resolved confirmation result for creating a brand-new Room -
+// outcome (c)'s accept-suggestion/freeform, b2's "its own Room" (when no
+// exact standalone match exists), and the first-time-zero-Rooms freeform
+// paths. Same shape regardless of which UI path produced it.
+function resolveNewRoomConfirmation(roomName, { areaName = null, areaScope = "whole-room" } = {}) {
+  return {
+    outcome: "new-room",
+    canonicalSpaceId: null,
+    confirmedRoomName: roomName,
+    areaName,
+    areaScope,
+  };
 }
 
 module.exports = {
@@ -674,4 +887,10 @@ module.exports = {
   validateTargetSpace,
   resolveRecognitionCandidates,
   summarizeRecognitionCandidateWork,
+  classifyLegacySpaceType,
+  dedupeToKnownRooms,
+  findPlausibleParentRoom,
+  routeRoomConfirmation,
+  resolveExistingRoomConfirmation,
+  resolveNewRoomConfirmation,
 };
