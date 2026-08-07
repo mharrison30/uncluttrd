@@ -6144,8 +6144,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <ScrollView ref={resultsScrollRef} contentContainerStyle={s.scrollContent}>
           <View style={s.resTop}>
             <View style={{ flex: 1 }}>
+              {/* Room/area hierarchy fix (2026-08-07): the Room's actual
+                  identity is now the primary heading - it was previously a
+                  12px eyebrow label beneath a static, non-data-driven
+                  "Your Room" heading, which buried the one thing this
+                  screen most needs to say. justConfirmedRecognition (set
+                  only on a genuine existing-room confirmation, see its own
+                  declaration) upgrades the heading text itself to a
+                  welcome-back acknowledgment rather than the bare name -
+                  the rename pencil still passes the bare
+                  getSpaceDisplayName(results) to the rename sheet
+                  regardless, since that's the actual current name being
+                  edited, not the heading's greeting phrasing. */}
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <Text style={s.resSpace} numberOfLines={1}>{getSpaceDisplayName(results)?.toUpperCase()}</Text>
+                <Text style={s.resRoomName} numberOfLines={1}>
+                  {justConfirmedRecognition ? `Welcome back to your ${getSpaceDisplayName(results)}` : getSpaceDisplayName(results)}
+                </Text>
                 {/* Reuses the exact same rename bottom sheet as the merge-
                     review cards, History's "Rename" action, and Space
                     Detail's pencil - currentPlanId, not results.id, since
@@ -6154,11 +6168,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                     once a real saved plan is being viewed). */}
                 {currentPlanId && (
                   <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, getSpaceDisplayName(results))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
-                    <Pencil size={12} color={BRAND.green} strokeWidth={2.25} />
+                    <Pencil size={14} color={BRAND.green} strokeWidth={2.25} />
                   </TouchableOpacity>
                 )}
               </View>
-              <Text style={s.resTitle}>Your Room</Text>
+              {/* Room-First Identity's area-level identity (Phase C) -
+                  descriptive only, shown as a secondary line under the Room
+                  name exclusively for a confirmed sub-area; a whole-room
+                  plan or one with no areaName shows nothing here at all -
+                  no empty line, no placeholder. */}
+              {results.areaName && results.areaScope === "sub-area" && (
+                <Text style={s.resAreaName} numberOfLines={1}>{results.areaName}</Text>
+              )}
             </View>
             <TouchableOpacity style={s.shareBtn} accessibilityLabel="Share your room" accessibilityRole="button" onPress={() => setTimeout(() => {
               Alert.alert(
@@ -7066,8 +7087,9 @@ const s = StyleSheet.create({
   ctaDisabled: { opacity: 0.68 },
   ctaText: { color: "white", fontSize: 16, fontFamily: "Inter_700Bold" },
   resTop: { flexDirection: "row", alignItems: "flex-start", marginBottom: 18 },
-  resSpace: { fontSize: 12, fontFamily: "Inter_700Bold", color: BRAND.green, letterSpacing: 0.8, marginBottom: 3 },
   resTitle: { fontSize: 24, fontFamily: "Inter_700Bold", color: BRAND.ink },
+  resRoomName: { fontSize: 22, fontFamily: "Inter_700Bold", color: BRAND.ink },
+  resAreaName: { fontSize: 15, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 2 },
   overviewCard: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 14, padding: 16, marginBottom: 16 },
   resPhoto: { width: "100%", height: 220, borderRadius: 14, backgroundColor: BRAND.stone },
   resPhotoHint: { fontSize: 11, color: BRAND.mist, textAlign: "center", marginTop: 6, marginBottom: 16, fontFamily: "Inter_400Regular" },
