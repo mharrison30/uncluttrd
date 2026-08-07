@@ -3194,14 +3194,58 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // missed) - it just avoids paying the query's cost when the cache
   // already has a real answer. Flagged explicitly, not silently changed.
   //
-  // Never throws - a recognition failure must never block the fresh-start
-  // path it's proposing something in front of (§2d's structural
-  // guarantee). Returns [] on any query error, identical to "no match."
+  // Never THROWS out to its caller - a recognition failure must never
+  // block the fresh-start path it's proposing something in front of (§2d's
+  // structural guarantee). But it no longer silently collapses a genuine
+  // query failure into "no match" either (Track 2 diagnostic finding,
+  // 2026-08-07: a live on-device test showed a real matching Room went
+  // unfound with zero trace of why, because this function's old contract
+  // - bare array, [] for both "queried and found nothing" and "query threw"
+  // - made the two indistinguishable after the fact). Now returns
+  // { status, candidates, diagnostics }:
+  //   status: "MATCH_FOUND" | "NO_MATCH" | "RECOGNITION_FAILED"
+  //   candidates: the resolved candidate array (always [] for NO_MATCH/RECOGNITION_FAILED)
+  //   diagnostics: a structured, JSON-loggable object describing exactly
+  //     what happened at every step - cache state, whether the fallback
+  //     query ran and why, its raw per-field result counts, and (only for
+  //     RECOGNITION_FAILED) the thrown error's name/message/code. Logged
+  //     via dlog on every call (not just failures) so it's captured in the
+  //     existing debugLogBuffer/debugShareLog mechanism (long-press the
+  //     header logo) for the next on-device test to export. Not persisted
+  //     to Firestore anywhere - purely in-memory operational telemetry.
   const findRecognitionCandidates = async (freshLabel, historyList, forUid) => {
-    if (!freshLabel) return [];
+    const diagnostics = {
+      freshLabel: freshLabel || null,
+      cacheLoaded: Array.isArray(historyList),
+      cacheSize: Array.isArray(historyList) ? historyList.length : 0,
+      cacheCandidateCount: 0,
+      fallbackQueryRan: false,
+      fallbackQueryReason: null, // "no-fresh-label" | "cache-not-loaded" | "cache-had-zero-matches" | null
+      byTypeCount: null,
+      byNameCount: null,
+      error: null,
+      finalCandidateCount: 0,
+      status: null,
+    };
+    const finish = (status, candidates) => {
+      diagnostics.status = status;
+      diagnostics.finalCandidateCount = candidates.length;
+      dlog(`[RECOGNITION] ${JSON.stringify(diagnostics)}`);
+      return { status, candidates, diagnostics };
+    };
+
+    if (!freshLabel) {
+      diagnostics.fallbackQueryReason = "no-fresh-label";
+      return finish("NO_MATCH", []);
+    }
+
     const cachePlans = (historyList || []).map((h) => ({ id: h.id, data: h }));
     const cacheCandidates = resolveRecognitionCandidates(freshLabel, cachePlans);
-    if (cacheCandidates.length) return cacheCandidates;
+    diagnostics.cacheCandidateCount = cacheCandidates.length;
+    if (cacheCandidates.length) return finish("MATCH_FOUND", cacheCandidates);
+
+    diagnostics.fallbackQueryRan = true;
+    diagnostics.fallbackQueryReason = diagnostics.cacheLoaded && diagnostics.cacheSize > 0 ? "cache-had-zero-matches" : "cache-not-loaded";
 
     try {
       const plansRef = collection(db, "users", forUid, "plans");
@@ -3209,14 +3253,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         getDocs(query(plansRef, where("spaceType", "==", freshLabel))),
         getDocs(query(plansRef, where("spaceName", "==", freshLabel))),
       ]);
+      diagnostics.byTypeCount = byType.size;
+      diagnostics.byNameCount = byName.size;
       const merged = new Map();
       [...byType.docs, ...byName.docs].forEach((d) => {
         if (!merged.has(d.id)) merged.set(d.id, { id: d.id, data: d.data() });
       });
-      return resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+      const resolved = resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+      return finish(resolved.length ? "MATCH_FOUND" : "NO_MATCH", resolved);
     } catch (e) {
-      dlog(`[RECOGNITION] targeted query failed, proceeding with no candidates: ${e.message}`);
-      return [];
+      diagnostics.error = { name: e.name || null, message: e.message || String(e), code: e.code || null };
+      return finish("RECOGNITION_FAILED", []);
     }
   };
 
@@ -3886,9 +3933,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // at the ROOM level - parsed.suggestedRoomName; suggestedAreaName
       // never reaches this call, by construction.
       if (!returningContext) {
-        const rawMatches = await findRecognitionCandidates(parsed.suggestedRoomName, history, user.uid);
+        const recognitionResult = await findRecognitionCandidates(parsed.suggestedRoomName, history, user.uid);
         const knownRooms = dedupeToKnownRooms(history.map(h => ({ id: h.id, data: h })));
-        const routing = routeRoomConfirmation(parsed, rawMatches, knownRooms);
+        // RECOGNITION_FAILED bypasses routeRoomConfirmation entirely - the
+        // lookup never completed, so there is no candidate data for it to
+        // classify/route on. A dedicated "failed" outcome, not folded into
+        // (c): (c) means "we checked, genuinely nothing matched," which is
+        // a different, true statement from "we don't know if anything
+        // matched" (Track 2 diagnostic finding - showing (c)'s copy here
+        // would misrepresent an incomplete lookup as a completed one).
+        const routing = recognitionResult.status === "RECOGNITION_FAILED"
+          ? { outcome: "failed" }
+          : routeRoomConfirmation(parsed, recognitionResult.candidates, knownRooms);
         // Pause here - the Room confirmation screen (roomConfirmation
         // truthy) takes over on the next render, ahead of Results in the
         // if-chain. Nothing is saved yet, for ANY outcome including (a) -
@@ -4570,7 +4626,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // photo so the user can retry rather than losing it entirely.
       if (roomConfirmation) {
         if (roomConfirmation.view !== "main") { backToRoomConfirmationMain(); return true; }
-        if (roomConfirmation.routing.outcome !== "c") { declineToOutcomeC(); return true; }
+        // "failed" has no completed check to decline BACK to (unlike a/b1/
+        // b2/b3, which decline to (c) - "checked, found nothing"). Declining
+        // "failed" to (c) would show (c)'s "We think this is your X" copy,
+        // the exact misrepresentation this outcome exists to avoid. Falls
+        // straight through to full cancel instead, same as (c) itself.
+        if (roomConfirmation.routing.outcome !== "c" && roomConfirmation.routing.outcome !== "failed") { declineToOutcomeC(); return true; }
         recognitionPendingRef.current = null;
         setRoomFreeformInput("");
         setRoomConfirmation(null);
@@ -5986,6 +6047,36 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <Text style={s.mergeSecondaryBtnText}>{`${label} is inside another Room`}</Text>
               </TouchableOpacity>
             )}
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // Outcome (failed): the recognition lookup itself never completed
+    // (query threw/errored) - deliberately distinct copy from (c) below.
+    // (c) asserts a completed check found nothing; that would be false
+    // here, since we genuinely don't know whether a matching Room exists
+    // (Track 2 diagnostic finding, 2026-08-07). Two honest choices only:
+    // pick an existing Room directly (skips recognition entirely, same
+    // resolution as (c)'s secondary option), or continue with a new one
+    // (same as (c)'s "accept suggestion" - reuses onAcceptSuggestedRoom
+    // verbatim, since "continue as new" and "accept the AI's suggestion"
+    // are the same resolution regardless of why we ended up here).
+    if (routing.outcome === "failed") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <RoomConfirmationHeader title="We couldn't check your saved Rooms right now." />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            <Text style={{ fontSize: 14, color: BRAND.slate, marginBottom: 16 }}>Choose an existing Room or continue with a new one.</Text>
+            {knownRooms.length > 0 && (
+              <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => openRoomPicker("failed-secondary")}>
+                <Text style={[s.startOverText, { color: "white" }]}>Choose an existing Room</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onAcceptSuggestedRoom}>
+              <Text style={s.mergeSecondaryBtnText}>{`Continue as new: "${pendingParsed?.suggestedRoomName || "Room"}"`}</Text>
+            </TouchableOpacity>
           </ScrollView>
         </SafeAreaView>
       );
