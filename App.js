@@ -6357,7 +6357,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </TouchableOpacity>
           )}
           <TouchableOpacity style={s.startOverBtn} onPress={reset}>
-            <Text style={s.startOverText}>Analyze a New Room</Text>
+            <Text style={s.startOverText}>Analyze Another Area</Text>
           </TouchableOpacity>
         </ScrollView>
         {renderRenameSheet()}
