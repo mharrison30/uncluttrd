@@ -6148,18 +6148,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   identity is now the primary heading - it was previously a
                   12px eyebrow label beneath a static, non-data-driven
                   "Your Room" heading, which buried the one thing this
-                  screen most needs to say. justConfirmedRecognition (set
-                  only on a genuine existing-room confirmation, see its own
-                  declaration) upgrades the heading text itself to a
-                  welcome-back acknowledgment rather than the bare name -
-                  the rename pencil still passes the bare
-                  getSpaceDisplayName(results) to the rename sheet
-                  regardless, since that's the actual current name being
-                  edited, not the heading's greeting phrasing. */}
+                  screen most needs to say. Deliberately stable across
+                  every arrival path (first visit or a returning
+                  confirmation) - the heading's job is identity (where you
+                  are), never context (what the app remembers); that's the
+                  welcome-back banner's job below, so the two never say the
+                  same thing twice. */}
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <Text style={s.resRoomName} numberOfLines={1}>
-                  {justConfirmedRecognition ? `Welcome back to your ${getSpaceDisplayName(results)}` : getSpaceDisplayName(results)}
-                </Text>
+                <Text style={s.resRoomName} numberOfLines={1}>{getSpaceDisplayName(results)}</Text>
                 {/* Reuses the exact same rename bottom sheet as the merge-
                     review cards, History's "Rename" action, and Space
                     Detail's pencil - currentPlanId, not results.id, since
