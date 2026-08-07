@@ -5888,6 +5888,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <Text style={s.hdrPageName}>{title}</Text>
           </View>
+          {/* Track 2 finding (2026-08-07): this header is its own local
+              component, not the shared goHome/debugShareLog header pattern
+              used elsewhere - its logo TouchableOpacity only ever had
+              onPress (cancel-and-return), never onLongPress, so the
+              long-press-to-share gesture was never wired here at all; a
+              long press just resolved to the plain cancel tap. Explicit
+              button instead of trying to retrofit onLongPress onto the
+              cancel button (which would make one gesture do two unrelated
+              things on the one screen where accidentally triggering
+              "cancel" mid-confirmation is worst). Staging-only (IS_STAGING,
+              same gate as the STAGING banner) - never shown in production. */}
+          {IS_STAGING && (
+            <TouchableOpacity onPress={debugShareLog} style={{ paddingHorizontal: 10, paddingVertical: 6, marginTop: 2 }} accessibilityLabel="Share debug log" accessibilityRole="button">
+              <Text style={{ fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.mist }}>Debug Log</Text>
+            </TouchableOpacity>
+          )}
         </View>
         {/* Error handling, point 5: a failed save leaves roomConfirmation/
             recognitionPendingRef untouched (see completeRoomConfirmation's
