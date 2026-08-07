@@ -3616,10 +3616,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // "Welcome back to your X" is honest, unlike Phase B's transitional
       // state where nothing was actually confirmed yet.
       if (resolvedResult.outcome === "existing-room") {
+        // unresolvedCount drives the banner's actionable-vs-quiet split
+        // below - the same signal already used to decide whether
+        // carryForwardUnresolvedItems fires at all (a few lines down), not
+        // a separate derivation. sourceCandidate carries this Room's own
+        // most-recent unresolved items regardless of what area within the
+        // Room today's photo targets (recognition matches at the Room
+        // level - see findRecognitionCandidates - so the same candidate,
+        // and the same unresolvedItems, come back whether today's
+        // suggestedAreaName is the whole Room or one specific area inside
+        // it). Only populated for outcome (a)/a b1 card (sourceCandidate is
+        // a real recognition candidate there); b2/b3/picker/freeform paths
+        // pass no sourceCandidate at all, so this is correctly 0 for them -
+        // a pre-existing, disclosed limitation (see completeRoomConfirmation's
+        // own comment above), not something this change introduces.
         setJustConfirmedRecognition({
           displayName: resolvedResult.confirmedRoomName,
-          lastOrganizedAt: sourceCandidate?.lastOrganizedAt ?? null,
-          workSummary: sourceCandidate?.workSummary ?? null,
+          unresolvedCount: sourceCandidate?.unresolvedItems?.length || 0,
         });
       }
 
@@ -6218,12 +6231,39 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               repeat a data dump. Only ever shown once, right after
               confirming - cleared by every navigation helper. */}
           {justConfirmedRecognition && (
-            <View style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}>
-              <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{`Welcome back to your ${justConfirmedRecognition.displayName}.`}</Text>
-              {justConfirmedRecognition.workSummary && (
-                <Text style={{ fontSize: 13, color: "#64748B" }}>{justConfirmedRecognition.workSummary}</Text>
-              )}
-            </View>
+            justConfirmedRecognition.unresolvedCount > 0 ? (
+              // Actionable: tapping the whole card enters Companion on
+              // TODAY's just-created plan (results/currentPlanId - already
+              // set to it by savePlanToHistory inside completeRoomConfirmation,
+              // not the prior historical plan, which the convergence
+              // contract keeps untouched). Same entry mechanism as the
+              // "Let's Get Started" button below - not a separate Companion
+              // launch path. The carried-forward items already lead
+              // results.currentBatch.items (carryForwardUnresolvedItems
+              // prepends them) by the time this is tappable, so they render
+              // first with no extra wiring here.
+              <TouchableOpacity
+                onPress={() => {
+                  setShowCompanion(true);
+                  setTimeout(() => companionScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+                }}
+                style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}
+                accessibilityLabel="Continue where you left off"
+                accessibilityRole="button"
+              >
+                <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{`Welcome back to your ${justConfirmedRecognition.displayName}.`}</Text>
+                <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 6 }}>{`You had ${justConfirmedRecognition.unresolvedCount} item${justConfirmedRecognition.unresolvedCount === 1 ? "" : "s"} left to do.`}</Text>
+                <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Continue where you left off →</Text>
+              </TouchableOpacity>
+            ) : (
+              // Quiet: recognition still acknowledged, but nothing to act
+              // on - not tappable, no arrow, no CTA (a dead tap target is
+              // worse than no card at all).
+              <View style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}>
+                <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{`Welcome back to your ${justConfirmedRecognition.displayName}.`}</Text>
+                <Text style={{ fontSize: 13, color: "#64748B" }}>Everything from your last visit is wrapped up.</Text>
+              </View>
+            )
           )}
           {results.photoUrl && (
             // Same photoUrl source as the History list thumbnails and the
