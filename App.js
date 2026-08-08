@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -57,6 +57,25 @@ function debugHashBase64(b64) {
     hash = (hash * 31 + b64.charCodeAt(i)) | 0;
   }
   return `len${b64.length}:h${hash}`;
+}
+
+// My Rooms -> True Room Grouping, Phase A: Results screen Room-name
+// resolution. Space.displayName (via the already-loaded `roomsList`, i.e.
+// MainApp's `rooms` state) is the CURRENT, authoritative name; a plan's
+// own spaceName is historical - what the Room was called at the time of
+// THIS visit, which may since have been renamed. Never mutates the plan's
+// own spaceName field - purely a read-time display choice. Falls back to
+// getSpaceDisplayName(plan) only when the matching Space genuinely isn't
+// in roomsList yet (a deep link, or Results reached before My Rooms has
+// loaded this session, e.g. straight from a fresh analysis) - it never
+// silently prefers the plan's own historical name when the Space IS
+// available. Pure (no I/O, no closure over component state) so it's
+// testable directly, independent of any render.
+function resolveResultsRoomName(plan, currentPlanId, roomsList) {
+  if (!plan) return null;
+  const roomId = plan.canonicalSpaceId || currentPlanId;
+  const matchedRoom = (roomsList || []).find((r) => r.id === roomId);
+  return matchedRoom?.displayName || getSpaceDisplayName(plan);
 }
 
 // Stable per-item id for batch checklist items - only needs to be unique
@@ -150,6 +169,34 @@ function buildShadowDocs({ planId, entry, photoUrl }) {
 // for the same planId overwrites the same four documents rather than
 // creating new ones - this is what Task 3's idempotency invariant
 // actually verifies.
+// ---- My Rooms -> True Room Grouping, Phase A: Room summary maintenance ----
+// Best-effort, non-transactional, run AFTER a Space/Project write has
+// already committed - never inside the same transaction/batch. Reading a
+// whole subcollection inside a transaction risks the read-set/size limits
+// a Room with many visits could eventually hit, and a briefly-stale
+// summary (this call fails, or hasn't run yet) is an acceptable,
+// self-correcting failure mode - the same tolerance already established
+// for writeSpaceShadowStructure/deleteSpaceShadowGraph elsewhere in this
+// file (never awaited into a caller's critical path beyond its own
+// call site, never throws out).
+//
+// CRITICAL: recomputes every summary field fresh from the actual Project
+// documents every single call - computeRoomSummaryFields (shared/
+// spaceMigration.js) is pure and order-independent, so calling this after
+// ANY sync (creation, pause, completion, rename, next-batch, retroactive-
+// save, or a genuinely new visit) is always idempotent by construction,
+// never an increment. Calling it twice in a row for the same Space
+// produces byte-identical output both times.
+async function updateSpaceRoomSummary(uid, spaceId) {
+  try {
+    const projectsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects"));
+    const summary = computeRoomSummaryFields(projectsSnap.docs.map((d) => d.data()));
+    await updateDoc(doc(db, "users", uid, "spaces", spaceId), summary);
+  } catch (e) {
+    dlog(`[ROOM SUMMARY] update failed for space ${spaceId}: ${e.message}`);
+  }
+}
+
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
   try {
     const shadow = buildShadowDocs({ planId, entry, photoUrl });
@@ -174,6 +221,10 @@ async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
     }
     await batch.commit();
     dlog(`[SPACE SHADOW] wrote shadow structure for plan ${planId} (sessionCount: ${shadow.sessions.length}, batchCount: ${batchCount})`);
+    // My Rooms -> True Room Grouping, Phase A - see updateSpaceRoomSummary's
+    // own comment (below) for why this is safe to call unconditionally on
+    // every creation, not just a "new Room" one.
+    await updateSpaceRoomSummary(uid, spaceId);
     return { outcome: "written", sessionCount: shadow.sessions.length, batchCount };
   } catch (e) {
     // A genuine atomic-write failure. No shadow docs exist for this plan
@@ -535,7 +586,7 @@ async function loadSpaceShadowGraph(uid, planId) {
 async function syncPlanToSpaceGraph(uid, planId) {
   const planRef = doc(db, "users", uid, "plans", planId);
 
-  return runTransaction(db, async (tx) => {
+  const result = await runTransaction(db, async (tx) => {
     // Explicit plan-existence check, first, before anything else - part of
     // this function's core contract, not a test-only concern. This
     // function may only ever project from an existing authoritative plan.
@@ -577,7 +628,7 @@ async function syncPlanToSpaceGraph(uid, planId) {
     if (existingVersion > planVersion) {
       // A newer projection is already persisted than what this plan state
       // would produce - this call is the late one. Do not write anything.
-      return { outcome: "no-op", reason: "existing shadow already at or ahead of this plan version", existingVersion, planVersion };
+      return { outcome: "no-op", reason: "existing shadow already at or ahead of this plan version", existingVersion, planVersion, spaceId };
     }
 
     // syncedAt uses this SDK's own serverTimestamp() sentinel - the shared
@@ -609,8 +660,21 @@ async function syncPlanToSpaceGraph(uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
   });
+
+  // My Rooms -> True Room Grouping, Phase A - see updateSpaceRoomSummary's
+  // own comment for the idempotency contract. Deliberately outside the
+  // transaction above (reading a whole subcollection inside a transaction
+  // risks the read-set/size limits a Room with many visits could
+  // eventually hit) - a failure here never affects the sync's own
+  // already-committed result, which is why it's applied after the
+  // transaction fully resolves, not folded into it.
+  if (result.outcome === "written") {
+    await updateSpaceRoomSummary(uid, result.spaceId);
+  }
+
+  return result;
 }
 
 // ---- Shadow Synchronization: deletion lifecycle ----
@@ -748,7 +812,7 @@ async function reconcileActivePlanShadow(uid, planId) {
 async function forceFullReprojection(uid, planId) {
   const planRef = doc(db, "users", uid, "plans", planId);
 
-  return runTransaction(db, async (tx) => {
+  const result = await runTransaction(db, async (tx) => {
     const planSnap = await tx.get(planRef);
     if (!planSnap.exists()) {
       return { outcome: "source-plan-missing" };
@@ -787,8 +851,19 @@ async function forceFullReprojection(uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
   });
+
+  // My Rooms -> True Room Grouping, Phase A - same hook and idempotency
+  // contract as syncPlanToSpaceGraph's own (see there for the full
+  // comment). This function has no live call site in the client today
+  // (migration is Admin-SDK-only) - kept consistent so it's correct if
+  // that ever changes, not a dead gap.
+  if (result.outcome === "written") {
+    await updateSpaceRoomSummary(uid, result.spaceId);
+  }
+
+  return result;
 }
 
 // Read-only. Reads Space/Project/every Session/every Batch actually
@@ -867,7 +942,17 @@ async function renameSpace(uid, planId, newName) {
   // established Space, not some other path.
   const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
   const canonicalSpaceId = planSnap.exists() ? planSnap.data().canonicalSpaceId : null;
-  await updateDoc(doc(db, "users", uid, "plans", planId), { spaceName: newName, shadowSourceVersion: increment(1) });
+  // My Rooms -> True Room Grouping, rollout closeout item 3: rename
+  // touches ONLY Space.displayName now - the plan's own spaceName is
+  // historical metadata under the new source-of-truth contract (Phase A
+  // Section 1b/5) and must stay untouched, INCLUDING the plan used to
+  // initiate the rename. shadowSourceVersion is still bumped so
+  // syncPlanToSpaceGraph below genuinely re-syncs (a real "written"
+  // outcome, not a no-op) - which is also what keeps this Room's summary
+  // fields (Phase A's updateSpaceRoomSummary hook) current after a rename,
+  // for free, via the exact same mechanism every other mutation already
+  // uses.
+  await updateDoc(doc(db, "users", uid, "plans", planId), { shadowSourceVersion: increment(1) });
   // displayName is user-owned (see deriveFullReprojectionDocs) - written
   // here, directly and explicitly, never through the generic projection
   // sync below, which deliberately excludes displayName from what it
@@ -2141,6 +2226,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState([]);
+  // My Rooms -> True Room Grouping, Phase A: the authoritative Room list,
+  // sourced from users/{uid}/spaces (see loadRooms below) - deliberately
+  // separate state from `history` (the capped, plan-level cache), which
+  // Space Detail/rename suggestions/the resumable-plan banner/PDF share
+  // still read from unchanged this phase (Room Detail's own redesign is
+  // explicitly out of scope here). Each entry is a Space document's data
+  // plus its own doc id (the canonical Space id / Room id).
+  const [rooms, setRooms] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
   // Space Detail screen (on-device UX fix - "View Plan" from My Spaces
   // must land on the Space's own content, not the Companion journey).
@@ -2984,6 +3077,34 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       }
     };
     loadHistory();
+  }, [isPro]);
+
+  // My Rooms -> True Room Grouping, Phase A: the authoritative Room list.
+  // Reads users/{uid}/spaces directly, NOT plans - a Room with any number
+  // of visits still appears exactly once, and the old 20-plan cap no
+  // longer determines which Rooms appear at all (every Space is fetched).
+  // Retired/redirected Spaces (merge losers) are filtered in-memory, not
+  // via a `where("retired","!=",true)` query clause - that operator
+  // excludes any document where the field is simply ABSENT (the "!=
+  // excludes missing field" trap already avoided the same way elsewhere
+  // in this codebase, e.g. checkOrphanedUserDeletions), and the
+  // overwhelming majority of real Spaces never have `retired` set at all.
+  // Same isPro-dependency mount-timing reasoning as loadHistory above.
+  useEffect(() => {
+    const loadRooms = async () => {
+      try {
+        const snapshot = await getDocs(collection(db, "users", user.uid, "spaces"));
+        const allSpaces = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+        const nonRetired = allSpaces.filter(s => s.retired !== true);
+        const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
+        nonRetired.sort((a, b) => toMillis(b.lastOrganizedAt || b.createdAt) - toMillis(a.lastOrganizedAt || a.createdAt));
+        console.log("Loaded", nonRetired.length, "rooms from Firestore (", allSpaces.length - nonRetired.length, "retired, filtered)");
+        setRooms(nonRetired);
+      } catch (e) {
+        console.log("Load rooms error:", e.message, e.code);
+      }
+    };
+    loadRooms();
   }, [isPro]);
 
   useEffect(() => {
@@ -4560,6 +4681,73 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // occurrence of this exact bug class (goHome, then the merge-review
   // screen, now here) - always clear every flag between where you are
   // and where you're going, not just the one you're leaving.
+  // Extracted, unchanged, from My Rooms' own former inline onPress handler
+  // (pre-Phase-A) so both the temporary Room-card tap bridge below and any
+  // other plan-level entry point can share exactly one copy of this action
+  // list, rather than two copies drifting apart.
+  const showPlanActionsAlert = (item) => {
+    Alert.alert(getSpaceDisplayName(item), "What would you like to do?", [
+      { text: "View Plan", onPress: () => { setShowHistory(false); setSpaceDetailPlanId(item.id); } },
+      { text: "Organize Again", onPress: () => startOrganizeAgain(item) },
+      { text: "Rename", onPress: () => openRenameSheet(item.id, getSpaceDisplayName(item)) },
+      isPro
+        ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
+        : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
+      {
+        text: "Delete Plan", style: "destructive", onPress: () => {
+          Alert.alert("Delete this plan?", "This can't be undone.", [
+            { text: "Cancel", style: "cancel" },
+            { text: "Delete", style: "destructive", onPress: () => deletePlan(item.id) },
+          ]);
+        },
+      },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  };
+
+  // My Rooms -> True Room Grouping, Phase A: temporary tap bridge. A Room
+  // card is a Space, not a plan - every existing action this Alert offers
+  // (View Plan/Organize Again/Rename/Share as PDF/Delete Plan) is plan-
+  // shaped, so tapping resolves the Room to its most-recently-created
+  // plan FIRST, then shows the exact same Alert as before, unchanged,
+  // against that resolved plan - preserving every existing action rather
+  // than dropping Share/Delete (neither exists inside Space Detail today)
+  // just because the card itself is no longer plan-sourced. Room Detail's
+  // own redesign (a real overflow menu, Room-level delete, etc.) is
+  // explicitly out of scope for this phase.
+  //
+  // Fast path: the capped `history` cache already has a plan for this
+  // Space (the common case - most Rooms' latest visit is recent). Falls
+  // back to a targeted query only on a miss, which is now a real
+  // possibility for an older Room the 20-plan cap doesn't cover -
+  // Section 2c's own point: Room-list accuracy no longer depends on that
+  // cap, so this resolution can't either.
+  const openRoomFromCard = async (room) => {
+    const cached = history.find(h => (h.canonicalSpaceId || h.id) === room.id);
+    if (cached) {
+      showPlanActionsAlert(cached);
+      return;
+    }
+    try {
+      const projectsSnap = await getDocs(query(collection(db, "users", user.uid, "spaces", room.id, "projects"), orderBy("createdAt", "desc"), limit(1)));
+      const latestProject = projectsSnap.docs[0]?.data();
+      const planId = latestProject?.sourcePlanId || room.id; // room.id is itself a valid planId fallback for a self-owned Space never yet synced past creation
+      const planSnap = await getDoc(doc(db, "users", user.uid, "plans", planId));
+      if (!planSnap.exists()) {
+        Alert.alert("Room not found", "We couldn't find any plans for this room.");
+        return;
+      }
+      const planData = { id: planSnap.id, ...planSnap.data() };
+      // Cache it so Space Detail's own history.find(spaceDetailPlanId)
+      // lookup (unchanged this phase) succeeds without a second fetch.
+      setHistory(prev => prev.some(h => h.id === planData.id) ? prev : [planData, ...prev]);
+      showPlanActionsAlert(planData);
+    } catch (e) {
+      dlog(`[MY ROOMS] failed to resolve a plan for room ${room.id}: ${e.message}`);
+      Alert.alert("Something went wrong", "Couldn't open this room. Please try again.");
+    }
+  };
+
   const openSpaceResults = (item) => {
     setShowFaq(false);
     setShowMergeReview(false);
@@ -4846,7 +5034,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // future reconciliation sweep to find and remove, which is a safer
       // failure state than ever risking the reverse order.
       step = "deleteSpaceShadowGraph";
-      await deleteSpaceShadowGraph(uid, planId, canonicalSpaceId);
+      const shadowResult = await deleteSpaceShadowGraph(uid, planId, canonicalSpaceId);
+
+      // My Rooms -> True Room Grouping, rollout closeout item 2: the
+      // deleted plan's own Project is gone, so this Room's summary
+      // (visitCount, latest photo/date/area) is now stale if the Space
+      // survived (other Projects remain) - recompute it from what's
+      // actually left, same idempotent mechanism every other mutation
+      // already uses. If the Space itself was removed (this was the last
+      // Project), there is nothing left to summarize - updateSpaceRoomSummary
+      // would just fail trying to read a Space that no longer exists, so
+      // it's skipped entirely rather than called and swallowed.
+      step = "updateSpaceRoomSummary";
+      const spaceId = canonicalSpaceId || planId;
+      if (shadowResult.outcome === "deleted" && !shadowResult.spaceDeleted) {
+        await updateSpaceRoomSummary(uid, spaceId);
+        const refreshedSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId));
+        if (refreshedSpaceSnap.exists()) {
+          setRooms(prev => prev.map(r => r.id === spaceId ? { id: spaceId, ...refreshedSpaceSnap.data() } : r));
+        }
+      } else if (shadowResult.spaceDeleted) {
+        setRooms(prev => prev.filter(r => r.id !== spaceId));
+      }
 
       step = "listAll";
       const prefixes = [
@@ -5098,6 +5307,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
   // HISTORY SCREEN
   if (showHistory) {
+    // Local, matches the existing Room Confirmation screen's own daysAgo
+    // helper in spirit (App.js's roomConfirmation render block) but
+    // produces the exact "Organized {X}" phrase this screen's cards need -
+    // not reused directly since that one returns a bare day count, not a
+    // formatted phrase.
+    const formatLastOrganized = (iso) => {
+      if (!iso) return "Not yet synced";
+      const days = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Organized today";
+      if (days === 1) return "Organized yesterday";
+      return `Organized ${days} days ago`;
+    };
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="dark-content" />
@@ -5108,87 +5329,45 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <Text style={s.hdrPageName}>My Rooms</Text>
-            <Text style={s.hdrTag}>{history.length} saved {history.length === 1 ? "room" : "rooms"}</Text>
+            <Text style={s.hdrTag}>{rooms.length} saved {rooms.length === 1 ? "room" : "rooms"}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => { setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMenu(true); }} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
         <ScrollView contentContainerStyle={s.scrollContent}>
-          {history.length === 0 ? (
+          {rooms.length === 0 ? (
             <View style={{ alignItems: "center", paddingTop: 60 }}>
               <Text style={{ fontSize: 48, marginBottom: 16 }}>📋</Text>
               <Text style={[s.resTitle, { textAlign: "center", marginBottom: 8 }]}>No rooms yet</Text>
               <Text style={[s.heroP, { textAlign: "center" }]}>Your analyzed rooms will appear here after you get your first organization plan.</Text>
             </View>
           ) : (
-            history.map((item) => (
-              <TouchableOpacity key={item.id} style={s.historyItem} onPress={() => {
-                Alert.alert(getSpaceDisplayName(item), "What would you like to do?", [
-                  // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a):
-                  // Space Detail is reactivated as the destination for
-                  // tapping a Space - "View Plan" now opens it instead of
-                  // going straight to Results, so photo/status/history show
-                  // first (Space Detail's own "View Full Plan" button still
-                  // reaches Results in exactly one more tap, unchanged).
-                  // Deviation from RememberedHomeDesign.md 1a's own exact
-                  // wording, disclosed in the implementation report: the
-                  // design doc's 1a keeps "View Plan" going straight to
-                  // Results and would add "Organize Again" as a bare fifth
-                  // option instead; this implementation repoints "View Plan"
-                  // itself at Space Detail (rather than bypassing this Alert
-                  // entirely on a raw row tap) specifically so Rename/Share
-                  // as PDF/Delete Plan - each reachable from nowhere else in
-                  // the app - are never silently lost.
-                  { text: "View Plan", onPress: () => { setShowHistory(false); setSpaceDetailPlanId(item.id); } },
-                  // Remembered Home v1 Step 2: the other entry point to the
-                  // exact same startOrganizeAgain flow Space Detail's own
-                  // button below triggers - two entry points, one flow.
-                  { text: "Organize Again", onPress: () => startOrganizeAgain(item) },
-                  // Opens the exact same bottom sheet used by the merge-
-                  // review screen's rename affordance and the Space Detail
-                  // screen below - no new mechanism, no duplicate sheet.
-                  { text: "Rename", onPress: () => openRenameSheet(item.id, getSpaceDisplayName(item)) },
-                  // Gated the same way as the main results-screen share button
-                  // (isPro ? "How would you like to share?" : "Upgrade to Pro
-                  // for a beautiful branded PDF") - now that free plans are
-                  // saved and reachable from History too, this option would
-                  // otherwise bypass that same Pro-only PDF policy.
-                  isPro
-                    ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
-                    : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
-                  {
-                    text: "Delete Plan", style: "destructive", onPress: () => {
-                      Alert.alert("Delete this plan?", "This can't be undone.", [
-                        { text: "Cancel", style: "cancel" },
-                        { text: "Delete", style: "destructive", onPress: () => deletePlan(item.id) },
-                      ]);
-                    },
-                  },
-                  { text: "Cancel", style: "cancel" },
-                ]);
-              }}>
-                {item.photoUrl ? (
-                  // Same photo source as the Space Detail screen's Photos
-                  // section (item.photoUrl - the plan's original photo) -
-                  // not a separate thumbnail asset or a new field.
-                  <Image source={{ uri: item.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+            // My Rooms -> True Room Grouping, Phase A: one card per Space
+            // (Room), not per plan - sourced entirely from `rooms` (see
+            // loadRooms above), never from `history`. A Room with 3 visits
+            // renders exactly once here, regardless of the old 20-plan cap.
+            rooms.map((room) => (
+              <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomFromCard(room)}>
+                {room.latestPhotoUrl ? (
+                  <Image source={{ uri: room.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
                 ) : (
                   <View style={s.historyIcon}>
                     <Text style={{ fontSize: 20 }}>🏠</Text>
                   </View>
                 )}
                 <View style={{ flex: 1 }}>
-                  <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 8 }}>
-                    <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{getSpaceDisplayName(item)}</Text>
-                    <Text style={[s.historyDate, { flexShrink: 0 }]}>{item.date}</Text>
-                  </View>
-                  {item.companionComplete && (
-                    <View style={s.historyCompleteBadge}>
-                      <Text style={s.historyCompleteBadgeText}>Completed</Text>
-                    </View>
+                  <Text style={s.historySpace} numberOfLines={1}>{room.displayName}</Text>
+                  {/* Only when the latest visit was genuinely a sub-area
+                      (Room-First Identity's own areaScope contract) - a
+                      whole-room latest visit shows no area line at all,
+                      never an empty one. */}
+                  {room.latestAreaName && room.latestAreaScope === "sub-area" && (
+                    <Text style={s.historyOverview} numberOfLines={1}>{`Last worked on: ${room.latestAreaName}`}</Text>
                   )}
-                  <Text style={s.historyOverview} numberOfLines={2}>{item.overview}</Text>
+                  <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>
+                    {`${formatLastOrganized(room.lastOrganizedAt)} · ${room.visitCount ?? 1} visit${(room.visitCount ?? 1) === 1 ? "" : "s"}`}
+                  </Text>
                 </View>
               </TouchableOpacity>
             ))
@@ -6183,15 +6362,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   welcome-back banner's job below, so the two never say the
                   same thing twice. */}
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <Text style={s.resRoomName} numberOfLines={1}>{getSpaceDisplayName(results)}</Text>
+                {/* My Rooms -> True Room Grouping, Phase A: the CURRENT
+                    Space.displayName (via the already-loaded `rooms` list),
+                    not the plan's own historical spaceName - see
+                    resolveResultsRoomName's own comment for the fallback
+                    contract when the Space isn't loaded (deep link / no My
+                    Rooms visit yet this session). */}
+                <Text style={s.resRoomName} numberOfLines={1}>{resolveResultsRoomName(results, currentPlanId, rooms)}</Text>
                 {/* Reuses the exact same rename bottom sheet as the merge-
                     review cards, History's "Rename" action, and Space
                     Detail's pencil - currentPlanId, not results.id, since
                     a just-analyzed plan may not have an id on `results`
                     yet before it's saved (currentPlanId is only ever set
-                    once a real saved plan is being viewed). */}
+                    once a real saved plan is being viewed). Prefilled with
+                    the same resolved current name as the heading above,
+                    not the plan's own historical spaceName. */}
                 {currentPlanId && (
-                  <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, getSpaceDisplayName(results))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
+                  <TouchableOpacity onPress={() => openRenameSheet(currentPlanId, resolveResultsRoomName(results, currentPlanId, rooms))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
                     <Pencil size={14} color={BRAND.green} strokeWidth={2.25} />
                   </TouchableOpacity>
                 )}

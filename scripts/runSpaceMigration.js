@@ -72,11 +72,100 @@
 
 const admin = require("firebase-admin");
 const {
-  computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, evaluateMigrationCompleteness, MIGRATION_VERSION,
+  computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION,
   detectMergeCandidates, evaluateCandidateInvalidation, DETECTION_VERSION,
   computeMergeCandidateId, CANDIDATE_KEY_VERSION, getSpaceDisplayName, SHADOW_SCHEMA_VERSION,
   validateTargetSpace, resolveRecognitionCandidates,
 } = require("../shared/spaceMigration");
+
+// ---- My Rooms -> True Room Grouping, Phase A: Room summary maintenance
+// (Admin-SDK mirror of App.js's updateSpaceRoomSummary - 1:1 same
+// idempotency contract: recomputes every summary field fresh from the
+// actual Project documents every call, never increments anything. See
+// the client function's own comment for the full reasoning.) ----
+async function updateSpaceRoomSummaryAdmin(db, uid, spaceId) {
+  try {
+    const projectsSnap = await db.collection("users").doc(uid).collection("spaces").doc(spaceId).collection("projects").get();
+    const summary = computeRoomSummaryFields(projectsSnap.docs.map((d) => d.data()));
+    await db.collection("users").doc(uid).collection("spaces").doc(spaceId).update(summary);
+    return summary;
+  } catch (e) {
+    console.log(`[ROOM SUMMARY] update failed for space ${spaceId}: ${e.message}`);
+    return null;
+  }
+}
+
+// ---- My Rooms -> True Room Grouping, rollout closeout item 1: existing-
+// Space summary backfill ----
+// Restartable, idempotent, no ledger and no checkpoint (Restartability
+// Principle, SpaceMemoryModel.md §12 - same principle this file's own
+// structural migration already commits to) - every Space is visited via a
+// plain collectionGroup query, every visit recomputes its summary fresh
+// from the actual current Project set via the exact same
+// updateSpaceRoomSummaryAdmin/computeRoomSummaryFields every live
+// mutation already uses, not a separate one-off computation. Re-running
+// this against an already-backfilled Space (or the whole project) is
+// therefore guaranteed to reproduce identical values unless the
+// underlying Project data genuinely changed in between - there is no
+// increment, no "have I already processed this" flag, nothing that could
+// make a second run behave differently from the first for unchanged data.
+//
+// Retired Spaces are skipped, not backfilled - they don't appear in My
+// Rooms (see loadRooms, App.js) and their own summary fields are
+// meaningless once redirected; touching them would just be wasted writes
+// against documents nothing reads for this purpose.
+async function backfillRoomSummariesAdmin(db) {
+  const spacesSnap = await db.collectionGroup("spaces").get();
+  const results = { totalSpaces: spacesSnap.size, processed: 0, skippedRetired: 0, failed: 0 };
+  for (const spaceDoc of spacesSnap.docs) {
+    if (spaceDoc.data().retired === true) { results.skippedRetired++; continue; }
+    const uid = spaceDoc.ref.parent.parent.id;
+    const spaceId = spaceDoc.id;
+    const summary = await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
+    if (summary) results.processed++; else results.failed++;
+  }
+  return results;
+}
+
+// ---- My Rooms -> True Room Grouping, rollout closeout item 2: deletePlan
+// summary maintenance (Admin-SDK mirror) ----
+// Mirrors App.js's deletePlan + deleteSpaceShadowGraph 1:1, including the
+// new item-2 step: if the Space survives (other Projects remain), its
+// summary is recomputed from what's actually left via
+// updateSpaceRoomSummaryAdmin - the exact same idempotent mechanism every
+// other mutation already uses. If the Space itself was the last Project
+// and got removed, there's nothing left to summarize, so it's skipped,
+// matching the real client's own new logic. Storage cleanup is
+// deliberately NOT mirrored here - that part of deletePlan is unchanged
+// by this task and isn't what's being tested.
+async function deletePlanAdmin(db, uid, planId) {
+  const userRef = db.collection("users").doc(uid);
+  const planRef = userRef.collection("plans").doc(planId);
+  const planSnap = await planRef.get();
+  const canonicalSpaceId = planSnap.exists ? (planSnap.data().canonicalSpaceId || null) : null;
+  await planRef.delete();
+
+  const spaceId = canonicalSpaceId || planId;
+  const spaceRef = userRef.collection("spaces").doc(spaceId);
+  const projectRef = spaceRef.collection("projects").doc(planId);
+  const sessionRef = projectRef.collection("sessions").doc(planId);
+  const batchesSnap = await sessionRef.collection("batches").get();
+  await Promise.all(batchesSnap.docs.map((d) => d.ref.delete()));
+  await sessionRef.delete().catch(() => {});
+
+  const siblingProjectsSnap = await spaceRef.collection("projects").get();
+  const hasSiblingProjects = siblingProjectsSnap.docs.some((d) => d.id !== planId);
+  await projectRef.delete().catch(() => {});
+
+  let spaceDeleted = false;
+  if (!hasSiblingProjects) {
+    await spaceRef.delete();
+    spaceDeleted = true;
+  } else {
+    await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
+  }
+  return { outcome: "deleted", spaceDeleted, spaceId };
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -85,6 +174,7 @@ function parseArgs(argv) {
     if (raw === "--all") { args.all = true; continue; }
     if (raw === "--structural-only") { args.structuralOnly = true; continue; }
     if (raw === "--detect-only") { args.detectOnly = true; continue; }
+    if (raw === "--backfill-room-summaries") { args.backfillRoomSummaries = true; continue; }
     const m = raw.match(/^--([^=]+)=(.*)$/);
     if (m) args[m[1]] = m[2];
   }
@@ -130,7 +220,7 @@ async function checkMigrationCompletenessAdmin(db, uid, planId) {
  */
 async function forceFullReprojectionAdmin(db, uid, planId) {
   const planRef = db.collection("users").doc(uid).collection("plans").doc(planId);
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const planSnap = await tx.get(planRef);
     if (!planSnap.exists) {
       return { outcome: "source-plan-missing" };
@@ -164,8 +254,14 @@ async function forceFullReprojectionAdmin(db, uid, planId) {
         batchCount++;
       });
     });
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
   });
+  // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook on
+  // forceFullReprojection/syncPlanToSpaceGraph 1:1.
+  if (result.outcome === "written") {
+    await updateSpaceRoomSummaryAdmin(db, uid, result.spaceId);
+  }
+  return result;
 }
 
 /**
@@ -183,7 +279,7 @@ async function forceFullReprojectionAdmin(db, uid, planId) {
  */
 async function syncPlanToSpaceGraphAdmin(db, uid, planId) {
   const planRef = db.collection("users").doc(uid).collection("plans").doc(planId);
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const planSnap = await tx.get(planRef);
     if (!planSnap.exists) return { outcome: "source-plan-missing" };
     const plan = planSnap.data();
@@ -228,17 +324,26 @@ async function syncPlanToSpaceGraphAdmin(db, uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
   });
+  // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook.
+  if (result.outcome === "written") {
+    await updateSpaceRoomSummaryAdmin(db, uid, result.spaceId);
+  }
+  return result;
 }
 
 /**
  * Admin-SDK mirror of App.js's renameSpace - the authoritative
- * User-Managed Space Identity mutation (§12 Migration Part 3). Same
- * contract: write spaceName + increment shadowSourceVersion on the plan,
- * then fire syncPlanToSpaceGraphAdmin (not awaited in the real client
- * version - awaited here since a test needs the write to have landed
- * before asserting on it, not because the real contract changed).
+ * User-Managed Space Identity mutation (§12 Migration Part 3). Rollout
+ * closeout item 3: mirrors App.js's renameSpace 1:1 - rename touches ONLY
+ * Space.displayName now, never the plan's own spaceName (historical
+ * metadata under the Phase A source-of-truth contract, including the
+ * plan used to initiate the rename). shadowSourceVersion is still bumped
+ * on the plan so syncPlanToSpaceGraphAdmin below performs a genuine
+ * re-sync (not a no-op), which also keeps this Room's summary fields
+ * current via the same updateSpaceRoomSummaryAdmin hook every other
+ * mutation already uses.
  */
 async function renameSpaceAdmin(db, uid, planId, newName) {
   const userRef = db.collection("users").doc(uid);
@@ -249,7 +354,7 @@ async function renameSpaceAdmin(db, uid, planId, newName) {
   // deriveFullReprojectionDocs), then sync the Project layer separately.
   const planSnap = await planRef.get();
   const canonicalSpaceId = planSnap.exists ? planSnap.data().canonicalSpaceId : null;
-  await planRef.update({ spaceName: newName, shadowSourceVersion: admin.firestore.FieldValue.increment(1) });
+  await planRef.update({ shadowSourceVersion: admin.firestore.FieldValue.increment(1) });
   const { spaceId } = computeShadowIds(planId, { canonicalSpaceId });
   await userRef.collection("spaces").doc(spaceId).update({ displayName: newName });
   const syncResult = await syncPlanToSpaceGraphAdmin(db, uid, planId);
@@ -350,6 +455,10 @@ async function savePlanToHistoryAdmin(db, uid, plan, { canonicalSpaceId = null, 
     }
   }
   await batch.commit();
+
+  // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook on
+  // writeSpaceShadowStructure.
+  await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
 
   return { outcome: "created", planId, spaceId, canonicalSpaceId: entry.canonicalSpaceId || null };
 }
@@ -657,6 +766,19 @@ async function main() {
   admin.initializeApp({ projectId });
   const db = admin.firestore();
 
+  // Genuinely separate mode - operates over Spaces, not the plan/target
+  // loop below, so it's handled before targets are even resolved.
+  if (args.backfillRoomSummaries) {
+    console.log(`Backfilling Room summary fields for every non-retired Space in ${projectId}...\n`);
+    const result = await backfillRoomSummariesAdmin(db);
+    console.log(`Total Spaces found: ${result.totalSpaces}`);
+    console.log(`Processed: ${result.processed}`);
+    console.log(`Skipped (retired): ${result.skippedRetired}`);
+    console.log(`Failed: ${result.failed}`);
+    process.exitCode = result.failed > 0 ? 1 : 0;
+    return;
+  }
+
   let targets = [];
   if (args.uid && args.planId) {
     targets = [{ uid: args.uid, planId: args.planId }];
@@ -733,6 +855,6 @@ if (require.main === module) {
   module.exports = {
     checkMigrationCompletenessAdmin, forceFullReprojectionAdmin, migratePlan, detectAndPersistMergeCandidatesForUser,
     syncPlanToSpaceGraphAdmin, renameSpaceAdmin, savePlanToHistoryAdmin, findRecognitionCandidatesAdmin,
-    carryForwardUnresolvedItemsAdmin,
+    carryForwardUnresolvedItemsAdmin, updateSpaceRoomSummaryAdmin, backfillRoomSummariesAdmin, deletePlanAdmin,
   };
 }

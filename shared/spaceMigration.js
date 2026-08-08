@@ -236,6 +236,14 @@ function deriveFullReprojectionDocs(planId, plan) {
     completedAt: plan.companionComplete?.completedAt || null,
     abandonedAt: null,
     supersededAt: null,
+    // My Rooms -> True Room Grouping, Phase A: carried straight from the
+    // source plan (descriptive-only, same as the plan's own areaName/
+    // areaScope - see savePlanToHistory's own comment on that field) so
+    // computeRoomSummaryFields below can derive a Room's "latest area"
+    // purely from this Project's own already-fetched data, without a
+    // second read into the plan document it was derived from.
+    areaName: plan.areaName ?? null,
+    areaScope: plan.areaScope ?? null,
   };
 
   const clusters = reconstructSessionClusters(plan);
@@ -267,6 +275,48 @@ function deriveFullReprojectionDocs(planId, plan) {
   });
 
   return { ids, sourceVersion: planVersion, space, spaceProjectionUpdate, project, sessions };
+}
+
+// ---- My Rooms -> True Room Grouping, Phase A: Room summary fields ----
+// Pure. Given every Project document currently under one Space (the
+// caller's own already-fetched read - this function does no I/O), derives
+// the Room-level summary fields My Rooms renders: visitCount,
+// lastOrganizedAt, latestPhotoUrl, latestAreaName, latestAreaScope.
+//
+// CRITICAL invariant this function exists to satisfy: visitCount is
+// projectDocs.length - the actual count of Project documents under this
+// Space, recomputed fresh every call - never an increment. Calling this
+// twice with the same input always produces the same output; calling it
+// after a sync that touched zero NEW Projects (a pause/completion/rename/
+// next-batch mutation on an EXISTING plan) reproduces the exact same
+// visitCount as before, because the set of Project documents didn't
+// change - the count is a property of that set, not of how many times
+// this function has been called. This is what makes it safe to call from
+// every projection write path (creation and every live mutation alike)
+// without any of them needing their own "is this a new visit?" branch.
+//
+// "Latest" (lastOrganizedAt/latestPhotoUrl/latestAreaName/latestAreaScope)
+// is resolved by comparing every Project's own createdAt - never assumed
+// to be whichever Project happens to be the one that just synced - so an
+// older plan mutating (e.g. resuming a paused Companion session on last
+// month's visit) can never regress the Room's "latest" fields backward
+// past a more recently created visit; the derivation is order-independent
+// by construction, not by caller discipline.
+function computeRoomSummaryFields(projectDocs) {
+  const list = (projectDocs || []).filter(Boolean);
+  const visitCount = list.length;
+  if (visitCount === 0) {
+    return { visitCount: 0, lastOrganizedAt: null, latestPhotoUrl: null, latestAreaName: null, latestAreaScope: null };
+  }
+  const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
+  const latest = list.reduce((best, cur) => (toMillis(cur.createdAt) > toMillis(best.createdAt) ? cur : best));
+  return {
+    visitCount,
+    lastOrganizedAt: latest.createdAt ?? null,
+    latestPhotoUrl: latest.currentEvidence?.photoUrl ?? null,
+    latestAreaName: latest.areaName ?? null,
+    latestAreaScope: latest.areaScope ?? null,
+  };
 }
 
 // Pure. Given a plan and already-fetched shadow data, decides migration
@@ -877,6 +927,7 @@ module.exports = {
   computeShadowBatchId,
   reconstructSessionClusters,
   deriveFullReprojectionDocs,
+  computeRoomSummaryFields,
   evaluateMigrationCompleteness,
   detectMergeCandidates,
   evaluateCandidateInvalidation,
