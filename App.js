@@ -2228,20 +2228,36 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [history, setHistory] = useState([]);
   // My Rooms -> True Room Grouping, Phase A: the authoritative Room list,
   // sourced from users/{uid}/spaces (see loadRooms below) - deliberately
-  // separate state from `history` (the capped, plan-level cache), which
-  // Space Detail/rename suggestions/the resumable-plan banner/PDF share
-  // still read from unchanged this phase (Room Detail's own redesign is
-  // explicitly out of scope here). Each entry is a Space document's data
-  // plus its own doc id (the canonical Space id / Room id).
+  // separate state from `history` (the capped, plan-level cache). Room
+  // Detail (Phase B) reads its own plan list fresh per Room, uncapped, via
+  // roomDetailPlans below - `history` remains what rename suggestions,
+  // the resumable-plan banner, and PDF share read from. Each entry is a
+  // Space document's data plus its own doc id (the canonical Space id /
+  // Room id).
   const [rooms, setRooms] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
-  // Space Detail screen (on-device UX fix - "View Plan" from My Spaces
-  // must land on the Space's own content, not the Companion journey).
-  // Holds only the plan ID, not a copy of the item itself - the detail
-  // screen looks the current item up from `history` by ID on every
-  // render, so a rename (which already patches `history` in place) is
-  // reflected immediately with no separate patch target to keep in sync.
-  const [spaceDetailPlanId, setSpaceDetailPlanId] = useState(null);
+  // Room Detail screen (My Rooms -> True Room Grouping, Phase B) - replaces
+  // the old single-plan Space Detail as the primary destination from My
+  // Rooms. Holds only the Room (Space) id, not a copy of the room itself -
+  // the header reads the current entry from `rooms` by id on every render,
+  // so a rename (which already patches `rooms` in place, see
+  // handleSaveRename) is reflected immediately with no separate patch
+  // target to keep in sync. roomDetailPlans/roomDetailLoading are the
+  // Room's own plan list, loaded fresh per Section 1's verified query
+  // whenever roomDetailRoomId changes (see the effect below) - deliberately
+  // NOT sourced from `history` (the capped, plan-level cache), since a Room
+  // with more visits than that cap would otherwise silently show only some
+  // of its own history.
+  const [roomDetailRoomId, setRoomDetailRoomId] = useState(null);
+  const [roomDetailPlans, setRoomDetailPlans] = useState([]);
+  const [roomDetailLoading, setRoomDetailLoading] = useState(false);
+  // Results -> back -> Room Detail navigation contract (Phase B §5/§3.h):
+  // holds the Room id to return to, set ONLY when Results was entered via
+  // Room Detail (a prior-visit tap, or Room Detail's own unfinished-work
+  // CTA by way of Companion) - null for every other Results entry path
+  // (first-time analysis, deep link, Home's resumable-plan banner, etc.),
+  // which keeps their existing back-to-Home behavior completely unchanged.
+  const [resultsCameFromRoomDetail, setResultsCameFromRoomDetail] = useState(null);
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1): set by
   // startOrganizeAgain when the user taps "Organize Again" from either
   // entry point (History row, Space Detail's own button) - carries the
@@ -3106,6 +3122,46 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     };
     loadRooms();
   }, [isPro]);
+
+  // My Rooms -> True Room Grouping, Phase B: Room Detail's own plan list.
+  // Verified against real staging data (merged + reclassified cases,
+  // Phase B scoping pass Section 1) that a Room's full plan membership is
+  // exactly: plans whose canonicalSpaceId points here, PLUS the Room's own
+  // self-owned founding plan (canonicalSpaceId absent, its own id equals
+  // the Space id) - a real merge writes canonicalSpaceId onto the survivor
+  // itself too (executeMerge.js), but a Room that was never on either side
+  // of a merge or reclassification never gets that self-write, so both
+  // halves of this OR are real, load-bearing cases, not redundant. Two
+  // queries (Firestore can't OR across different fields), merged and
+  // deduped by plan id (belt-and-suspenders for the case where a Room IS
+  // itself the survivor of a merge and so appears in both), sorted by
+  // createdAt descending client-side.
+  useEffect(() => {
+    if (!roomDetailRoomId) { setRoomDetailPlans([]); return; }
+    let cancelled = false;
+    const loadRoomDetailPlans = async () => {
+      setRoomDetailLoading(true);
+      try {
+        const [byCanonicalSnap, selfSnap] = await Promise.all([
+          getDocs(query(collection(db, "users", user.uid, "plans"), where("canonicalSpaceId", "==", roomDetailRoomId))),
+          getDoc(doc(db, "users", user.uid, "plans", roomDetailRoomId)),
+        ]);
+        const byId = new Map();
+        byCanonicalSnap.docs.forEach((d) => byId.set(d.id, { id: d.id, ...d.data() }));
+        if (selfSnap.exists()) byId.set(selfSnap.id, { id: selfSnap.id, ...selfSnap.data() });
+        const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
+        const plans = [...byId.values()].sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+        if (!cancelled) setRoomDetailPlans(plans);
+      } catch (e) {
+        dlog(`[ROOM DETAIL] failed to load plans for room ${roomDetailRoomId}: ${e.message}`);
+        if (!cancelled) setRoomDetailPlans([]);
+      } finally {
+        if (!cancelled) setRoomDetailLoading(false);
+      }
+    };
+    loadRoomDetailPlans();
+    return () => { cancelled = true; };
+  }, [roomDetailRoomId]);
 
   useEffect(() => {
     if (showPaywall) {
@@ -4379,6 +4435,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
   const resumablePlan = history.find(isCompanionResumable);
 
+  // Room Detail (Phase B §2): a Room-level notion of "unfinished work",
+  // broader than isCompanionResumable alone - a freshly generated batch
+  // where every item is still "pending" isn't resumable (nothing to
+  // continue yet, per isCompanionResumable's own comment), but it's still
+  // unfinished work worth surfacing at the Room level. Same
+  // "carried"/"pending" = unresolved definition used everywhere else in
+  // this file (Remembered Home's prior-context note, the welcome-back
+  // banner's unresolvedCount) - "skipped" items are an explicit past
+  // decision, not left unresolved. A finished project is never unfinished
+  // regardless of what currentBatch still says, same guard
+  // isCompanionResumable already applies.
+  const planHasUnfinishedWork = (plan) => {
+    if (plan?.companionComplete) return false;
+    if (isCompanionResumable(plan)) return true;
+    const items = plan?.currentBatch?.items;
+    return Array.isArray(items) && items.some((i) => i.status === "carried" || i.status === "pending");
+  };
+
   // Step 5: non-blocking app-start reconciliation, scoped to the same
   // resumable plan Home already surfaces via the banner below - not a
   // sweep over all of history. Guarded by reconciledPlanIdRef so the
@@ -4546,8 +4620,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // from both the merge-review screen's evidence cards and the History
   // screen's row Alert (Task 6/7) - opening it only needs a planId and
   // its current display name, regardless of which screen triggered it.
-  const openRenameSheet = (planId, currentName) => {
-    setRenamePlanTarget({ id: planId, currentName: currentName || "" });
+  // roomId (Phase B): optional, explicit Room id to patch in `rooms` state
+  // on save - passed by Room Detail, whose target plan may not be in the
+  // capped `history` cache at all (an older visit `loadHistory`'s 20-plan
+  // cap never fetched). Existing call sites (Results/Space-Detail-era
+  // rename pencils) omit it and fall back to resolving the Room id from
+  // `history` inside handleSaveRename, same as before this addition.
+  const openRenameSheet = (planId, currentName, roomId = null) => {
+    setRenamePlanTarget({ id: planId, currentName: currentName || "", roomId });
     setRenameSheetValue(currentName || "");
   };
   const closeRenameSheet = () => {
@@ -4570,6 +4650,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setMergeReviewPlansById((prev) => (renamePlanTarget.id in prev ? { ...prev, [renamePlanTarget.id]: { ...prev[renamePlanTarget.id], spaceName: trimmed } } : prev));
       setHistory((prev) => prev.map((h) => (h.id === renamePlanTarget.id ? { ...h, spaceName: trimmed } : h)));
       if (currentPlanId === renamePlanTarget.id) setResults((prev) => (prev ? { ...prev, spaceName: trimmed } : prev));
+      // My Rooms -> True Room Grouping, Phase B: `rooms` is now the
+      // primary source Room Detail's header (and My Rooms' own cards) read
+      // displayName from - without this patch a rename wouldn't visibly
+      // "stick" on either screen until the next loadRooms() re-fetch.
+      // Resolves the target Room id from the explicit roomId Room Detail
+      // passes, falling back to the cached plan's own canonicalSpaceId (or
+      // its own id) when no explicit roomId was given - same resolution
+      // renameSpace itself performs server-side.
+      const cachedForRename = history.find((h) => h.id === renamePlanTarget.id);
+      const renamedRoomId = renamePlanTarget.roomId || (cachedForRename ? (cachedForRename.canonicalSpaceId || cachedForRename.id) : null);
+      if (renamedRoomId) {
+        setRooms((prev) => prev.map((r) => (r.id === renamedRoomId ? { ...r, displayName: trimmed } : r)));
+      }
+      setRoomDetailPlans((prev) => prev.map((p) => (p.id === renamePlanTarget.id ? { ...p, spaceName: trimmed } : p)));
       setRenamePlanTarget(null);
       setRenameSheetValue("");
     } catch (e) {
@@ -4643,6 +4737,35 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     </Modal>
   );
 
+  // Full-screen photo viewer - reuses the existing vizModal/vizModalKey
+  // state (pinch-zoom, close button) originally built for the AI
+  // visualization images and Results' own starting photo. Extracted here
+  // (Phase B) since Room Detail is now a second real caller alongside
+  // Results, matching this file's own renderRenameSheet precedent for a
+  // modal rendered from more than one screen's return block.
+  const renderPhotoZoomModal = () => (
+    <Modal visible={!!vizModal} transparent={true} animationType="fade" onRequestClose={() => setVizModal(null)}>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <View style={s.vizModalBg}>
+          <TouchableOpacity style={s.vizModalClose} onPress={() => setVizModal(null)}>
+            <X size={20} color="white" strokeWidth={2.25} />
+          </TouchableOpacity>
+          {vizModal && (
+            <ImageZoom
+              key={vizModalKey}
+              uri={vizModal}
+              minScale={1}
+              maxScale={5}
+              isDoubleTapEnabled={true}
+              style={s.vizModalImage}
+              resizeMode="contain"
+            />
+          )}
+        </View>
+      </GestureHandlerRootView>
+    </Modal>
+  );
+
   const resumeCompanionSession = (item) => {
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
     setResults(item);
@@ -4669,83 +4792,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   //
   // "View Full Plan" must ALWAYS open Results - no conditional.
   //
-  // Also clears every OTHER screen flag that sits between Space Detail's
-  // own render condition (~4371) and Results' (~4994) in the render
-  // chain - showFaq, showMergeReview, showSpaceInspector, showAccount.
-  // Each top-level screen is its own early-return `if (flag) return (...)`,
-  // checked in source order on every render - Space Detail's check fires
-  // first and masks any of these being left true from earlier navigation
-  // in the same session, but the instant spaceDetailPlanId is cleared
-  // (as this function does), the chain falls through to the next truthy
-  // flag instead of Results if one of them was never reset. Third
-  // occurrence of this exact bug class (goHome, then the merge-review
-  // screen, now here) - always clear every flag between where you are
-  // and where you're going, not just the one you're leaving.
-  // Extracted, unchanged, from My Rooms' own former inline onPress handler
-  // (pre-Phase-A) so both the temporary Room-card tap bridge below and any
-  // other plan-level entry point can share exactly one copy of this action
-  // list, rather than two copies drifting apart.
-  const showPlanActionsAlert = (item) => {
-    Alert.alert(getSpaceDisplayName(item), "What would you like to do?", [
-      { text: "View Plan", onPress: () => { setShowHistory(false); setSpaceDetailPlanId(item.id); } },
-      { text: "Organize Again", onPress: () => startOrganizeAgain(item) },
-      { text: "Rename", onPress: () => openRenameSheet(item.id, getSpaceDisplayName(item)) },
-      isPro
-        ? { text: "Share as PDF", onPress: () => { setResults(item); setVizImage(item.vizImages || {}); setVizLoading({}); setCurrentPlanId(item.id); restorePhotoFromPlan(item); setTimeout(() => generatePDF(), 100); } }
-        : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
-      {
-        text: "Delete Plan", style: "destructive", onPress: () => {
-          Alert.alert("Delete this plan?", "This can't be undone.", [
-            { text: "Cancel", style: "cancel" },
-            { text: "Delete", style: "destructive", onPress: () => deletePlan(item.id) },
-          ]);
-        },
-      },
-      { text: "Cancel", style: "cancel" },
-    ]);
-  };
+  // Also clears every OTHER screen flag that sits between Room Detail's
+  // own render condition and Results' in the render chain - showFaq,
+  // showMergeReview, showSpaceInspector, showAccount. Each top-level
+  // screen is its own early-return `if (flag) return (...)`, checked in
+  // source order on every render - Room Detail's check fires first and
+  // masks any of these being left true from earlier navigation in the
+  // same session, but the instant roomDetailRoomId is cleared (as this
+  // function does), the chain falls through to the next truthy flag
+  // instead of Results if one of them was never reset. Third occurrence
+  // of this exact bug class (goHome, then the merge-review screen, now
+  // here) - always clear every flag between where you are and where
+  // you're going, not just the one you're leaving.
 
-  // My Rooms -> True Room Grouping, Phase A: temporary tap bridge. A Room
-  // card is a Space, not a plan - every existing action this Alert offers
-  // (View Plan/Organize Again/Rename/Share as PDF/Delete Plan) is plan-
-  // shaped, so tapping resolves the Room to its most-recently-created
-  // plan FIRST, then shows the exact same Alert as before, unchanged,
-  // against that resolved plan - preserving every existing action rather
-  // than dropping Share/Delete (neither exists inside Space Detail today)
-  // just because the card itself is no longer plan-sourced. Room Detail's
-  // own redesign (a real overflow menu, Room-level delete, etc.) is
-  // explicitly out of scope for this phase.
-  //
-  // Fast path: the capped `history` cache already has a plan for this
-  // Space (the common case - most Rooms' latest visit is recent). Falls
-  // back to a targeted query only on a miss, which is now a real
-  // possibility for an older Room the 20-plan cap doesn't cover -
-  // Section 2c's own point: Room-list accuracy no longer depends on that
-  // cap, so this resolution can't either.
-  const openRoomFromCard = async (room) => {
-    const cached = history.find(h => (h.canonicalSpaceId || h.id) === room.id);
-    if (cached) {
-      showPlanActionsAlert(cached);
-      return;
-    }
-    try {
-      const projectsSnap = await getDocs(query(collection(db, "users", user.uid, "spaces", room.id, "projects"), orderBy("createdAt", "desc"), limit(1)));
-      const latestProject = projectsSnap.docs[0]?.data();
-      const planId = latestProject?.sourcePlanId || room.id; // room.id is itself a valid planId fallback for a self-owned Space never yet synced past creation
-      const planSnap = await getDoc(doc(db, "users", user.uid, "plans", planId));
-      if (!planSnap.exists()) {
-        Alert.alert("Room not found", "We couldn't find any plans for this room.");
-        return;
-      }
-      const planData = { id: planSnap.id, ...planSnap.data() };
-      // Cache it so Space Detail's own history.find(spaceDetailPlanId)
-      // lookup (unchanged this phase) succeeds without a second fetch.
-      setHistory(prev => prev.some(h => h.id === planData.id) ? prev : [planData, ...prev]);
-      showPlanActionsAlert(planData);
-    } catch (e) {
-      dlog(`[MY ROOMS] failed to resolve a plan for room ${room.id}: ${e.message}`);
-      Alert.alert("Something went wrong", "Couldn't open this room. Please try again.");
-    }
+  // My Rooms -> True Room Grouping, Phase B: opens Room Detail for a tapped
+  // Room card - replaces Phase A's temporary Alert-bridge tap behavior
+  // (showPlanActionsAlert/openRoomFromCard, both removed; Room Detail is
+  // now the real destination, not a bridge to plan-shaped actions).
+  const openRoomDetail = (room) => {
+    setShowHistory(false);
+    setRoomDetailRoomId(room.id);
   };
 
   const openSpaceResults = (item) => {
@@ -4753,18 +4819,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setShowMergeReview(false);
     setShowSpaceInspector(false);
     setShowAccount(false);
-    setJustConfirmedRecognition(null); // browsing to a plan via History/Space Detail is not a fresh confirmation - no stale banner
+    setJustConfirmedRecognition(null); // browsing to a plan via History/Room Detail is not a fresh confirmation - no stale banner
     setResults(item);
     setShowCompanion(false);
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
-    setSpaceDetailPlanId(null);
+    setRoomDetailRoomId(null);
+    setResultsCameFromRoomDetail(null);
     restorePhotoFromPlan(item);
   };
   // "Continue Organizing" - only ever reached when the user explicitly
   // chooses it (only rendered when isCompanionResumable(item) is true -
-  // see the Space Detail screen below), never as a default. Same
+  // see the Room Detail screen below), never as a default. Same
   // intervening-flag vulnerability and fix as openSpaceResults above -
   // the Companion render condition (results && showCompanion) sits even
   // further down the chain, past all the same flags.
@@ -4773,21 +4840,83 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setShowMergeReview(false);
     setShowSpaceInspector(false);
     setShowAccount(false);
-    logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "space_detail" });
+    logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "room_detail" });
     setJustConfirmedRecognition(null);
     setResults(item);
     setShowCompanion(true);
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
-    setSpaceDetailPlanId(null);
+    setRoomDetailRoomId(null);
+    setResultsCameFromRoomDetail(null);
     restorePhotoFromPlan(item);
   };
+  // Room Detail -> tap a prior visit -> that plan's Results (Phase B §5).
+  // Captures roomDetailRoomId BEFORE openSpaceResults clears it (same
+  // clear-every-flag-between-screens discipline its own comment already
+  // documents), so the correct Room to return to survives into
+  // resultsCameFromRoomDetail.
+  const openRoomDetailVisit = (item) => {
+    const roomId = roomDetailRoomId;
+    openSpaceResults(item);
+    setResultsCameFromRoomDetail(roomId);
+  };
+  // Room Detail's own "Continue where you left off" CTA (Phase B §2) -
+  // same capture-before-clear pattern as openRoomDetailVisit. Companion's
+  // own back arrow already returns to Results unchanged; tagging this path
+  // too means Results' OWN back (see returnToRoomDetail) correctly
+  // continues the chain back to Room Detail from there.
+  const openRoomDetailUnfinishedCTA = (item) => {
+    const roomId = roomDetailRoomId;
+    openCompanionSession(item);
+    setResultsCameFromRoomDetail(roomId);
+  };
+  // Results -> back -> Room Detail (Phase B §5/§3.h), reached only when
+  // resultsCameFromRoomDetail is set. Mirrors the relevant subset of
+  // goHome()'s own resets for leaving Results/Companion, but deliberately
+  // does NOT touch showHistory/showMenu/etc - this is a lateral return to
+  // Room Detail, not a full reset to Home.
+  const returnToRoomDetail = (roomId) => {
+    setResults(null);
+    setShowCompanion(false);
+    setCurrentPlanId(null);
+    setVizImage({});
+    setVizLoading({});
+    setJustConfirmedRecognition(null);
+    setResultsCameFromRoomDetail(null);
+    setRoomDetailRoomId(roomId);
+  };
+  // Room Detail overflow menu (Phase B §2). Share as PDF is real, reusing
+  // the exact same pattern the old plan-actions Alert used. Move/Delete
+  // Room are placement only per this phase's explicit scope - wired to
+  // reclassifyLegacyPlan / real Room-level delete semantics in a later
+  // phase, never executed here.
+  const openRoomDetailOverflow = (room, mostRecentPlan) => {
+    Alert.alert(room.displayName, "More options", [
+      isPro
+        ? {
+            text: "Share as PDF", onPress: () => {
+              if (!mostRecentPlan) return;
+              setResults(mostRecentPlan);
+              setVizImage(mostRecentPlan.vizImages || {});
+              setVizLoading({});
+              setCurrentPlanId(mostRecentPlan.id);
+              restorePhotoFromPlan(mostRecentPlan);
+              setTimeout(() => generatePDF(), 100);
+            },
+          }
+        : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
+      { text: "Move to another Room", onPress: () => Alert.alert("Coming soon", "Moving a room's visits to another room will be available in a future update.") },
+      { text: "Delete Room", style: "destructive", onPress: () => Alert.alert("Coming soon", "Deleting a whole room will be available in a future update.") },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  };
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): the one flow
-  // behind both entry points - the History row's "Organize Again" Alert
-  // action and Space Detail's own button - not two separate flows, same
+  // behind every "Organize Again" entry point (originally the History
+  // row's Alert action and Space Detail's own button; now Room Detail's
+  // own button, Section 2) - not a separate flow per entry point, same
   // pattern as this file's one renderRenameSheet()/openRenameSheet() bottom
-  // sheet serving four call sites. Resolves the target Space id the same
+  // sheet serving multiple call sites. Resolves the target Space id the same
   // way computeShadowIds does (this item's own canonicalSpaceId if it's
   // itself a returning-visit plan, else its own id), stores it plus the
   // item itself (§1c/1e's prior context) in organizeAgainContext, clears
@@ -4808,7 +4937,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionRevealReady(false);
   };
   const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setSpaceDetailPlanId(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setRoomDetailRoomId(null); setResultsCameFromRoomDetail(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -4827,9 +4956,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (showAccount) { setShowAccount(false); setShowMenu(true); return true; }
       if (showSpaceInspector) { setShowSpaceInspector(false); setShowMenu(true); return true; }
       if (showMergeReview) { setShowMergeReview(false); setShowMenu(true); return true; }
-      // Reached only from My Spaces (History) - back returns there, not
+      // Reached only from My Rooms (History) - back returns there, not
       // to Menu, matching the drill-down it actually came from.
-      if (spaceDetailPlanId) { setSpaceDetailPlanId(null); setShowHistory(true); return true; }
+      if (roomDetailRoomId) { setRoomDetailRoomId(null); setShowHistory(true); return true; }
       // Room-First Identity, Phase B: backing out of the Room confirmation
       // screen steps back through it, never a no-op. Within a sub-view
       // (picker/freeform), back returns to that outcome's main chooser.
@@ -4864,13 +4993,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // Home, instead of stepping back one screen like every other back
       // arrow here does.
       if (results && showCompanion) { setShowCompanion(false); return true; }
-      if (results) { goHome(); return true; }
+      // Phase B: back from Results returns to Room Detail specifically
+      // when that's where the user came from (resultsCameFromRoomDetail),
+      // matching the general "step back to where you came from" rule
+      // every other branch here already follows - otherwise falls through
+      // to the existing goHome() default, completely unchanged.
+      if (results) {
+        if (resultsCameFromRoomDetail) { returnToRoomDetail(resultsCameFromRoomDetail); return true; }
+        goHome();
+        return true;
+      }
       return false;
     };
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, spaceDetailPlanId, roomConfirmation, results, showCompanion, unresolvedReview]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, roomDetailRoomId, roomConfirmation, results, showCompanion, unresolvedReview, resultsCameFromRoomDetail]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -5348,7 +5486,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             // loadRooms above), never from `history`. A Room with 3 visits
             // renders exactly once here, regardless of the old 20-plan cap.
             rooms.map((room) => (
-              <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomFromCard(room)}>
+              <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomDetail(room)}>
                 {room.latestPhotoUrl ? (
                   <Image source={{ uri: room.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
                 ) : (
@@ -5378,33 +5516,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
-  // SPACE DETAIL SCREEN. Reactivated as the primary destination for
-  // tapping a Space (Remembered Home v1 Step 2, RememberedHomeDesign.md
-  // §1a) - reached from My Spaces' "View Plan" Alert action, or directly
-  // via "Organize Again" from either that same Alert or this screen's own
-  // button (startOrganizeAgain). This comment was previously stale (said
-  // "reached only from... View Plan" back when View Plan went straight to
-  // Results instead) - corrected per the design doc's own §3 gap #3.
-  // Shows the Space's own content (photos, status, history) rather than
-  // dropping the user straight into the Companion journey - that journey
-  // is still one tap away ("Continue Organizing"/"View Full Plan" below),
-  // just no longer the forced default. Reuses
-  // the exact same rename bottom sheet as the merge-review screen and
-  // History's own "Rename" action (renderRenameSheet, openRenameSheet) -
-  // no second sheet built. Structurally modeled on the Space Inspector
-  // (header + ScrollView of SectionCard-shaped blocks) per the
-  // investigation's finding that the Inspector's shape, not its
-  // shadow-graph-specific data source, is what's reusable here - the
-  // Inspector itself stays untouched, dev-only, and reads the shadow
-  // graph (a diagnostic concern); this screen reads the plan document
-  // directly, the same source every other end-user screen already uses.
-  if (spaceDetailPlanId) {
-    const item = history.find((h) => h.id === spaceDetailPlanId);
-    if (!item) {
+  // ROOM DETAIL SCREEN (My Rooms -> True Room Grouping, Phase B). Replaces
+  // the old single-plan Space Detail as the primary destination from My
+  // Rooms (openRoomDetail) - shows the Room's full organizing history
+  // (every visit under this Space, Section 1's verified query), not just
+  // one plan. The Room is the durable place; plans are dated chapters
+  // inside it. Reuses the exact same rename bottom sheet and full-screen
+  // photo viewer as every other screen (renderRenameSheet/
+  // renderPhotoZoomModal) - no new modal patterns introduced. Structurally
+  // modeled on the retired Space Detail screen's own shape (header +
+  // ScrollView of SectionCard-shaped blocks).
+  if (roomDetailRoomId) {
+    const room = rooms.find((r) => r.id === roomDetailRoomId);
+    if (!room) {
       return (
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
-            <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <View style={[s.hdr, { alignItems: "flex-start" }]}>
             <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
               <DrawerIcon size={54} dark={true} />
             </TouchableOpacity>
@@ -5412,7 +5540,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
               <Text style={s.hdrPageName}>Room Not Found</Text>
             </View>
-            <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
+            <TouchableOpacity onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
               <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
             </TouchableOpacity>
           </View>
@@ -5423,13 +5551,39 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       );
     }
 
-    const startingUri = item.photoUrl || null;
-    const latestUri = Array.isArray(item.progressPhotos) && item.progressPhotos.length ? item.progressPhotos[item.progressPhotos.length - 1].url : null;
-    const statusLabel = item.companionComplete ? "Completed" : (item.currentBatch ? "In progress" : "Not started");
-    const allBatches = [...(Array.isArray(item.batchHistory) ? item.batchHistory : []), ...(item.currentBatch ? [item.currentBatch] : [])]
-      .sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0));
+    const mostRecent = roomDetailPlans[0] || null;
+    const startingUri = mostRecent?.photoUrl || null;
+    const latestUri = Array.isArray(mostRecent?.progressPhotos) && mostRecent.progressPhotos.length ? mostRecent.progressPhotos[mostRecent.progressPhotos.length - 1].url : null;
+    // Section 2's CTA target rule, expressed directly as a find() over a
+    // list already sorted most-recent-first (Section 1) - the first match
+    // IS "the most recent plan that still has unfinished work," with no
+    // separate sort or special-casing needed for the prior-visit-only case
+    // (test f).
+    const unfinishedTarget = roomDetailPlans.find(planHasUnfinishedWork) || null;
 
-    const SpaceDetailSectionCard = ({ title, children }) => (
+    // The SAME three-way split the old Space Detail's own statusLabel used
+    // (companionComplete -> Completed / currentBatch -> In progress / else
+    // Not started) - companionComplete is the one authoritative "done"
+    // signal, never inferred from batch contents. The only addition is a
+    // finer branch between the top two, using the exact unresolved
+    // definition already authoritative everywhere else in this file
+    // ("carried"/"pending" = unresolved, "skipped" is an explicit past
+    // decision, never conflated with "still open") - per Section 3's own
+    // worked examples ("3 items remaining", not just "In progress"). This
+    // is deliberately NOT a Room-Detail-specific interpretation of
+    // completion - a fully-resolved-but-not-explicitly-completed batch
+    // (e.g. every item skipped, none carried/pending, companionComplete
+    // still false) still reads "In progress", same as it always has.
+    const visitStatusLabel = (plan) => {
+      if (plan.companionComplete) return "Completed";
+      const items = plan?.currentBatch?.items || [];
+      const unresolvedCount = items.filter((i) => i.status === "carried" || i.status === "pending").length;
+      if (unresolvedCount > 0) return `${unresolvedCount} item${unresolvedCount === 1 ? "" : "s"} remaining`;
+      if (plan.currentBatch) return "In progress";
+      return "Not started";
+    };
+
+    const RoomDetailSectionCard = ({ title, children }) => (
       <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
         <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
         {children}
@@ -5446,80 +5600,105 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <View style={{ flex: 1 }}>
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Text style={s.hdrPageName} numberOfLines={1}>{getSpaceDisplayName(item)}</Text>
-              <TouchableOpacity onPress={() => openRenameSheet(item.id, getSpaceDisplayName(item))} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
+              <Text style={s.hdrPageName} numberOfLines={1}>{room.displayName}</Text>
+              {/* roomId passed explicitly (3rd arg) - this Room's target plan
+                  may not be in the capped `history` cache at all, so
+                  handleSaveRename can't rely on resolving it from there. */}
+              <TouchableOpacity onPress={() => openRenameSheet(mostRecent?.id || room.id, room.displayName, room.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
                 <Pencil size={14} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
               </TouchableOpacity>
             </View>
-            <Text style={s.hdrTag}>{item.date}</Text>
+            {/* Most recent area - only for a genuine sub-area latest visit
+                (Room-First Identity's own areaScope contract), same rule
+                My Rooms' own card already follows - never an empty line. */}
+            {room.latestAreaName && room.latestAreaScope === "sub-area" && (
+              <Text style={s.hdrTag} numberOfLines={1}>{room.latestAreaName}</Text>
+            )}
           </View>
-          <TouchableOpacity onPress={() => { setSpaceDetailPlanId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
+          <TouchableOpacity onPress={() => openRoomDetailOverflow(room, mostRecent)} style={{ padding: 8 }} accessibilityLabel="More options" accessibilityRole="button">
+            <Text style={{ fontSize: 20, color: "rgba(255,255,255,0.9)", fontFamily: "Inter_700Bold" }}>⋯</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
         <ScrollView contentContainerStyle={s.scrollContent}>
-          <SpaceDetailSectionCard title="Photos">
-            {startingUri && latestUri ? (
-              <BeforeAfterStack beforeUri={startingUri} afterUri={latestUri} height={200} />
-            ) : startingUri ? (
-              <Image source={{ uri: startingUri }} style={{ width: "100%", height: 200, borderRadius: 10 }} resizeMode="cover" />
-            ) : (
-              <View style={{ width: "100%", height: 120, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" }}>
-                <Text style={{ fontSize: 12, color: "#94A3B8" }}>No photo yet</Text>
-              </View>
-            )}
-          </SpaceDetailSectionCard>
-
-          <SpaceDetailSectionCard title="Status">
-            <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 4 }}>{statusLabel}</Text>
-            <Text style={{ fontSize: 12, color: "#64748B" }}>Started {item.date}</Text>
-          </SpaceDetailSectionCard>
-
-          <SpaceDetailSectionCard title="History">
-            {allBatches.length === 0 ? (
-              <Text style={{ fontSize: 13, color: "#64748B" }}>No sessions recorded yet.</Text>
-            ) : allBatches.map((b, i) => (
-              <View key={b.batchIndex ?? i} style={{ marginBottom: i === allBatches.length - 1 ? 0 : 12 }}>
-                <Text style={{ fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginBottom: 4 }}>Session {i + 1}</Text>
-                {(b.items || []).map((it, j) => (
-                  <View key={it.id || j} style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                    {it.status !== "pending" ? (
-                      <Check size={14} color={BRAND.green} strokeWidth={2.5} />
-                    ) : (
-                      <View style={{ width: 14, height: 14, borderRadius: 7, borderWidth: 1.5, borderColor: BRAND.mist }} />
-                    )}
-                    <Text style={{ fontSize: 13, color: BRAND.ink, flex: 1 }} numberOfLines={2}>{it.text}</Text>
+          {roomDetailLoading && roomDetailPlans.length === 0 ? (
+            <View style={{ alignItems: "center", paddingTop: 60 }}>
+              <ActivityIndicator size="small" color={BRAND.green} />
+            </View>
+          ) : (
+            <>
+              <RoomDetailSectionCard title="Photos">
+                {startingUri && latestUri ? (
+                  <BeforeAfterStack
+                    beforeUri={startingUri}
+                    afterUri={latestUri}
+                    height={200}
+                    onPress={(which) => { setVizModal(which === "before" ? startingUri : latestUri); setVizModalKey((k) => k + 1); }}
+                  />
+                ) : startingUri ? (
+                  <TouchableOpacity onPress={() => { setVizModal(startingUri); setVizModalKey((k) => k + 1); }} activeOpacity={0.9} accessibilityLabel="View photo full screen" accessibilityRole="button">
+                    <Image source={{ uri: startingUri }} style={{ width: "100%", height: 200, borderRadius: 10 }} resizeMode="cover" />
+                  </TouchableOpacity>
+                ) : (
+                  <View style={{ width: "100%", height: 120, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" }}>
+                    <Text style={{ fontSize: 12, color: "#94A3B8" }}>No photo yet</Text>
                   </View>
-                ))}
-              </View>
-            ))}
-          </SpaceDetailSectionCard>
+                )}
+              </RoomDetailSectionCard>
 
-          {/* Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): "the
-              primary new interaction" - the user is saying "I want to
-              organize this room again." Styled as the top, primary
-              (green) action; View Full Plan below is demoted to secondary
-              styling to make room for it - its function (one tap to
-              Results) is completely unchanged, only its visual weight. */}
-          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => startOrganizeAgain(item)}>
-            <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
-          </TouchableOpacity>
-          {/* Always available, always leads to Results (budget tiers,
-              product recommendations, visualization) - never
-              conditionally rerouted to Companion. */}
-          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openSpaceResults(item)}>
-            <Text style={s.mergeSecondaryBtnText}>View Full Plan</Text>
-          </TouchableOpacity>
-          {/* Companion is reached ONLY through this explicit, separately-
-              labeled secondary action, and only when there's genuinely an
-              in-progress checklist to resume - never the default. */}
-          {isCompanionResumable(item) && (
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openCompanionSession(item)}>
-              <Text style={s.mergeSecondaryBtnText}>Continue Organizing</Text>
-            </TouchableOpacity>
+              {/* Section 2: shown only when unfinished work exists ANYWHERE
+                  in the Room, targeting the single most recent plan that
+                  has it (unfinishedTarget above) - omitted entirely, not a
+                  quiet placeholder, when there's nothing to act on (the
+                  "Organize Again" button below already communicates the
+                  Room is ready for more attention). */}
+              {unfinishedTarget && (
+                <TouchableOpacity
+                  onPress={() => openRoomDetailUnfinishedCTA(unfinishedTarget)}
+                  style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}
+                  accessibilityLabel="Continue where you left off"
+                  accessibilityRole="button"
+                >
+                  <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Continue where you left off →</Text>
+                </TouchableOpacity>
+              )}
+
+              <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => startOrganizeAgain(mostRecent || { id: room.id })}>
+                <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
+              </TouchableOpacity>
+
+              <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${roomDetailPlans.length})`}</Text>
+              {roomDetailPlans.length === 0 ? (
+                <Text style={{ fontSize: 13, color: "#64748B" }}>No visits recorded yet.</Text>
+              ) : roomDetailPlans.map((plan) => (
+                <TouchableOpacity key={plan.id} style={s.historyItem} onPress={() => openRoomDetailVisit(plan)}>
+                  {plan.photoUrl ? (
+                    <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                  ) : (
+                    <View style={s.historyIcon}>
+                      <Text style={{ fontSize: 20 }}>🏠</Text>
+                    </View>
+                  )}
+                  <View style={{ flex: 1 }}>
+                    {/* No "Whole room"/"General" placeholder for a
+                        whole-room visit - the area segment is omitted
+                        entirely (not rendered as an empty string) whenever
+                        there's no genuine confirmed sub-area, same rule
+                        the header's own area subtitle and My Rooms' cards
+                        already follow elsewhere on this screen. */}
+                    <Text style={s.historySpace} numberOfLines={1}>
+                      {[plan.date, (plan.areaScope === "sub-area" && plan.areaName) ? plan.areaName : null, visitStatusLabel(plan)].filter(Boolean).join(" · ")}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              ))}
+            </>
           )}
         </ScrollView>
         {renderRenameSheet()}
+        {renderPhotoZoomModal()}
       </SafeAreaView>
     );
   }
@@ -6344,7 +6523,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
+          {/* Phase B (§5/§3.h): the user entered through the Room, they
+              return to it - same icon-slot-reused-as-back pattern this
+              codebase already established for the old Space Detail screen
+              (App.js's since-retired "Back to My Rooms" icon). Falls back
+              to its unchanged, original "Open menu" behavior whenever
+              Results wasn't reached via Room Detail. */}
+          <TouchableOpacity
+            onPress={() => (resultsCameFromRoomDetail ? returnToRoomDetail(resultsCameFromRoomDetail) : setShowMenu(true))}
+            style={{ padding: 8 }}
+            accessibilityLabel={resultsCameFromRoomDetail ? "Back to Room" : "Open menu"}
+            accessibilityRole="button"
+          >
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
@@ -6555,27 +6745,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </View>
             );
           })}
-          {/* Full screen visualization modal */}
-          <Modal visible={!!vizModal} transparent={true} animationType="fade" onRequestClose={() => setVizModal(null)}>
-            <GestureHandlerRootView style={{flex:1}}>
-              <View style={s.vizModalBg}>
-                <TouchableOpacity style={s.vizModalClose} onPress={() => setVizModal(null)}>
-                  <X size={20} color="white" strokeWidth={2.25} />
-                </TouchableOpacity>
-                {vizModal && (
-                  <ImageZoom
-                    key={vizModalKey}
-                    uri={vizModal}
-                    minScale={1}
-                    maxScale={5}
-                    isDoubleTapEnabled={true}
-                    style={s.vizModalImage}
-                    resizeMode="contain"
-                  />
-                )}
-              </View>
-            </GestureHandlerRootView>
-          </Modal>
+          {renderPhotoZoomModal()}
 
           {results.proTip && (
             <View style={s.tipBox}>
