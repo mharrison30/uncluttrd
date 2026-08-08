@@ -5624,10 +5624,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
               <Text style={s.hdrPageName}>Room Not Found</Text>
             </View>
-            <TouchableOpacity onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
+            <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
               <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
             </TouchableOpacity>
           </View>
+          {/* Navigation Consistency fix: was a Menu-icon-reused-as-back
+              (same ambiguity the Results fix already addressed elsewhere) -
+              now the same explicit "<- [destination]" bar pattern, below
+              the header. The hamburger above reverts to unconditionally
+              opening the menu. */}
+          <TouchableOpacity
+            onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }}
+            style={{ backgroundColor: BRAND.greenLight, borderBottomWidth: 1, borderBottomColor: BRAND.greenMid, paddingVertical: 10, paddingHorizontal: 16 }}
+            accessibilityLabel="Back to My Rooms"
+            accessibilityRole="button"
+          >
+            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>← My Rooms</Text>
+          </TouchableOpacity>
           <ScrollView contentContainerStyle={s.scrollContent}>
             <Text style={{ fontSize: 14, color: "#64748B" }}>This room could no longer be found.</Text>
           </ScrollView>
@@ -5714,10 +5727,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.hdrTag} numberOfLines={1}>{room.latestAreaName}</Text>
             )}
           </View>
-          <TouchableOpacity onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
+          <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
+        {/* Navigation Consistency fix: was a Menu-icon-reused-as-back (same
+            ambiguity the Results fix already addressed elsewhere) - now the
+            same explicit "<- [destination]" bar pattern, below the header.
+            The hamburger above reverts to unconditionally opening the menu. */}
+        <TouchableOpacity
+          onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }}
+          style={{ backgroundColor: BRAND.greenLight, borderBottomWidth: 1, borderBottomColor: BRAND.greenMid, paddingVertical: 10, paddingHorizontal: 16 }}
+          accessibilityLabel="Back to My Rooms"
+          accessibilityRole="button"
+        >
+          <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>← My Rooms</Text>
+        </TouchableOpacity>
         <ScrollView contentContainerStyle={s.scrollContent}>
           {roomDetailLoading && roomDetailPlans.length === 0 ? (
             <View style={{ alignItems: "center", paddingTop: 60 }}>
@@ -6464,7 +6489,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </TouchableOpacity>
             ))}
             <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
-              <Text style={s.mergeSecondaryBtnText}>Back</Text>
+              <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
         </SafeAreaView>
@@ -6490,7 +6515,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={[s.startOverText, { color: "white" }]}>Save</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
-              <Text style={s.mergeSecondaryBtnText}>Back</Text>
+              <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
         </SafeAreaView>
