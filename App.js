@@ -6523,21 +6523,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
             <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
           </TouchableOpacity>
-          {/* Phase B (§5/§3.h): the user entered through the Room, they
-              return to it - same icon-slot-reused-as-back pattern this
-              codebase already established for the old Space Detail screen
-              (App.js's since-retired "Back to My Rooms" icon). Falls back
-              to its unchanged, original "Open menu" behavior whenever
-              Results wasn't reached via Room Detail. */}
-          <TouchableOpacity
-            onPress={() => (resultsCameFromRoomDetail ? returnToRoomDetail(resultsCameFromRoomDetail) : setShowMenu(true))}
-            style={{ padding: 8 }}
-            accessibilityLabel={resultsCameFromRoomDetail ? "Back to Room" : "Open menu"}
-            accessibilityRole="button"
-          >
+          <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
+        {/* Phase B device-fix (§5/§3.h): the prior fix reused this header's
+            Menu icon as a silent context-dependent "back" (only its
+            accessibilityLabel changed - the visible glyph never did),
+            which on-device testing confirmed reads as "menu," not "back."
+            Replaced with an explicit, visually distinct bar - its own row
+            below the header, not sharing the header's icon slot - shown
+            ONLY when Results was reached via Room Detail. Every other
+            entry path (first-time analysis, deep link, Home's resumable
+            banner) renders nothing here, unchanged. */}
+        {resultsCameFromRoomDetail && (
+          <TouchableOpacity
+            onPress={() => returnToRoomDetail(resultsCameFromRoomDetail)}
+            style={{ backgroundColor: BRAND.greenLight, borderBottomWidth: 1, borderBottomColor: BRAND.greenMid, paddingVertical: 10, paddingHorizontal: 16 }}
+            accessibilityLabel={`Back to ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
+            accessibilityRole="button"
+          >
+            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>
+              {`← ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
+            </Text>
+          </TouchableOpacity>
+        )}
         <ScrollView ref={resultsScrollRef} contentContainerStyle={s.scrollContent}>
           <View style={s.resTop}>
             <View style={{ flex: 1 }}>
