@@ -72,7 +72,7 @@
 
 const admin = require("firebase-admin");
 const {
-  computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION,
+  computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION,
   detectMergeCandidates, evaluateCandidateInvalidation, DETECTION_VERSION,
   computeMergeCandidateId, CANDIDATE_KEY_VERSION, getSpaceDisplayName, SHADOW_SCHEMA_VERSION,
   validateTargetSpace, resolveRecognitionCandidates,
@@ -93,6 +93,58 @@ async function updateSpaceRoomSummaryAdmin(db, uid, spaceId) {
     console.log(`[ROOM SUMMARY] update failed for space ${spaceId}: ${e.message}`);
     return null;
   }
+}
+
+// ---- Area Identity, Phase A (AreaIdentityDesign.md §2/§5/§11) - Admin-SDK
+// mirrors of App.js's updateAreaSummary/createAreaForPlan/renameArea,
+// 1:1 same contracts. See each client function's own comment for the
+// full reasoning; not restated here. ----
+async function updateAreaSummaryAdmin(db, uid, roomId, areaId) {
+  try {
+    const projectsSnap = await db.collection("users").doc(uid).collection("spaces").doc(roomId).collection("projects").get();
+    const areaProjects = projectsSnap.docs.map((d) => d.data()).filter((p) => p.areaId === areaId);
+    const summary = computeAreaSummaryFields(areaProjects);
+    await db.collection("users").doc(uid).collection("spaces").doc(roomId).collection("areas").doc(areaId).update(summary);
+    return summary;
+  } catch (e) {
+    console.log(`[AREA SUMMARY] update failed for area ${areaId} in room ${roomId}: ${e.message}`);
+    return null;
+  }
+}
+
+async function createAreaForPlanAdmin(db, uid, roomId, planId, areaName) {
+  try {
+    const planSnap = await db.collection("users").doc(uid).collection("plans").doc(planId).get();
+    const photoUrl = planSnap.exists ? (planSnap.data().photoUrl || null) : null;
+    const now = new Date().toISOString();
+    const areaRef = await db.collection("users").doc(uid).collection("spaces").doc(roomId).collection("areas").add({
+      roomId,
+      displayName: areaName || "Unnamed Area",
+      createdAt: now,
+      originalPhotoUrl: photoUrl,
+      latestPhotoUrl: photoUrl,
+      lastOrganizedAt: now,
+      visitCount: 1,
+      retired: false,
+      redirectTo: null,
+    });
+    // Real-staging test finding (mirrors App.js's createAreaForPlan 1:1):
+    // this plan's shadow Project was already written before this Area
+    // existed (at savePlanToHistoryAdmin/writeSpaceShadowStructure time),
+    // with areaId: null - updating the plan document alone does not fix
+    // it. Bump shadowSourceVersion and re-sync so syncPlanToSpaceGraphAdmin
+    // re-derives the Project from the plan's now-current areaId.
+    await db.collection("users").doc(uid).collection("plans").doc(planId).update({ areaId: areaRef.id, shadowSourceVersion: admin.firestore.FieldValue.increment(1) });
+    await syncPlanToSpaceGraphAdmin(db, uid, planId);
+    return areaRef.id;
+  } catch (e) {
+    console.log(`[AREA CREATE] failed for plan ${planId} in room ${roomId}: ${e.message}`);
+    return null;
+  }
+}
+
+async function renameAreaAdmin(db, uid, roomId, areaId, newName) {
+  await db.collection("users").doc(uid).collection("spaces").doc(roomId).collection("areas").doc(areaId).update({ displayName: newName });
 }
 
 // ---- My Rooms -> True Room Grouping, rollout closeout item 1: existing-
@@ -143,6 +195,8 @@ async function deletePlanAdmin(db, uid, planId) {
   const planRef = userRef.collection("plans").doc(planId);
   const planSnap = await planRef.get();
   const canonicalSpaceId = planSnap.exists ? (planSnap.data().canonicalSpaceId || null) : null;
+  // Area Identity, Phase A - mirrors App.js's deletePlan 1:1.
+  const deletedPlanAreaId = planSnap.exists ? (planSnap.data().areaId || null) : null;
   await planRef.delete();
 
   const spaceId = canonicalSpaceId || planId;
@@ -164,7 +218,13 @@ async function deletePlanAdmin(db, uid, planId) {
   } else {
     await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
   }
-  return { outcome: "deleted", spaceDeleted, spaceId };
+  // Area Identity, Phase A - unconditional on spaceDeleted, mirrors
+  // App.js's deletePlan 1:1 (see its own comment for why - the Area
+  // document doesn't require its parent Space to still exist).
+  if (deletedPlanAreaId) {
+    await updateAreaSummaryAdmin(db, uid, spaceId, deletedPlanAreaId);
+  }
+  return { outcome: "deleted", spaceDeleted, spaceId, areaId: deletedPlanAreaId };
 }
 
 function parseArgs(argv) {
@@ -254,12 +314,16 @@ async function forceFullReprojectionAdmin(db, uid, planId) {
         batchCount++;
       });
     });
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId, areaId: derived.project.areaId ?? null };
   });
   // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook on
   // forceFullReprojection/syncPlanToSpaceGraph 1:1.
   if (result.outcome === "written") {
     await updateSpaceRoomSummaryAdmin(db, uid, result.spaceId);
+    // Area Identity, Phase A - same hook, one level down.
+    if (result.areaId) {
+      await updateAreaSummaryAdmin(db, uid, result.spaceId, result.areaId);
+    }
   }
   return result;
 }
@@ -324,11 +388,15 @@ async function syncPlanToSpaceGraphAdmin(db, uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId, areaId: derived.project.areaId ?? null };
   });
   // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook.
   if (result.outcome === "written") {
     await updateSpaceRoomSummaryAdmin(db, uid, result.spaceId);
+    // Area Identity, Phase A - same hook, one level down.
+    if (result.areaId) {
+      await updateAreaSummaryAdmin(db, uid, result.spaceId, result.areaId);
+    }
   }
   return result;
 }
@@ -404,6 +472,10 @@ async function savePlanToHistoryAdmin(db, uid, plan, { canonicalSpaceId = null, 
     spaceType: plan.suggestedRoomName,
     areaName: plan.areaName !== undefined ? plan.areaName : (plan.suggestedAreaName ?? null),
     areaScope: plan.areaScope ?? null,
+    // Area Identity, Phase A - mirrors App.js's savePlanToHistory 1:1:
+    // always written, null (not absent) unless the caller explicitly
+    // supplies a real Area id.
+    areaId: plan.areaId !== undefined ? plan.areaId : null,
     ...(canonicalSpaceId
       ? { canonicalSpaceId, spaceName: inheritedSpaceName }
       : (plan.spaceName ? { spaceName: plan.spaceName } : {})),
@@ -459,8 +531,12 @@ async function savePlanToHistoryAdmin(db, uid, plan, { canonicalSpaceId = null, 
   // My Rooms -> True Room Grouping, Phase A - mirrors App.js's own hook on
   // writeSpaceShadowStructure.
   await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
+  // Area Identity, Phase A - same hook, one level down.
+  if (entry.areaId) {
+    await updateAreaSummaryAdmin(db, uid, spaceId, entry.areaId);
+  }
 
-  return { outcome: "created", planId, spaceId, canonicalSpaceId: entry.canonicalSpaceId || null };
+  return { outcome: "created", planId, spaceId, canonicalSpaceId: entry.canonicalSpaceId || null, areaId: entry.areaId || null };
 }
 
 /**
@@ -856,5 +932,6 @@ if (require.main === module) {
     checkMigrationCompletenessAdmin, forceFullReprojectionAdmin, migratePlan, detectAndPersistMergeCandidatesForUser,
     syncPlanToSpaceGraphAdmin, renameSpaceAdmin, savePlanToHistoryAdmin, findRecognitionCandidatesAdmin,
     carryForwardUnresolvedItemsAdmin, updateSpaceRoomSummaryAdmin, backfillRoomSummariesAdmin, deletePlanAdmin,
+    updateAreaSummaryAdmin, createAreaForPlanAdmin, renameAreaAdmin,
   };
 }

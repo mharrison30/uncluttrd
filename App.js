@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -226,6 +226,99 @@ async function updateSpaceRoomSummary(uid, spaceId) {
   }
 }
 
+// Area Identity, Phase A (AreaIdentityDesign.md §2/§5/§11) - same
+// idempotent-recompute discipline as updateSpaceRoomSummary above, one
+// level down. Areas don't get their own Projects subcollection (see
+// AreaIdentityDesign.md §2's path decision) - this reads the WHOLE
+// Room's Projects collection (the same read updateSpaceRoomSummary
+// already performs) and filters to this one Area's own Projects in
+// memory via the areaId field deriveFullReprojectionDocs now carries.
+// Never deletes the Area document, even when the filtered list is empty
+// (visitCount: 0) - Area is identity, not a projection of its plans
+// (item 5's explicit requirement); computeAreaSummaryFields's own
+// contract already guarantees this by only ever returning summary
+// fields, never a deletion signal.
+async function updateAreaSummary(uid, roomId, areaId) {
+  try {
+    const projectsSnap = await getDocs(collection(db, "users", uid, "spaces", roomId, "projects"));
+    const areaProjects = projectsSnap.docs.map((d) => d.data()).filter((p) => p.areaId === areaId);
+    const summary = computeAreaSummaryFields(areaProjects);
+    await updateDoc(doc(db, "users", uid, "spaces", roomId, "areas", areaId), summary);
+  } catch (e) {
+    dlog(`[AREA SUMMARY] update failed for area ${areaId} in room ${roomId}: ${e.message}`);
+  }
+}
+
+// Area Identity, Phase A §3: creates a new, durable Area for a confirmed
+// sub-area visit. Phase A NEVER attempts to match an existing Area here -
+// every generic-camera sub-area visit gets a brand-new Area, full stop
+// (the governing principle: only navigation from an existing Area, i.e.
+// startOrganizeAgain's areaId option, or a future Phase B confirmation,
+// ever associates a visit with a PRE-EXISTING Area). Sets originalPhotoUrl/
+// latestPhotoUrl/visitCount/lastOrganizedAt directly at creation, correct
+// by construction (this IS the Area's first and only visit at this
+// instant), rather than calling updateAreaSummary - which would need to
+// read this plan's own shadow Project back, and that Project may not
+// exist yet (writeSpaceShadowStructure runs fire-and-forget, after this
+// function's caller already has newPlanId in hand - see
+// completeRoomConfirmation). Re-reads the plan for its own photoUrl
+// rather than trusting anything passed in, since by the time this runs
+// savePlanToHistory's internal photo upload has already completed and
+// written it - the same "read back what was actually persisted" caution
+// renameSpace itself already uses for canonicalSpaceId.
+async function createAreaForPlan(uid, roomId, planId, areaName) {
+  try {
+    const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+    const photoUrl = planSnap.exists() ? (planSnap.data().photoUrl || null) : null;
+    const now = new Date().toISOString();
+    const areaRef = await addDoc(collection(db, "users", uid, "spaces", roomId, "areas"), {
+      roomId,
+      displayName: areaName || "Unnamed Area",
+      createdAt: now,
+      originalPhotoUrl: photoUrl,
+      latestPhotoUrl: photoUrl,
+      lastOrganizedAt: now,
+      visitCount: 1,
+      retired: false,
+      redirectTo: null,
+    });
+    // Real-staging test finding: writeSpaceShadowStructure already wrote
+    // this plan's shadow Project BEFORE this Area existed (fire-and-forget,
+    // kicked off at the tail of savePlanToHistory - this function's own
+    // caller, completeRoomConfirmation, only runs after that returns, not
+    // after the shadow write itself finishes) - so that Project was
+    // written with areaId: null, and updating the PLAN document's own
+    // areaId above does not retroactively fix it. Bumping
+    // shadowSourceVersion and re-syncing forces syncPlanToSpaceGraph to
+    // re-derive the Project from the plan's now-current areaId, the same
+    // "changed something the shadow needs to catch up on" pattern
+    // renameSpace already uses for an analogous problem - not a new
+    // mechanism.
+    await updateDoc(doc(db, "users", uid, "plans", planId), { areaId: areaRef.id, shadowSourceVersion: increment(1) });
+    // Awaited, not fire-and-forget: completeRoomConfirmation already
+    // awaits this whole function, and the caller (and any test) needs
+    // Project.areaId to be reliably correct by the time this returns, not
+    // "usually correct soon after."
+    await syncPlanToSpaceGraph(uid, planId).catch((e) => dlog(`[AREA CREATE] shadow resync failed for plan ${planId}: ${e.message}`));
+    dlog(`[AREA CREATE] created area ${areaRef.id} ("${areaName}") in room ${roomId} for plan ${planId}`);
+    return areaRef.id;
+  } catch (e) {
+    dlog(`[AREA CREATE] failed for plan ${planId} in room ${roomId}: ${e.message}`);
+    return null;
+  }
+}
+
+// Area Identity, Phase A §7/§8: writes ONLY Area.displayName - never
+// touches any plan's own historical areaName field, mirroring
+// renameSpace's exact contract for Room.displayName one-to-one. No
+// shadowSourceVersion bump is needed the way renameSpace needs one for
+// Room - Area's own summary fields aren't sourced from a resync the way
+// Room's are; they're maintained directly by updateAreaSummary's own
+// hook points.
+async function renameArea(uid, roomId, areaId, newName) {
+  await updateDoc(doc(db, "users", uid, "spaces", roomId, "areas", areaId), { displayName: newName });
+}
+
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
   try {
     const shadow = buildShadowDocs({ planId, entry, photoUrl });
@@ -254,6 +347,13 @@ async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
     // own comment (below) for why this is safe to call unconditionally on
     // every creation, not just a "new Room" one.
     await updateSpaceRoomSummary(uid, spaceId);
+    // Area Identity, Phase A - same hook, one level down, only when this
+    // plan actually has a durable areaId (the common case, a whole-Room or
+    // legacy-descriptive visit, has none - entry.areaId is null, not
+    // absent, per savePlanToHistory's own field contract).
+    if (entry.areaId) {
+      await updateAreaSummary(uid, spaceId, entry.areaId);
+    }
     return { outcome: "written", sessionCount: shadow.sessions.length, batchCount };
   } catch (e) {
     // A genuine atomic-write failure. No shadow docs exist for this plan
@@ -689,7 +789,7 @@ async function syncPlanToSpaceGraph(uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId, areaId: derived.project.areaId ?? null };
   });
 
   // My Rooms -> True Room Grouping, Phase A - see updateSpaceRoomSummary's
@@ -701,6 +801,10 @@ async function syncPlanToSpaceGraph(uid, planId) {
   // transaction fully resolves, not folded into it.
   if (result.outcome === "written") {
     await updateSpaceRoomSummary(uid, result.spaceId);
+    // Area Identity, Phase A - same hook, one level down.
+    if (result.areaId) {
+      await updateAreaSummary(uid, result.spaceId, result.areaId);
+    }
   }
 
   return result;
@@ -880,7 +984,7 @@ async function forceFullReprojection(uid, planId) {
       });
     });
 
-    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId };
+    return { outcome: "written", sourceVersion: derived.sourceVersion, migrationVersion: MIGRATION_VERSION, sessionCount: derived.sessions.length, batchCount, spaceId, areaId: derived.project.areaId ?? null };
   });
 
   // My Rooms -> True Room Grouping, Phase A - same hook and idempotency
@@ -890,6 +994,10 @@ async function forceFullReprojection(uid, planId) {
   // that ever changes, not a dead gap.
   if (result.outcome === "written") {
     await updateSpaceRoomSummary(uid, result.spaceId);
+    // Area Identity, Phase A - same hook, one level down.
+    if (result.areaId) {
+      await updateAreaSummary(uid, result.spaceId, result.areaId);
+    }
   }
 
   return result;
@@ -2280,6 +2388,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [roomDetailRoomId, setRoomDetailRoomId] = useState(null);
   const [roomDetailPlans, setRoomDetailPlans] = useState([]);
   const [roomDetailLoading, setRoomDetailLoading] = useState(false);
+  // Area Identity, Phase A: this Room's own durable Areas, loaded fresh
+  // whenever roomDetailRoomId changes, same effect-per-Room-change pattern
+  // as roomDetailPlans above. Not filtered here by visitCount - the
+  // render layer hides a zero-matching-plan Area from the ordinary view
+  // (item 5's "hide, don't delete") by simply never rendering a section
+  // for an Area with no plans left in roomDetailPlans, not by filtering
+  // this array itself.
+  const [roomDetailAreas, setRoomDetailAreas] = useState([]);
   // Results -> back -> Room Detail navigation contract (Phase B §5/§3.h):
   // holds the Room id to return to, set ONLY when Results was entered via
   // Room Detail (a prior-visit tap, or Room Detail's own unfinished-work
@@ -2326,7 +2442,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // exact same button); recoverable in the worst case by
   // validateTargetSpace, since the plan lands under a real, still-valid
   // Space, not a corrupted one.
-  const [organizeAgainContext, setOrganizeAgainContext] = useState(null); // { spaceId, priorItem } | null
+  const [organizeAgainContext, setOrganizeAgainContext] = useState(null); // { spaceId, areaId, priorItem } | null - areaId (Area Identity, Phase A) is null except for an existing-Area "Organize Again" from Room Detail
   // Room-First Identity, Phase B (supersedes Step 3's single-outcome
   // recognition proposal - RoomFirstIdentityDesign.md §2). Non-null
   // triggers the Room confirmation screen, ahead of Results in the
@@ -3207,6 +3323,27 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     return () => { cancelled = true; };
   }, [roomDetailRoomId]);
 
+  // Area Identity, Phase A: this Room's own durable Areas - a plain
+  // subcollection read (spaces/{roomId}/areas), no OR-query complexity
+  // needed the way roomDetailPlans has, since an Area is definitionally
+  // Room-owned and lives entirely under this one path.
+  useEffect(() => {
+    if (!roomDetailRoomId) { setRoomDetailAreas([]); return; }
+    let cancelled = false;
+    const loadRoomDetailAreas = async () => {
+      try {
+        const areasSnap = await getDocs(collection(db, "users", user.uid, "spaces", roomDetailRoomId, "areas"));
+        const areas = areasSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        if (!cancelled) setRoomDetailAreas(areas);
+      } catch (e) {
+        dlog(`[ROOM DETAIL] failed to load areas for room ${roomDetailRoomId}: ${e.message}`);
+        if (!cancelled) setRoomDetailAreas([]);
+      }
+    };
+    loadRoomDetailAreas();
+    return () => { cancelled = true; };
+  }, [roomDetailRoomId]);
+
   useEffect(() => {
     if (showPaywall) {
       logEvent(getAnalytics(), "paywall_viewed");
@@ -3296,6 +3433,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // document, no sub-area UI, not durable identity yet).
         areaName: plan.areaName !== undefined ? plan.areaName : (plan.suggestedAreaName ?? null),
         areaScope: plan.areaScope ?? null,
+        // Area Identity, Phase A (AreaIdentityDesign.md §2/§3): always
+        // written, deliberately never omitted - null means a genuine
+        // whole-Room visit (or a legacy-style visit with only the
+        // descriptive areaName above and no durable identity yet), a
+        // string means a durable Area established either by navigation
+        // (startOrganizeAgain's areaId option, an existing-Area "Organize
+        // Again") or by completeRoomConfirmation's own post-save Area
+        // creation for a fresh sub-area visit. Phase A never infers this
+        // value from areaName/suggestedAreaName - only an explicit
+        // plan.areaId set by one of those two call sites ever populates
+        // it.
+        areaId: plan.areaId !== undefined ? plan.areaId : null,
         // spaceName: the CONFIRMED Room name (Phase C). For a returning
         // visit (canonicalSpaceId set), inheritedSpaceName - re-read fresh
         // from the target Space's own displayName - always wins, exactly
@@ -3686,10 +3835,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // (savePlanToHistory); non-null means a returning visit
   // (createReturningPlan), handling the invalid-target-space race exactly
   // as Step 2 already does.
-  const finalizeAnalysisResult = async (parsedResult, canonicalSpaceId, analysesRemaining) => {
+  // areaId (Area Identity, Phase A §4): optional, threaded straight
+  // through from organizeAgainContext.areaId (see the analyze() call
+  // site below) - identity already established by navigation, so this
+  // never triggers any Area creation/matching here, just carries the
+  // existing Area's id onto the new plan exactly like canonicalSpaceId
+  // already carries the existing Room's id.
+  const finalizeAnalysisResult = async (parsedResult, canonicalSpaceId, analysesRemaining, areaId = null) => {
     let newPlanId;
+    const planWithArea = areaId ? { ...parsedResult, areaId } : parsedResult;
     if (canonicalSpaceId) {
-      const returningResult = await createReturningPlan(parsedResult, canonicalSpaceId);
+      const returningResult = await createReturningPlan(planWithArea, canonicalSpaceId);
       newPlanId = returningResult.planId;
       if (returningResult.outcome === "invalid-target-space") {
         // Point 2 (Step 1) working as designed: the target Room became
@@ -3701,7 +3857,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         Alert.alert("This room is no longer available", "It may have been merged with another room. Your new photo was still analyzed, but couldn't be saved to that room.");
       }
     } else {
-      newPlanId = await savePlanToHistory(parsedResult);
+      newPlanId = await savePlanToHistory(planWithArea);
     }
     const validBatch = Array.isArray(parsedResult.firstActionBatch) && parsedResult.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
     if (validBatch) {
@@ -3818,6 +3974,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         setRoomConfirmationSaving(false);
         setRoomConfirmationError("We couldn't save your plan. Please try again.");
         return;
+      }
+
+      // Area Identity, Phase A §3: the ONE place a new Area gets created
+      // from the generic-camera path. Governing principle, restated:
+      // Phase A never attempts to match this sub-area visit against an
+      // existing Area by displayName or any other signal - every
+      // confirmed sub-area visit through THIS flow gets a brand-new Area,
+      // full stop. The only way a visit ever associates with a
+      // PRE-EXISTING Area is navigation (startOrganizeAgain's areaId
+      // option, threaded through finalizeAnalysisResult above - a
+      // completely different code path from this one). A whole-room
+      // outcome needs no action here at all - savePlanToHistory/
+      // createReturningPlan already wrote areaId: null via confirmedPlan
+      // not setting .areaId, per that field's own default. Non-fatal by
+      // design (createAreaForPlan never throws) - a failure here leaves
+      // the plan saved with areaId: null, same as a whole-Room visit,
+      // never blocks the confirmation flow the user is already past.
+      const roomIdForArea = resolvedResult.outcome === "existing-room" ? resolvedResult.canonicalSpaceId : newPlanId;
+      if (confirmedPlan.areaScope === "sub-area") {
+        await createAreaForPlan(user.uid, roomIdForArea, newPlanId, confirmedPlan.areaName);
       }
 
       // Success - only now clear the pending/confirmation state and
@@ -4223,7 +4399,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // inside finalizeAnalysisResult - currentPlanId itself doesn't reflect
       // the new doc until a re-render, and every batch event is
       // planId-correlated (see Analytics.md).
-      await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining);
+      await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining, returningContext?.areaId || null);
     } catch (e) {
       lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
@@ -4670,9 +4846,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // cap never fetched). Existing call sites (Results/Space-Detail-era
   // rename pencils) omit it and fall back to resolving the Room id from
   // `history` inside handleSaveRename, same as before this addition.
-  const openRenameSheet = (planId, currentName, roomId = null) => {
-    setRenamePlanTarget({ id: planId, currentName: currentName || "", roomId });
+  // kind ("plan" | "area"): Area Identity, Phase A §7 - reuses this exact
+  // sheet/Modal for Area rename rather than building a second one, since
+  // the shape (title + text input + suggestions + Cancel/Save) is
+  // otherwise identical. Only handleSaveRename's save call and this
+  // sheet's title actually branch on it; everything else (the Modal
+  // itself, the TextInput, the buttons) is shared unchanged.
+  const openRenameSheet = (planId, currentName, roomId = null, kind = "plan") => {
+    setRenamePlanTarget({ id: planId, currentName: currentName || "", roomId, kind });
     setRenameSheetValue(currentName || "");
+  };
+  // Area Identity, Phase A §7: id/roomId here are the AREA's own id and
+  // its parent Room's id (not a plan id at all) - handleSaveRename's
+  // "area" branch reads them that way.
+  const openAreaRenameSheet = (area) => {
+    openRenameSheet(area.id, area.displayName, area.roomId, "area");
   };
   const closeRenameSheet = () => {
     if (renameSheetSaving) return;
@@ -4683,6 +4871,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     const trimmed = renameSheetValue.trim();
     if (!renamePlanTarget || !trimmed) return;
     setRenameSheetSaving(true);
+    // Area Identity, Phase A §7/§8: a completely separate, much smaller
+    // save path - writes ONLY Area.displayName (renameArea's own
+    // contract), never touches any plan's spaceName/areaName field, and
+    // patches only roomDetailAreas (the one place an Area's name is
+    // rendered in Phase A). Does not fall through to the plan-rename
+    // logic below at all.
+    if (renamePlanTarget.kind === "area") {
+      try {
+        await renameArea(user.uid, renamePlanTarget.roomId, renamePlanTarget.id, trimmed);
+        setRoomDetailAreas((prev) => prev.map((a) => (a.id === renamePlanTarget.id ? { ...a, displayName: trimmed } : a)));
+        setRenamePlanTarget(null);
+        setRenameSheetValue("");
+      } catch (e) {
+        Alert.alert("Couldn't rename", e.message);
+      } finally {
+        setRenameSheetSaving(false);
+      }
+      return;
+    }
     try {
       await renameSpace(user.uid, renamePlanTarget.id, trimmed);
       // Patch every local cache that might be displaying this plan's name
@@ -4722,7 +4929,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // is already loaded (loadHistory's effect), so this is a plain
   // client-side computation, not a new query (Task 6).
   const renameSuggestions = () => {
-    if (!renamePlanTarget) return [];
+    // Area Identity, Phase A: these are OTHER ROOMS' names - irrelevant,
+    // and potentially confusing, as rename suggestions for an Area.
+    if (!renamePlanTarget || renamePlanTarget.kind === "area") return [];
     const names = new Set();
     history.forEach((h) => {
       const n = getSpaceDisplayName(h);
@@ -4741,7 +4950,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       <View style={s.renameSheetBackdrop}>
         <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
         <View style={s.renameSheetCard}>
-          <Text style={s.renameSheetTitle}>Rename Room</Text>
+          <Text style={s.renameSheetTitle}>{renamePlanTarget?.kind === "area" ? "Rename Area" : "Rename Room"}</Text>
           <TextInput
             style={s.renameSheetInput}
             value={renameSheetValue}
@@ -5001,10 +5210,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // every other screen flag via goHome() first (same discipline every nav
   // helper in this file follows), then reuses the exact same photo-picker
   // Alert the Home screen's own camera button opens - no second picker.
-  const startOrganizeAgain = (item) => {
+  // areaId (Area Identity, Phase A §4): optional. Room Detail's own
+  // per-Room "Organize Again" omits it (unchanged, whole-Room/legacy
+  // behavior). Room Detail's per-Area "Organize Again" passes the
+  // existing Area's own id - identity established through navigation,
+  // not inference, exactly the same governing rule Room identity itself
+  // already follows for this same button.
+  const startOrganizeAgain = (item, areaId = null) => {
     const targetSpaceId = item.canonicalSpaceId || item.id;
     goHome();
-    setOrganizeAgainContext({ spaceId: targetSpaceId, priorItem: item });
+    setOrganizeAgainContext({ spaceId: targetSpaceId, areaId, priorItem: item });
     showPhotoOptions();
   };
   const clearCompanionRevealState = () => {
@@ -5232,11 +5447,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // the wrong path is a strictly better failure mode than blocking the
       // user's own delete action on a diagnostic read.
       let canonicalSpaceId = null;
+      // Area Identity, Phase A: same reasoning as canonicalSpaceId just
+      // above - captured before deletion since there's nowhere left to
+      // read plan.areaId from once the plan doc is gone.
+      let deletedPlanAreaId = null;
       try {
         const planSnapForDelete = await getDoc(doc(db, "users", uid, "plans", planId));
         canonicalSpaceId = planSnapForDelete.exists() ? (planSnapForDelete.data().canonicalSpaceId || null) : null;
+        deletedPlanAreaId = planSnapForDelete.exists() ? (planSnapForDelete.data().areaId || null) : null;
       } catch (e) {
-        dlog(`[PLAN DELETE] canonicalSpaceId pre-read failed for ${planId}, proceeding as unmerged: ${e.message}`);
+        dlog(`[PLAN DELETE] canonicalSpaceId/areaId pre-read failed for ${planId}, proceeding as unmerged/no-area: ${e.message}`);
       }
 
       step = "deleteDoc";
@@ -5271,6 +5491,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         }
       } else if (shadowResult.spaceDeleted) {
         setRooms(prev => prev.filter(r => r.id !== spaceId));
+      }
+
+      // Area Identity, Phase A §5, item (j)/(i): recompute the owning
+      // Area's own summary the same way, whenever this plan had one.
+      // Deliberately unconditional on shadowResult.spaceDeleted (unlike
+      // the Room summary above) - even when deleting this plan also
+      // deleted the whole Room (this was the Room's last visit too), the
+      // Area document itself lives at spaces/{roomId}/areas/{areaId},
+      // which Firestore does not require its parent Space document to
+      // still exist for - the read/write still succeeds, correctly
+      // recomputes to visitCount: 0, and the Area survives (item i),
+      // simply now orphaned under a Room that no longer exists. Real
+      // cleanup of that orphan is real Room-deletion's job (Phase C,
+      // AreaIdentityDesign.md §11/§13), not this function's.
+      step = "updateAreaSummary";
+      if (deletedPlanAreaId) {
+        await updateAreaSummary(uid, spaceId, deletedPlanAreaId);
       }
 
       step = "listAll";
@@ -5695,6 +5932,49 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       return plan.date || "";
     };
 
+    // Area Identity, Phase A §6: same day-bucket math as formatVisitDate
+    // above, but Areas only carry a raw lastOrganizedAt ISO string (no
+    // pre-formatted `.date` field the way a plan does), so the "older
+    // than yesterday" fallback formats it directly here instead of
+    // reading a field that doesn't exist on an Area document.
+    const formatAreaDate = (iso) => {
+      if (!iso) return "";
+      const ms = Date.parse(iso);
+      if (Number.isNaN(ms)) return "";
+      const days = Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Today";
+      if (days === 1) return "Yesterday";
+      return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    };
+
+    // Area Identity, Phase A §6: extracted so the exact same row renders
+    // identically whether it's shown ungrouped (ungroupedPlans) or inside
+    // an Area section (areaVisits) below - unchanged from Room Detail UX
+    // Revision Section 3's own row design (photo, area title line only
+    // for a genuine sub-area, date · status, independent share icon).
+    const renderVisitRow = (plan) => (
+      <View key={plan.id} style={s.historyItem}>
+        <TouchableOpacity onPress={() => openRoomDetailVisit(plan)} style={{ flexDirection: "row", alignItems: "center", flex: 1, gap: 12 }}>
+          {plan.photoUrl ? (
+            <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+          ) : (
+            <View style={s.historyIcon}>
+              <Text style={{ fontSize: 20 }}>🏠</Text>
+            </View>
+          )}
+          <View style={{ flex: 1 }}>
+            {plan.areaScope === "sub-area" && plan.areaName && (
+              <Text style={s.historySpace} numberOfLines={1}>{plan.areaName}</Text>
+            )}
+            <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(plan)} · ${visitStatusLabel(plan)}`}</Text>
+          </View>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => shareVisitPlan(plan)} style={{ padding: 8 }} accessibilityLabel="Share this visit" accessibilityRole="button">
+          <Share2 size={18} color={BRAND.green} strokeWidth={2.25} />
+        </TouchableOpacity>
+      </View>
+    );
+
     const RoomDetailSectionCard = ({ title, children }) => (
       <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
         <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
@@ -5790,54 +6070,84 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
               </TouchableOpacity>
 
-              <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${roomDetailPlans.length})`}</Text>
-              {/* Room Detail UX Revision, Section 3 (revised): deliberately
-                  NOT grouped by areaName. areaName is AI-generated
-                  descriptive metadata, not durable identity - the same
-                  physical area has already produced different names across
-                  analyses (e.g. "Display Wall" vs "Trophy Wall Display"),
-                  so grouping by exact string match would recreate the
-                  Room-identity fragmentation problem one level lower, just
-                  silently instead of visibly. Stays a flat, chronological
-                  list (already sorted by Section 1's query); each row
-                  independently emphasizes its own photo and areaName
-                  instead. No section headers, no collapse, no claim that
-                  two same-named areas are the same physical spot. */}
-              {roomDetailPlans.length === 0 ? (
-                <Text style={{ fontSize: 13, color: "#64748B" }}>No visits recorded yet.</Text>
-              ) : roomDetailPlans.map((plan) => (
-                <View key={plan.id} style={s.historyItem}>
-                  <TouchableOpacity onPress={() => openRoomDetailVisit(plan)} style={{ flexDirection: "row", alignItems: "center", flex: 1, gap: 12 }}>
-                    {plan.photoUrl ? (
-                      <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
-                    ) : (
-                      <View style={s.historyIcon}>
-                        <Text style={{ fontSize: 20 }}>🏠</Text>
-                      </View>
+              {/* Area Identity, Phase A §6: visits with a durable areaId
+                  group under their Area's own displayName (read from the
+                  Area document, never the plan's own historical areaName);
+                  visits without one (whole-Room, or legacy
+                  descriptive-only) stay ungrouped, at the top, per item 6.
+                  Deliberately NOT grouped by areaName string - see Room
+                  Detail UX Revision Section 3's own reasoning (areaName is
+                  AI-generated descriptive metadata, not durable identity;
+                  "Display Wall" vs "Trophy Wall Display" already proved
+                  exact-string grouping unsafe) - that reasoning is exactly
+                  why Phase A built a real Area object instead of trying to
+                  group by that string. A visit whose areaId points at an
+                  Area that failed to load (a real, if rare, race between
+                  the two independent loading effects) falls back to
+                  ungrouped rather than being silently dropped. */}
+              {(() => {
+                const visibleAreas = roomDetailAreas.filter((a) => roomDetailPlans.some((p) => p.areaId === a.id));
+                const ungroupedPlans = roomDetailPlans.filter((p) => !p.areaId || !visibleAreas.some((a) => a.id === p.areaId));
+                // Item 6's own explicit requirement: a Room with only
+                // ungrouped visits (the overwhelmingly common case, and
+                // every Room today, before Phase A ships) renders
+                // byte-identically to the flat list that already existed -
+                // no visible change until a durable Area actually exists.
+                if (visibleAreas.length === 0) {
+                  return (
+                    <>
+                      <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${roomDetailPlans.length})`}</Text>
+                      {roomDetailPlans.length === 0 ? (
+                        <Text style={{ fontSize: 13, color: "#64748B" }}>No visits recorded yet.</Text>
+                      ) : roomDetailPlans.map(renderVisitRow)}
+                    </>
+                  );
+                }
+                return (
+                  <>
+                    {ungroupedPlans.length > 0 && (
+                      <>
+                        <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${ungroupedPlans.length})`}</Text>
+                        {ungroupedPlans.map(renderVisitRow)}
+                      </>
                     )}
-                    <View style={{ flex: 1 }}>
-                      {/* Area title line, shown ONLY for a genuine
-                          confirmed sub-area - a whole-room visit has no
-                          title line at all (never "Whole room" or any
-                          other placeholder), same rule this screen already
-                          follows elsewhere. */}
-                      {plan.areaScope === "sub-area" && plan.areaName && (
-                        <Text style={s.historySpace} numberOfLines={1}>{plan.areaName}</Text>
-                      )}
-                      <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(plan)} · ${visitStatusLabel(plan)}`}</Text>
-                    </View>
-                  </TouchableOpacity>
-                  {/* Plan-level share (Section 1) - lives on the row, not
-                      behind a Room-level menu. Independent tap target from
-                      the row's own onPress above (an RN TouchableOpacity
-                      nested alongside, not inside, another one - same
-                      established pattern this file already uses in the
-                      merge-review EvidenceCard). */}
-                  <TouchableOpacity onPress={() => shareVisitPlan(plan)} style={{ padding: 8 }} accessibilityLabel="Share this visit" accessibilityRole="button">
-                    <Share2 size={18} color={BRAND.green} strokeWidth={2.25} />
-                  </TouchableOpacity>
-                </View>
-              ))}
+                    {visibleAreas.map((area) => {
+                      const areaVisits = roomDetailPlans.filter((p) => p.areaId === area.id); // already sorted desc, same order roomDetailPlans itself is
+                      const mostRecentAreaVisit = areaVisits[0];
+                      const mostRecentAreaStatus = mostRecentAreaVisit ? visitStatusLabel(mostRecentAreaVisit) : null;
+                      const areaHasUnfinished = !!mostRecentAreaStatus && mostRecentAreaStatus.includes("remaining");
+                      return (
+                        <View key={area.id} style={{ marginTop: 20 }}>
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                            {area.latestPhotoUrl ? (
+                              <Image source={{ uri: area.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                            ) : (
+                              <View style={s.historyIcon}>
+                                <Text style={{ fontSize: 20 }}>📍</Text>
+                              </View>
+                            )}
+                            <View style={{ flex: 1 }}>
+                              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                                <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
+                                <TouchableOpacity onPress={() => openAreaRenameSheet(area)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this area" accessibilityRole="button">
+                                  <Pencil size={12} color={BRAND.slate} strokeWidth={2.25} />
+                                </TouchableOpacity>
+                              </View>
+                              <Text style={s.historyOverview} numberOfLines={1}>
+                                {`${area.visitCount ?? areaVisits.length} visit${(area.visitCount ?? areaVisits.length) === 1 ? "" : "s"} · Last organized ${formatAreaDate(area.lastOrganizedAt)}${areaHasUnfinished ? ` · ${mostRecentAreaStatus}` : ""}`}
+                              </Text>
+                            </View>
+                          </View>
+                          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginBottom: 12 }]} onPress={() => startOrganizeAgain(mostRecentAreaVisit || { id: room.id }, area.id)}>
+                            <Text style={s.mergeSecondaryBtnText}>Organize Again</Text>
+                          </TouchableOpacity>
+                          {areaVisits.map(renderVisitRow)}
+                        </View>
+                      );
+                    })}
+                  </>
+                );
+              })()}
 
               {/* Room-level actions (Section 1) - quiet/destructive text
                   links at the bottom of content, replacing the removed

@@ -244,6 +244,16 @@ function deriveFullReprojectionDocs(planId, plan) {
     // second read into the plan document it was derived from.
     areaName: plan.areaName ?? null,
     areaScope: plan.areaScope ?? null,
+    // Area Identity, Phase A (AreaIdentityDesign.md §11): carried straight
+    // from the source plan, exactly the same pattern as scopeId mirrors
+    // plan.canonicalSpaceId - this is the ONLY reason Project.areaId
+    // exists at all: computeAreaSummaryFields needs to distinguish which
+    // of a Room's Projects belong to which Area by scanning this one
+    // field, without a second read into each plan document. null for
+    // every whole-Room or legacy-descriptive-only visit, exactly as
+    // plan.areaId itself is null for those (never absent - see
+    // savePlanToHistory's own comment on this field).
+    areaId: plan.areaId ?? null,
   };
 
   const clusters = reconstructSessionClusters(plan);
@@ -316,6 +326,35 @@ function computeRoomSummaryFields(projectDocs) {
     latestPhotoUrl: latest.currentEvidence?.photoUrl ?? null,
     latestAreaName: latest.areaName ?? null,
     latestAreaScope: latest.areaScope ?? null,
+  };
+}
+
+// Area Identity, Phase A (AreaIdentityDesign.md §2/§5). Pure, same
+// idempotent-by-construction shape as computeRoomSummaryFields above -
+// same reasoning applies unmodified (recomputing from the same Project
+// set always produces the same answer, never an increment). The caller
+// is responsible for pre-filtering projectDocs to only the Projects
+// belonging to one specific Area (this function has no opinion on which
+// Room or Area it's summarizing - it just summarizes whatever list it's
+// given). No latestAreaName/latestAreaScope equivalent - the Area's own
+// displayName already IS that identity, there is nothing further to
+// derive. An empty list (every visit to this Area deleted) correctly
+// returns visitCount: 0 - the caller must NOT delete the Area document
+// on this result; Area is identity, not a projection of its plans
+// (AreaIdentityDesign.md §2, "retired/redirectTo" are the only fields
+// that ever remove an Area from view, and neither is written here).
+function computeAreaSummaryFields(projectDocs) {
+  const list = (projectDocs || []).filter(Boolean);
+  const visitCount = list.length;
+  if (visitCount === 0) {
+    return { visitCount: 0, lastOrganizedAt: null, latestPhotoUrl: null };
+  }
+  const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
+  const latest = list.reduce((best, cur) => (toMillis(cur.createdAt) > toMillis(best.createdAt) ? cur : best));
+  return {
+    visitCount,
+    lastOrganizedAt: latest.createdAt ?? null,
+    latestPhotoUrl: latest.currentEvidence?.photoUrl ?? null,
   };
 }
 
@@ -928,6 +967,7 @@ module.exports = {
   reconstructSessionClusters,
   deriveFullReprojectionDocs,
   computeRoomSummaryFields,
+  computeAreaSummaryFields,
   evaluateMigrationCompleteness,
   detectMergeCandidates,
   evaluateCandidateInvalidation,
