@@ -6852,6 +6852,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
+        {/* Same bar, same flag, same pattern as the Results screen (Phase B
+            device fix) - resultsCameFromRoomDetail is already set by
+            openRoomDetailUnfinishedCTA before Companion ever renders, so no
+            second flag is needed here. Does NOT replace the existing
+            ChevronLeft "Back to Results" button above (unchanged, steps
+            back one screen to Results as it always has) - this bar is an
+            additional, explicit shortcut straight back to the Room. */}
+        {resultsCameFromRoomDetail && (
+          <TouchableOpacity
+            onPress={() => returnToRoomDetail(resultsCameFromRoomDetail)}
+            style={{ backgroundColor: BRAND.greenLight, borderBottomWidth: 1, borderBottomColor: BRAND.greenMid, paddingVertical: 10, paddingHorizontal: 16 }}
+            accessibilityLabel={`Back to ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
+            accessibilityRole="button"
+          >
+            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>
+              {`← ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
+            </Text>
+          </TouchableOpacity>
+        )}
         <ScrollView ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
           {!showCompletedSummary && (
             companionStage === "batch-active" ? (
