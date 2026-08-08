@@ -190,7 +190,17 @@ exports.analyzePhoto = onCall(
 
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
-        max_tokens: 1500,
+        // Bumped from 1500 (2026-08-08, JSON parse fragility
+        // investigation): the response is a single JSON object carrying
+        // overview, itemsFound, three full tiers (suggestions + products
+        // each), room/area classification + reasoning fields, and the
+        // checklist - 1500 left too little headroom, and a response cut
+        // off mid-generation still returns HTTP 200 with partial text (no
+        // server-side JSON validation happens here), surfacing only later
+        // as a client-side JSON.parse failure. 4000 is comfortably below
+        // claude-sonnet-4-5's standard (non-beta) 8192 output-token cap,
+        // so no extended-output beta header is needed.
+        max_tokens: 4000,
         messages: [
           {
             role: "user",
@@ -199,6 +209,28 @@ exports.analyzePhoto = onCall(
         ],
       });
       text = message.content.find((b) => b.type === "text")?.text || "";
+      // Observability only (2026-08-08) - never enforced, never thrown; a
+      // malformed/truncated response still returns to the client exactly
+      // as before. stop_reason distinguishes a genuinely truncated
+      // response ("max_tokens") from a normal completion ("end_turn")
+      // that happens to be invalid JSON for some other reason - the two
+      // were previously indistinguishable after the fact, which is
+      // exactly what left root cause unconfirmed in the prior
+      // investigation. jsonMatch/looksLikeValidJson mirrors the client's
+      // own extraction (App.js's raw.match(/\{[\s\S]*\}/) + JSON.parse)
+      // so this log reflects what the client will actually attempt, not
+      // a separate check.
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      let looksLikeValidJson = false;
+      if (jsonMatch) {
+        try {
+          JSON.parse(jsonMatch[0]);
+          looksLikeValidJson = true;
+        } catch (parseErr) {
+          looksLikeValidJson = false;
+        }
+      }
+      console.log(`analyzePhoto response: stop_reason=${message.stop_reason} | textLength=${text.length} | looksLikeValidJson=${looksLikeValidJson}`);
     } catch (err) {
       throw new HttpsError("internal", err.message || "Analysis failed.");
     }
