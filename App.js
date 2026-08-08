@@ -2287,6 +2287,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // (first-time analysis, deep link, Home's resumable-plan banner, etc.),
   // which keeps their existing back-to-Home behavior completely unchanged.
   const [resultsCameFromRoomDetail, setResultsCameFromRoomDetail] = useState(null);
+  // Navigation UI Consistency audit: Companion's own back-bar contract.
+  // True ONLY when Companion was entered by tapping a button WHILE the
+  // user was actually looking at Results (the welcome-back banner, or
+  // "Let's Get Started") - not merely whenever `results` happens to be
+  // set, which is true for every Companion entry path including ones that
+  // skip Results entirely (Home's resumable-plan banner jumps straight
+  // there). That distinction is exactly why this needs its own flag
+  // rather than being inferred from `results` truthiness: "back to
+  // Results" is only a real, previously-visited destination for the two
+  // paths that set this true. Never true at the same time as a
+  // meaningful resultsCameFromRoomDetail in a way that matters - if both
+  // are set (arrived via Room Detail, then also tapped a Results button),
+  // the Room Detail destination wins, same "the whole session originated
+  // there" reasoning already applied to Results' own back bar.
+  const [companionEnteredFromResults, setCompanionEnteredFromResults] = useState(false);
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1): set by
   // startOrganizeAgain when the user taps "Organize Again" from either
   // entry point (History row, Space Detail's own button) - carries the
@@ -4799,6 +4814,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     logEvent(getAnalytics(), "companion_session_resumed", { planId: item.id, source: "home_banner" });
     setResults(item);
     setShowCompanion(true);
+    // Jumps straight from Home to Companion, skipping Results entirely -
+    // explicitly NOT a "came from Results" entry (companionEnteredFromResults
+    // stays false), so Companion's back bar correctly stays hidden for this
+    // path per the Navigation UI Consistency audit's own instruction.
+    setCompanionEnteredFromResults(false);
+    setResultsCameFromRoomDetail(null);
     setVizImage(item.vizImages || {});
     setVizLoading({});
     setCurrentPlanId(item.id);
@@ -4856,6 +4877,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCurrentPlanId(item.id);
     setRoomDetailRoomId(null);
     setResultsCameFromRoomDetail(null);
+    setCompanionEnteredFromResults(false);
     restorePhotoFromPlan(item);
   };
   // "Continue Organizing" - only ever reached when the user explicitly
@@ -4878,6 +4900,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCurrentPlanId(item.id);
     setRoomDetailRoomId(null);
     setResultsCameFromRoomDetail(null);
+    setCompanionEnteredFromResults(false);
     restorePhotoFromPlan(item);
   };
   // Room Detail -> tap a prior visit -> that plan's Results (Phase B §5).
@@ -4913,6 +4936,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setVizLoading({});
     setJustConfirmedRecognition(null);
     setResultsCameFromRoomDetail(null);
+    setCompanionEnteredFromResults(false);
     setRoomDetailRoomId(roomId);
   };
   // Room Detail UX Revision, Section 1: Share as PDF is a PLAN-level
@@ -4991,7 +5015,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionRevealReady(false);
   };
   const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
-  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setRoomDetailRoomId(null); setResultsCameFromRoomDetail(null); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
+  const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setRoomDetailRoomId(null); setResultsCameFromRoomDetail(null); setCompanionEnteredFromResults(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
   // exiting. Each branch matches that screen's own existing back/close behavior exactly
@@ -6746,6 +6770,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <TouchableOpacity
                 onPress={() => {
                   setShowCompanion(true);
+                  setCompanionEnteredFromResults(true);
                   setTimeout(() => companionScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
                 }}
                 style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}
@@ -6883,6 +6908,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           {batchItems.length > 0 && (
             <TouchableOpacity style={[s.companionBtn, { marginTop: 20 }]} onPress={() => {
               setShowCompanion(true);
+              setCompanionEnteredFromResults(true);
               // Companion's ScrollView doesn't exist yet at the moment of this
               // tap (it mounts fresh once showCompanion flips) - same deferred
               // pattern already used for analyze()'s scroll-to-top via
@@ -6946,17 +6972,38 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     const lastProgressPhotoUrl = results.progressPhotos?.length ? results.progressPhotos[results.progressPhotos.length - 1].url : null;
     const completedBeforeUri = results.photoUrl || companionOriginalPhotoRef.current || null;
     const completedCurrentUri = lastProgressPhotoUrl || companionBasePhotoRef.current || null;
+    // Navigation UI Consistency audit, item 1: the old ChevronLeft
+    // "Back to your room" control always navigated to Results
+    // (setShowCompanion(false) - Companion's own render condition is
+    // `results && showCompanion`, so clearing showCompanion alone always
+    // falls through to Results, never anywhere else) - but that
+    // destination is only a place the user actually WAS when Companion
+    // was entered via a Results button (companionEnteredFromResults).
+    // When arrived via Room Detail's own CTA, the meaningful destination
+    // is Room Detail directly (resultsCameFromRoomDetail), same priority
+    // order as Results' own back bar. When neither is set (Home's
+    // resumable-plan banner, which jumps straight past Results), there is
+    // no previously-visited screen to name, so no bar renders at all -
+    // matching this file's own "reused icon that silently means something
+    // else" lesson from the Results fix: better no affordance than one
+    // that can't be labeled honestly.
+    const companionBackLabel = resultsCameFromRoomDetail
+      ? `← ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`
+      : companionEnteredFromResults
+        ? `← ${resolveResultsRoomName(results, currentPlanId, rooms) || "Back to Plan"}`
+        : null;
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <View style={[s.hdr, { alignItems: "flex-start" }]}>
-          {/* Back to Results, not Home - standard back arrow, one screen at a
-              time (see the Android BackHandler branch below for hardware back
-              parity). TEMP DEBUG: long-press exports the [COMPANION DEBUG]
-              log via the share sheet - remove with the rest of the debug
-              instrumentation once the bug is found. */}
-          <TouchableOpacity onPress={() => setShowCompanion(false)} onLongPress={debugShareLog} style={{ padding: 8 }} accessibilityLabel="Back to your room" accessibilityRole="button">
-            <ChevronLeft size={26} color="rgba(255,255,255,0.9)" strokeWidth={2.25} />
+          {/* Same logo/title/menu shape as every other top-level screen
+              (Results included) - the ChevronLeft that used to live here
+              is gone, replaced entirely by the bar below. TEMP DEBUG:
+              long-press exports the [COMPANION DEBUG] log via the share
+              sheet - remove with the rest of the debug instrumentation
+              once the bug is found. */}
+          <TouchableOpacity onPress={goHome} onLongPress={debugShareLog} style={s.hdrMark} accessibilityLabel="Go to home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
@@ -6966,23 +7013,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        {/* Same bar, same flag, same pattern as the Results screen (Phase B
-            device fix) - resultsCameFromRoomDetail is already set by
-            openRoomDetailUnfinishedCTA before Companion ever renders, so no
-            second flag is needed here. Does NOT replace the existing
-            ChevronLeft "Back to Results" button above (unchanged, steps
-            back one screen to Results as it always has) - this bar is an
-            additional, explicit shortcut straight back to the Room. */}
-        {resultsCameFromRoomDetail && (
+        {companionBackLabel && (
           <TouchableOpacity
-            onPress={() => returnToRoomDetail(resultsCameFromRoomDetail)}
+            onPress={() => (resultsCameFromRoomDetail ? returnToRoomDetail(resultsCameFromRoomDetail) : setShowCompanion(false))}
             style={{ backgroundColor: BRAND.greenLight, borderBottomWidth: 1, borderBottomColor: BRAND.greenMid, paddingVertical: 10, paddingHorizontal: 16 }}
-            accessibilityLabel={`Back to ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
+            accessibilityLabel={companionBackLabel.replace("← ", "Back to ")}
             accessibilityRole="button"
           >
-            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>
-              {`← ${rooms.find((r) => r.id === resultsCameFromRoomDetail)?.displayName || "Room"}`}
-            </Text>
+            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>{companionBackLabel}</Text>
           </TouchableOpacity>
         )}
         <ScrollView ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
