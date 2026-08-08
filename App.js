@@ -17,7 +17,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment } from "firebase/firestore";
@@ -76,6 +76,35 @@ function resolveResultsRoomName(plan, currentPlanId, roomsList) {
   const roomId = plan.canonicalSpaceId || currentPlanId;
   const matchedRoom = (roomsList || []).find((r) => r.id === roomId);
   return matchedRoom?.displayName || getSpaceDisplayName(plan);
+}
+
+// My Rooms card icons (Room Detail UX Revision, Section 2): matched by
+// case-insensitive substring against Space.displayName ONLY - never the
+// AI's original spaceType, which isn't stored on the Space document at
+// all (only on individual plans) and, per explicit instruction, is not
+// being added there just for this. A renamed Room (e.g. "The Guest Room")
+// naturally falls through to the generic fallback rather than guessing -
+// that's correct behavior, not a gap. Order matters only where one
+// keyword could be a substring of another real room name; kept in the
+// order specified. Pure, no I/O - independent of any render.
+const ROOM_TYPE_ICON_RULES = [
+  { keywords: ["living room", "living"], icon: Sofa },
+  { keywords: ["kitchen"], icon: CookingPot },
+  { keywords: ["bathroom", "bath"], icon: Bath },
+  { keywords: ["bedroom", "guest room"], icon: BedDouble },
+  { keywords: ["office"], icon: Monitor },
+  { keywords: ["garage"], icon: Warehouse },
+  { keywords: ["dining"], icon: UtensilsCrossed },
+  { keywords: ["laundry"], icon: WashingMachine },
+  { keywords: ["closet"], icon: DoorOpen },
+  // Shelf isn't available in this lucide-react-native version - falls
+  // back to CookingPot per explicit instruction.
+  { keywords: ["pantry"], icon: CookingPot },
+];
+function getRoomTypeIcon(displayName) {
+  const name = (displayName || "").toLowerCase();
+  const match = ROOM_TYPE_ICON_RULES.find(({ keywords }) => keywords.some((k) => name.includes(k)));
+  return match ? match.icon : Home;
 }
 
 // Stable per-item id for batch checklist items - only needs to be unique
@@ -4886,30 +4915,55 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setResultsCameFromRoomDetail(null);
     setRoomDetailRoomId(roomId);
   };
-  // Room Detail overflow menu (Phase B §2). Share as PDF is real, reusing
-  // the exact same pattern the old plan-actions Alert used. Move/Delete
-  // Room are placement only per this phase's explicit scope - wired to
-  // reclassifyLegacyPlan / real Room-level delete semantics in a later
-  // phase, never executed here.
-  const openRoomDetailOverflow = (room, mostRecentPlan) => {
-    Alert.alert(room.displayName, "More options", [
-      isPro
-        ? {
-            text: "Share as PDF", onPress: () => {
-              if (!mostRecentPlan) return;
-              setResults(mostRecentPlan);
-              setVizImage(mostRecentPlan.vizImages || {});
-              setVizLoading({});
-              setCurrentPlanId(mostRecentPlan.id);
-              restorePhotoFromPlan(mostRecentPlan);
-              setTimeout(() => generatePDF(), 100);
-            },
-          }
-        : { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
-      { text: "Move to another Room", onPress: () => Alert.alert("Coming soon", "Moving a room's visits to another room will be available in a future update.") },
-      { text: "Delete Room", style: "destructive", onPress: () => Alert.alert("Coming soon", "Deleting a whole room will be available in a future update.") },
-      { text: "Cancel", style: "cancel" },
-    ]);
+  // Room Detail UX Revision, Section 1: Share as PDF is a PLAN-level
+  // action now (one visit row, or that plan's own Results screen - never
+  // a Room-level overflow menu, which is removed entirely). Mirrors
+  // Results' own "Share Your Room" Alert exactly (same PDF/Text/Cancel
+  // shape, same isPro gate) so a visit row offers the identical choice
+  // drilling into Results would, just without the extra tap.
+  const shareVisitPlan = (plan) => {
+    Alert.alert(
+      "Share Your Room",
+      isPro ? "How would you like to share?" : "Upgrade to Pro for a beautiful branded PDF",
+      isPro ? [
+        {
+          text: "📄 Share as PDF", onPress: () => {
+            setResults(plan);
+            setVizImage(plan.vizImages || {});
+            setVizLoading({});
+            setCurrentPlanId(plan.id);
+            restorePhotoFromPlan(plan);
+            setTimeout(() => generatePDF(), 100);
+          },
+        },
+        { text: "📝 Share as Text", onPress: () => { setResults(plan); setCurrentPlanId(plan.id); setTimeout(() => shareResults(), 100); } },
+        { text: "Cancel", style: "cancel" },
+      ] : [
+        { text: "📝 Share as Text (Free)", onPress: () => { setResults(plan); setCurrentPlanId(plan.id); setTimeout(() => shareResults(), 100); } },
+        { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  };
+  // Room Detail UX Revision, Section 1: Room-level actions, placed as
+  // quiet/destructive text links at the bottom of Room Detail's own
+  // content (see the Room Detail render block) - not behind a three-dot
+  // menu. Both remain placement only this pass: Move is not wired to
+  // reclassifyLegacyPlan yet, and Delete's confirmation is real (exact
+  // copy specified) but the actual deletion is Phase C - confirming today
+  // only leads to a "Coming soon" acknowledgement, never a real write.
+  const handleMoveRoomPlaceholder = () => {
+    Alert.alert("Coming soon", "Moving a room's visits to another room will be available in a future update.");
+  };
+  const handleDeleteRoomPlaceholder = (room) => {
+    Alert.alert(
+      `Delete ${room.displayName}?`,
+      "This will permanently remove all organizing plans, photos, sessions, and history associated with this room.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Delete", style: "destructive", onPress: () => Alert.alert("Coming soon", "Deleting a whole room will be available in a future update.") },
+      ]
+    );
   };
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): the one flow
   // behind every "Organize Again" entry point (originally the History
@@ -5485,16 +5539,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             // (Room), not per plan - sourced entirely from `rooms` (see
             // loadRooms above), never from `history`. A Room with 3 visits
             // renders exactly once here, regardless of the old 20-plan cap.
-            rooms.map((room) => (
-              <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomDetail(room)}>
-                {room.latestPhotoUrl ? (
-                  <Image source={{ uri: room.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
-                ) : (
+            rooms.map((room) => {
+              // Room Detail UX Revision, Section 2: a Room-type icon, not
+              // the most recent visit's photo - that photo is usually a
+              // specific area (entertainment center, vanity, counter), not
+              // a picture of the whole room, which reads as misleading on
+              // a card labeled "Living Room". s.historyIcon is already the
+              // exact rounded-square/BRAND-tinted shape this calls for -
+              // only its child changes.
+              const RoomIcon = getRoomTypeIcon(room.displayName);
+              return (
+                <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomDetail(room)}>
                   <View style={s.historyIcon}>
-                    <Text style={{ fontSize: 20 }}>🏠</Text>
+                    <RoomIcon size={30} color={BRAND.green} strokeWidth={2.25} />
                   </View>
-                )}
-                <View style={{ flex: 1 }}>
+                  <View style={{ flex: 1 }}>
                   <Text style={s.historySpace} numberOfLines={1}>{room.displayName}</Text>
                   {/* Only when the latest visit was genuinely a sub-area
                       (Room-First Identity's own areaScope contract) - a
@@ -5506,9 +5565,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>
                     {`${formatLastOrganized(room.lastOrganizedAt)} · ${room.visitCount ?? 1} visit${(room.visitCount ?? 1) === 1 ? "" : "s"}`}
                   </Text>
-                </View>
-              </TouchableOpacity>
-            ))
+                  </View>
+                </TouchableOpacity>
+              );
+            })
           )}
         </ScrollView>
         {renderRenameSheet()}
@@ -5583,6 +5643,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       return "Not started";
     };
 
+    // Same day-bucket math as My Rooms' own formatLastOrganized (today/
+    // yesterday/else), scoped to a single visit's date - falls back to the
+    // plan's own already-formatted `date` string (e.g. "Aug 7, 2026") for
+    // anything older than yesterday, rather than an open-ended "N days ago"
+    // count, since the per-visit row already has more going on (area,
+    // status) than a single Room-level summary line.
+    const formatVisitDate = (plan) => {
+      const ms = typeof plan.createdAt === "string" ? Date.parse(plan.createdAt) : (plan.createdAt?.toMillis ? plan.createdAt.toMillis() : NaN);
+      if (Number.isNaN(ms)) return plan.date || "";
+      const days = Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Today";
+      if (days === 1) return "Yesterday";
+      return plan.date || "";
+    };
+
     const RoomDetailSectionCard = ({ title, children }) => (
       <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
         <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
@@ -5615,9 +5690,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.hdrTag} numberOfLines={1}>{room.latestAreaName}</Text>
             )}
           </View>
-          <TouchableOpacity onPress={() => openRoomDetailOverflow(room, mostRecent)} style={{ padding: 8 }} accessibilityLabel="More options" accessibilityRole="button">
-            <Text style={{ fontSize: 20, color: "rgba(255,255,255,0.9)", fontFamily: "Inter_700Bold" }}>⋯</Text>
-          </TouchableOpacity>
           <TouchableOpacity onPress={() => { setRoomDetailRoomId(null); setShowHistory(true); }} style={{ padding: 8 }} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
@@ -5670,30 +5742,72 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </TouchableOpacity>
 
               <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${roomDetailPlans.length})`}</Text>
+              {/* Room Detail UX Revision, Section 3 (revised): deliberately
+                  NOT grouped by areaName. areaName is AI-generated
+                  descriptive metadata, not durable identity - the same
+                  physical area has already produced different names across
+                  analyses (e.g. "Display Wall" vs "Trophy Wall Display"),
+                  so grouping by exact string match would recreate the
+                  Room-identity fragmentation problem one level lower, just
+                  silently instead of visibly. Stays a flat, chronological
+                  list (already sorted by Section 1's query); each row
+                  independently emphasizes its own photo and areaName
+                  instead. No section headers, no collapse, no claim that
+                  two same-named areas are the same physical spot. */}
               {roomDetailPlans.length === 0 ? (
                 <Text style={{ fontSize: 13, color: "#64748B" }}>No visits recorded yet.</Text>
               ) : roomDetailPlans.map((plan) => (
-                <TouchableOpacity key={plan.id} style={s.historyItem} onPress={() => openRoomDetailVisit(plan)}>
-                  {plan.photoUrl ? (
-                    <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
-                  ) : (
-                    <View style={s.historyIcon}>
-                      <Text style={{ fontSize: 20 }}>🏠</Text>
+                <View key={plan.id} style={s.historyItem}>
+                  <TouchableOpacity onPress={() => openRoomDetailVisit(plan)} style={{ flexDirection: "row", alignItems: "center", flex: 1, gap: 12 }}>
+                    {plan.photoUrl ? (
+                      <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                    ) : (
+                      <View style={s.historyIcon}>
+                        <Text style={{ fontSize: 20 }}>🏠</Text>
+                      </View>
+                    )}
+                    <View style={{ flex: 1 }}>
+                      {/* Area title line, shown ONLY for a genuine
+                          confirmed sub-area - a whole-room visit has no
+                          title line at all (never "Whole room" or any
+                          other placeholder), same rule this screen already
+                          follows elsewhere. */}
+                      {plan.areaScope === "sub-area" && plan.areaName && (
+                        <Text style={s.historySpace} numberOfLines={1}>{plan.areaName}</Text>
+                      )}
+                      <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(plan)} · ${visitStatusLabel(plan)}`}</Text>
                     </View>
-                  )}
-                  <View style={{ flex: 1 }}>
-                    {/* No "Whole room"/"General" placeholder for a
-                        whole-room visit - the area segment is omitted
-                        entirely (not rendered as an empty string) whenever
-                        there's no genuine confirmed sub-area, same rule
-                        the header's own area subtitle and My Rooms' cards
-                        already follow elsewhere on this screen. */}
-                    <Text style={s.historySpace} numberOfLines={1}>
-                      {[plan.date, (plan.areaScope === "sub-area" && plan.areaName) ? plan.areaName : null, visitStatusLabel(plan)].filter(Boolean).join(" · ")}
-                    </Text>
-                  </View>
-                </TouchableOpacity>
+                  </TouchableOpacity>
+                  {/* Plan-level share (Section 1) - lives on the row, not
+                      behind a Room-level menu. Independent tap target from
+                      the row's own onPress above (an RN TouchableOpacity
+                      nested alongside, not inside, another one - same
+                      established pattern this file already uses in the
+                      merge-review EvidenceCard). */}
+                  <TouchableOpacity onPress={() => shareVisitPlan(plan)} style={{ padding: 8 }} accessibilityLabel="Share this visit" accessibilityRole="button">
+                    <Share2 size={18} color={BRAND.green} strokeWidth={2.25} />
+                  </TouchableOpacity>
+                </View>
               ))}
+
+              {/* Room-level actions (Section 1) - quiet/destructive text
+                  links at the bottom of content, replacing the removed
+                  three-dot overflow. Both still placement only: Move isn't
+                  wired to reclassifyLegacyPlan yet, and Delete's real
+                  confirmation dialog leads only to a "Coming soon"
+                  acknowledgement, never an actual write - real deletion is
+                  Phase C. */}
+              <TouchableOpacity onPress={handleMoveRoomPlaceholder} style={{ marginTop: 28, alignItems: "center", paddingVertical: 10 }} accessibilityLabel="Move to another Room" accessibilityRole="button">
+                <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }}>Move to another Room</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => handleDeleteRoomPlaceholder(room)}
+                style={{ marginTop: 4, alignItems: "center", paddingVertical: 14, borderTopWidth: 1, borderTopColor: "#E6E9EE" }}
+                accessibilityLabel="Delete Room"
+                accessibilityRole="button"
+              >
+                <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#DC2626" }}>Delete Room</Text>
+              </TouchableOpacity>
             </>
           )}
         </ScrollView>
