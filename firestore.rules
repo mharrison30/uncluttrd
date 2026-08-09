@@ -37,6 +37,18 @@ service cloud.firestore {
       // denied for real authenticated clients with no rule present here.
       match /spaces/{spaceId} {
         allow read, write: if request.auth != null && request.auth.uid == userId;
+
+        // Area Identity durable Area objects (AreaIdentityDesign.md §2) -
+        // same ownership pattern as projects/sessions/batches below. Had
+        // ZERO rule coverage until Phase B prerequisites (2026-08-09):
+        // every real client read/write (createAreaForPlan, updateAreaSummary,
+        // renameArea, Room Detail's loadRoomDetailAreas) was being silently
+        // denied - Phase A's "43/43 passing" validation only ever exercised
+        // the Admin SDK path, which bypasses rules entirely. Same failure
+        // mode already documented once above for the shadow structure.
+        match /areas/{areaId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
         match /projects/{projectId} {
           allow read, write: if request.auth != null && request.auth.uid == userId;
           match /sessions/{sessionId} {

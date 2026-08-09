@@ -6109,6 +6109,44 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 </>
               )}
 
+              {/* Phase B prerequisite #2: per-Area "Organize Again" entry
+                  point. The Phase A data path (organizeAgainContext.areaId
+                  -> finalizeAnalysisResult's areaId param) has existed since
+                  Phase A but had no live UI trigger once the per-Area
+                  grouped section above was retired by the Layout Revision.
+                  This is a lightweight list, not a revival of that section -
+                  one row per durable Area still represented among this
+                  Room's visits (same "hide, don't delete" rule the rest of
+                  this screen already follows for a zero-visit Area), each
+                  with its own small "Organize Again" link. Tapping it sets
+                  organizeAgainContext.areaId directly and skips straight to
+                  the camera - identity is already established by the tap
+                  itself, so no recognition/matching runs. */}
+              {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).length > 0 && (
+                <>
+                  <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>AREAS IN THIS ROOM</Text>
+                  {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).map((area) => (
+                    <View key={area.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                      {area.latestPhotoUrl ? (
+                        <Image source={{ uri: area.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                      ) : (
+                        <View style={s.historyIcon}>
+                          <Text style={{ fontSize: 20 }}>🏠</Text>
+                        </View>
+                      )}
+                      <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{area.displayName}</Text>
+                      <TouchableOpacity
+                        onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
+                        accessibilityLabel={`Organize Again in ${area.displayName}`}
+                        accessibilityRole="button"
+                      >
+                        <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </>
+              )}
+
               {/* Room-level actions (Section 1) - quiet/destructive text
                   links at the bottom of content, replacing the removed
                   three-dot overflow. Both still placement only: Move isn't
