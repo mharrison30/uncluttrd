@@ -388,7 +388,13 @@ async function findAreaRecognitionCandidates(roomId, newPhotoBase64, existingAre
   };
 
   if (candidatePayload.length === 0) {
-    return { status: "NO_MATCH", candidates: [], diagnostics: { ...diagnostics, reason: "no-usable-reference-photos" } };
+    // Not NO_MATCH - no visual comparison actually happened (every
+    // candidate's reference photo(s) failed to fetch/compress), so
+    // "genuinely checked, found nothing" would be a false claim. Governing
+    // principle: never auto-create an Area when recognition is
+    // unavailable - this is exactly that case, just discovered before the
+    // Anthropic call rather than during it.
+    return { status: "RECOGNITION_FAILED", candidates: [], diagnostics: { ...diagnostics, reason: "no-usable-reference-photos" } };
   }
 
   try {
