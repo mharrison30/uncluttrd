@@ -6206,6 +6206,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                             no shared row width to truncate against. */}
                         <View style={{ flex: 1 }}>
                           <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
+                          <Text style={s.historyOverview} numberOfLines={1}>{`${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}</Text>
                           <TouchableOpacity
                             onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
                             accessibilityLabel={`Organize Again in ${area.displayName}`}
