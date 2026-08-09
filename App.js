@@ -5913,15 +5913,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       );
     }
 
+    // Room Detail Layout Revision: LAST SESSION shows exactly the most
+    // recent visit; EARLIER ORGANIZING VISITS shows every visit except
+    // it, so the same visit is never rendered in both places at once.
     const mostRecent = roomDetailPlans[0] || null;
-    const startingUri = mostRecent?.photoUrl || null;
-    const latestUri = Array.isArray(mostRecent?.progressPhotos) && mostRecent.progressPhotos.length ? mostRecent.progressPhotos[mostRecent.progressPhotos.length - 1].url : null;
-    // Section 2's CTA target rule, expressed directly as a find() over a
-    // list already sorted most-recent-first (Section 1) - the first match
-    // IS "the most recent plan that still has unfinished work," with no
-    // separate sort or special-casing needed for the prior-visit-only case
-    // (test f).
-    const unfinishedTarget = roomDetailPlans.find(planHasUnfinishedWork) || null;
+    const earlierVisits = roomDetailPlans.slice(1);
+    // The CTA is now scoped to THIS specific visit (Last Session) only,
+    // not a room-wide search for any plan with unfinished work anywhere
+    // (that was the prior design) - a deliberate narrowing per this
+    // revision's own spec: "the visit has unfinished... items", singular,
+    // referring to the Last Session visit itself.
+    const lastSessionHasUnfinishedWork = mostRecent ? planHasUnfinishedWork(mostRecent) : false;
 
     // The SAME three-way split the old Space Detail's own statusLabel used
     // (companionComplete -> Completed / currentBatch -> In progress / else
@@ -5960,26 +5962,30 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       return plan.date || "";
     };
 
-    // Area Identity, Phase A §6: same day-bucket math as formatVisitDate
-    // above, but Areas only carry a raw lastOrganizedAt ISO string (no
-    // pre-formatted `.date` field the way a plan does), so the "older
-    // than yesterday" fallback formats it directly here instead of
-    // reading a field that doesn't exist on an Area document.
-    const formatAreaDate = (iso) => {
-      if (!iso) return "";
-      const ms = Date.parse(iso);
-      if (Number.isNaN(ms)) return "";
-      const days = Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
-      if (days === 0) return "Today";
-      if (days === 1) return "Yesterday";
-      return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    // Room Detail Layout Revision: the single area-label resolution used
+    // by both LAST SESSION and every EARLIER ORGANIZING VISITS row, so
+    // the two sections can never disagree about the same kind of visit.
+    // Prefers the durable Area's own CURRENT displayName (via areaId) -
+    // never stale once an Area is renamed - over the plan's own
+    // historical areaName string, which is the fallback only for a
+    // legacy sub-area visit with no durable areaId yet. Whole-room (or
+    // any visit with neither) resolves to null - no placeholder text is
+    // ever rendered for it, the same rule this screen has followed since
+    // the "no Whole Room label" fix.
+    const resolveVisitAreaLabel = (plan) => {
+      if (!plan) return null;
+      if (plan.areaId) {
+        const area = roomDetailAreas.find((a) => a.id === plan.areaId);
+        if (area) return area.displayName;
+      }
+      if (plan.areaScope === "sub-area" && plan.areaName) return plan.areaName;
+      return null;
     };
 
-    // Area Identity, Phase A §6: extracted so the exact same row renders
-    // identically whether it's shown ungrouped (ungroupedPlans) or inside
-    // an Area section (areaVisits) below - unchanged from Room Detail UX
-    // Revision Section 3's own row design (photo, area title line only
-    // for a genuine sub-area, date · status, independent share icon).
+    // Shared row renderer for every EARLIER ORGANIZING VISITS entry -
+    // photo, area label (resolveVisitAreaLabel above), date · status,
+    // independent share icon. Unchanged in shape from before this
+    // revision; only its area-label source changed (durable Area first).
     const renderVisitRow = (plan) => (
       <View key={plan.id} style={s.historyItem}>
         <TouchableOpacity onPress={() => openRoomDetailVisit(plan)} style={{ flexDirection: "row", alignItems: "center", flex: 1, gap: 12 }}>
@@ -5991,8 +5997,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           )}
           <View style={{ flex: 1 }}>
-            {plan.areaScope === "sub-area" && plan.areaName && (
-              <Text style={s.historySpace} numberOfLines={1}>{plan.areaName}</Text>
+            {resolveVisitAreaLabel(plan) && (
+              <Text style={s.historySpace} numberOfLines={1}>{resolveVisitAreaLabel(plan)}</Text>
             )}
             <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(plan)} · ${visitStatusLabel(plan)}`}</Text>
           </View>
@@ -6000,13 +6006,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <TouchableOpacity onPress={() => shareVisitPlan(plan)} style={{ padding: 8 }} accessibilityLabel="Share this visit" accessibilityRole="button">
           <Share2 size={18} color={BRAND.green} strokeWidth={2.25} />
         </TouchableOpacity>
-      </View>
-    );
-
-    const RoomDetailSectionCard = ({ title, children }) => (
-      <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
-        <Text style={{ fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.green, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>{title}</Text>
-        {children}
       </View>
     );
 
@@ -6019,21 +6018,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <View style={{ flex: 1 }}>
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            {/* Room Detail Layout Revision: Room name only, larger than
+                the shared hdrPageName default (14px -> 20px, this screen
+                only, not the shared style - every other screen keeps its
+                existing size) - no sub-area subtitle line underneath
+                anymore. */}
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Text style={s.hdrPageName} numberOfLines={1}>{room.displayName}</Text>
+              <Text style={[s.hdrPageName, { fontSize: 20 }]} numberOfLines={1}>{room.displayName}</Text>
               {/* roomId passed explicitly (3rd arg) - this Room's target plan
                   may not be in the capped `history` cache at all, so
                   handleSaveRename can't rely on resolving it from there. */}
               <TouchableOpacity onPress={() => openRenameSheet(mostRecent?.id || room.id, room.displayName, room.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
-                <Pencil size={14} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
+                <Pencil size={16} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
               </TouchableOpacity>
             </View>
-            {/* Most recent area - only for a genuine sub-area latest visit
-                (Room-First Identity's own areaScope contract), same rule
-                My Rooms' own card already follows - never an empty line. */}
-            {room.latestAreaName && room.latestAreaScope === "sub-area" && (
-              <Text style={s.hdrTag} numberOfLines={1}>{room.latestAreaName}</Text>
-            )}
           </View>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -6058,124 +6056,86 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           ) : (
             <>
-              <RoomDetailSectionCard title="Photos">
-                {startingUri && latestUri ? (
-                  <BeforeAfterStack
-                    beforeUri={startingUri}
-                    afterUri={latestUri}
-                    height={200}
-                    onPress={(which) => { setVizModal(which === "before" ? startingUri : latestUri); setVizModalKey((k) => k + 1); }}
-                  />
-                ) : startingUri ? (
-                  <TouchableOpacity onPress={() => { setVizModal(startingUri); setVizModalKey((k) => k + 1); }} activeOpacity={0.9} accessibilityLabel="View photo full screen" accessibilityRole="button">
-                    <Image source={{ uri: startingUri }} style={{ width: "100%", height: 200, borderRadius: 10 }} resizeMode="cover" />
-                  </TouchableOpacity>
-                ) : (
-                  <View style={{ width: "100%", height: 120, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" }}>
-                    <Text style={{ fontSize: 12, color: "#94A3B8" }}>No photo yet</Text>
+              {/* Room Detail Layout Revision, item 3: LAST SESSION - the
+                  Room-level hero photo (old Photos section) is gone
+                  entirely, replaced by this, since it always showed
+                  whichever Area was last touched, not the Room itself, and
+                  was misleading on that basis. Only rendered when at least
+                  one visit exists (item 3's own "brand new Room" case). */}
+              {mostRecent && (
+                <View style={{ marginBottom: 20 }}>
+                  <Text style={[s.sectionLabel, { marginBottom: 10 }]}>LAST SESSION</Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: lastSessionHasUnfinishedWork ? 12 : 0 }}>
+                    {/* Photo tap -> full-screen zoom (reuses the existing
+                        vizModal viewer); area name/date/status tap ->
+                        Results (openRoomDetailVisit) - two independent tap
+                        targets side by side, not one shared row tap,
+                        matching the spec's two separate statements about
+                        what tapping the photo vs. the area name each do. */}
+                    <TouchableOpacity
+                      onPress={() => { if (mostRecent.photoUrl) { setVizModal(mostRecent.photoUrl); setVizModalKey((k) => k + 1); } }}
+                      disabled={!mostRecent.photoUrl}
+                      accessibilityLabel="View photo full screen"
+                      accessibilityRole="button"
+                    >
+                      {mostRecent.photoUrl ? (
+                        <Image source={{ uri: mostRecent.photoUrl }} style={{ width: 96, height: 96, borderRadius: 14 }} resizeMode="cover" />
+                      ) : (
+                        <View style={{ width: 96, height: 96, borderRadius: 14, backgroundColor: BRAND.greenLight, alignItems: "center", justifyContent: "center" }}>
+                          <Text style={{ fontSize: 26 }}>🏠</Text>
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => openRoomDetailVisit(mostRecent)} style={{ flex: 1 }} accessibilityRole="button">
+                      {resolveVisitAreaLabel(mostRecent) && (
+                        <Text style={[s.historySpace, { fontSize: 16 }]} numberOfLines={1}>{resolveVisitAreaLabel(mostRecent)}</Text>
+                      )}
+                      <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(mostRecent)} · ${visitStatusLabel(mostRecent)}`}</Text>
+                    </TouchableOpacity>
                   </View>
-                )}
-              </RoomDetailSectionCard>
-
-              {/* Section 2: shown only when unfinished work exists ANYWHERE
-                  in the Room, targeting the single most recent plan that
-                  has it (unfinishedTarget above) - omitted entirely, not a
-                  quiet placeholder, when there's nothing to act on (the
-                  "Organize Again" button below already communicates the
-                  Room is ready for more attention). */}
-              {unfinishedTarget && (
-                <TouchableOpacity
-                  onPress={() => openRoomDetailUnfinishedCTA(unfinishedTarget)}
-                  style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14, marginBottom: 14 }}
-                  accessibilityLabel="Continue where you left off"
-                  accessibilityRole="button"
-                >
-                  <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Continue where you left off →</Text>
-                </TouchableOpacity>
+                  {/* Only when THIS visit (Last Session) itself has
+                      unfinished carried/pending items - no longer a
+                      room-wide search for any plan with unfinished work
+                      (that was the prior design). A completed Last Session
+                      shows no CTA at all - "Completed" above already says
+                      so, per this revision's own explicit instruction. */}
+                  {lastSessionHasUnfinishedWork && (
+                    <TouchableOpacity
+                      onPress={() => openRoomDetailUnfinishedCTA(mostRecent)}
+                      style={{ backgroundColor: "#F0FBF6", borderRadius: 12, borderWidth: 1, borderColor: "#CDEFDD", padding: 14 }}
+                      accessibilityLabel="Continue where you left off"
+                      accessibilityRole="button"
+                    >
+                      <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Continue where you left off →</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
               )}
 
               <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => startOrganizeAgain(mostRecent || { id: room.id })}>
                 <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
               </TouchableOpacity>
 
-              {/* Area Identity, Phase A §6: visits with a durable areaId
-                  group under their Area's own displayName (read from the
-                  Area document, never the plan's own historical areaName);
-                  visits without one (whole-Room, or legacy
-                  descriptive-only) stay ungrouped, at the top, per item 6.
-                  Deliberately NOT grouped by areaName string - see Room
-                  Detail UX Revision Section 3's own reasoning (areaName is
-                  AI-generated descriptive metadata, not durable identity;
-                  "Display Wall" vs "Trophy Wall Display" already proved
-                  exact-string grouping unsafe) - that reasoning is exactly
-                  why Phase A built a real Area object instead of trying to
-                  group by that string. A visit whose areaId points at an
-                  Area that failed to load (a real, if rare, race between
-                  the two independent loading effects) falls back to
-                  ungrouped rather than being silently dropped. */}
-              {(() => {
-                const visibleAreas = roomDetailAreas.filter((a) => roomDetailPlans.some((p) => p.areaId === a.id));
-                const ungroupedPlans = roomDetailPlans.filter((p) => !p.areaId || !visibleAreas.some((a) => a.id === p.areaId));
-                // Item 6's own explicit requirement: a Room with only
-                // ungrouped visits (the overwhelmingly common case, and
-                // every Room today, before Phase A ships) renders
-                // byte-identically to the flat list that already existed -
-                // no visible change until a durable Area actually exists.
-                if (visibleAreas.length === 0) {
-                  return (
-                    <>
-                      <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${roomDetailPlans.length})`}</Text>
-                      {roomDetailPlans.length === 0 ? (
-                        <Text style={{ fontSize: 13, color: "#64748B" }}>No visits recorded yet.</Text>
-                      ) : roomDetailPlans.map(renderVisitRow)}
-                    </>
-                  );
-                }
-                return (
-                  <>
-                    {ungroupedPlans.length > 0 && (
-                      <>
-                        <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`PRIOR ORGANIZING VISITS (${ungroupedPlans.length})`}</Text>
-                        {ungroupedPlans.map(renderVisitRow)}
-                      </>
-                    )}
-                    {visibleAreas.map((area) => {
-                      const areaVisits = roomDetailPlans.filter((p) => p.areaId === area.id); // already sorted desc, same order roomDetailPlans itself is
-                      const mostRecentAreaVisit = areaVisits[0];
-                      const mostRecentAreaStatus = mostRecentAreaVisit ? visitStatusLabel(mostRecentAreaVisit) : null;
-                      const areaHasUnfinished = !!mostRecentAreaStatus && mostRecentAreaStatus.includes("remaining");
-                      return (
-                        <View key={area.id} style={{ marginTop: 20 }}>
-                          <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 12 }}>
-                            {area.latestPhotoUrl ? (
-                              <Image source={{ uri: area.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
-                            ) : (
-                              <View style={s.historyIcon}>
-                                <Text style={{ fontSize: 20 }}>📍</Text>
-                              </View>
-                            )}
-                            <View style={{ flex: 1 }}>
-                              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                                <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
-                                <TouchableOpacity onPress={() => openAreaRenameSheet(area)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this area" accessibilityRole="button">
-                                  <Pencil size={12} color={BRAND.slate} strokeWidth={2.25} />
-                                </TouchableOpacity>
-                              </View>
-                              <Text style={s.historyOverview} numberOfLines={1}>
-                                {`${area.visitCount ?? areaVisits.length} visit${(area.visitCount ?? areaVisits.length) === 1 ? "" : "s"} · Last organized ${formatAreaDate(area.lastOrganizedAt)}${areaHasUnfinished ? ` · ${mostRecentAreaStatus}` : ""}`}
-                              </Text>
-                            </View>
-                          </View>
-                          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginBottom: 12 }]} onPress={() => startOrganizeAgain(mostRecentAreaVisit || { id: room.id }, area.id)}>
-                            <Text style={s.mergeSecondaryBtnText}>Organize Again</Text>
-                          </TouchableOpacity>
-                          {areaVisits.map(renderVisitRow)}
-                        </View>
-                      );
-                    })}
-                  </>
-                );
-              })()}
+              {/* Room Detail Layout Revision, item 5: EARLIER ORGANIZING
+                  VISITS - every visit except the one already shown in Last
+                  Session, so no visit ever renders twice. Deliberately
+                  flat, not grouped by Area (see resolveVisitAreaLabel
+                  above for why each row can still show a durable Area's
+                  current name without needing a grouped section around
+                  it) - the prior Area-grouped section design (with its own
+                  per-Area "Organize Again"/rename) is retired by this
+                  revision; nothing in the Area data model itself changed
+                  (Area documents, areaId, summary maintenance all still
+                  work exactly as before - see AreaIdentityImplementation.md
+                  - only this screen's visual grouping is gone). Omitted
+                  entirely when there are no earlier visits (item 5's own
+                  "only one visit ever" case). */}
+              {earlierVisits.length > 0 && (
+                <>
+                  <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`EARLIER ORGANIZING VISITS (${earlierVisits.length})`}</Text>
+                  {earlierVisits.map(renderVisitRow)}
+                </>
+              )}
 
               {/* Room-level actions (Section 1) - quiet/destructive text
                   links at the bottom of content, replacing the removed
