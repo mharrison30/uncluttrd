@@ -4427,7 +4427,27 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // inside finalizeAnalysisResult - currentPlanId itself doesn't reflect
       // the new doc until a re-render, and every batch event is
       // planId-correlated (see Analytics.md).
-      await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining, returningContext?.areaId || null);
+      const returningPlanId = await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining, returningContext?.areaId || null);
+      // Area Creation stopgap (2026-08-09): "Organize Another Area" (Room
+      // known via returningContext.spaceId, Area NOT known -
+      // returningContext.areaId null) skips the !returningContext branch
+      // above entirely, which is the ONLY other place createAreaForPlan is
+      // called - so a sub-area visit through THIS path never got an Area,
+      // ever (confirmed against real staging data: plan C9UGhJHh3ml3CI0aeX9J
+      // saved correctly with areaScope "sub-area" but areaId stayed null,
+      // zero Area docs existed). Runs ONLY after finalizeAnalysisResult has
+      // already returned a real newPlanId - never fires on a failed/rejected
+      // save (invalid-target-space returns null), so no orphan Area is ever
+      // created for a plan that doesn't exist. suggestedAreaName is used
+      // (not plan.areaName, which savePlanToHistory/createReturningPlan
+      // themselves fall back to it for exactly this call path) - matches
+      // completeRoomConfirmation's own areaName argument to createAreaForPlan
+      // by construction. This is a stopgap, not real Area matching - Phase B
+      // (recognition-then-confirm) replaces it; it always creates a fresh
+      // Area, same as the fresh-photo path already does today.
+      if (returningContext && !returningContext.areaId && parsed.areaScope === "sub-area" && returningPlanId) {
+        await createAreaForPlan(user.uid, returningContext.spaceId, returningPlanId, parsed.suggestedAreaName ?? null);
+      }
     } catch (e) {
       lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
