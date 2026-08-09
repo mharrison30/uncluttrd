@@ -4220,6 +4220,49 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           }
         }
       }
+      // Known-identity AI context (Existing Area -> Organize Again,
+      // 2026-08-09): when returningContext carries BOTH spaceId and areaId,
+      // Room and Area identity are already established by the user's own
+      // navigation (the tap itself - AreaIdentityDesign.md's governing
+      // principle: only explicit user confirmation establishes identity),
+      // never by this photo's own AI classification. suggestedRoomName/
+      // suggestedAreaName are still requested in the JSON schema below and
+      // still correctly ignored for filing (canonicalSpaceId/areaId come
+      // from returningContext, see finalizeAnalysisResult) - but nothing
+      // previously stopped the model's own free-text prose (overview,
+      // tasks, product suggestions, pro tip) from using a DIFFERENT room's
+      // name. Real staging evidence: the same physical Corner Shelf photo
+      // was twice classified suggestedRoomName "Entryway" - filing was
+      // correctly unaffected, but the checklist text itself said "...this
+      // entryway space." This note grounds the prose without touching the
+      // classification instructions (roomAreaInstruction, below) at all -
+      // the model still analyzes the real photo content, it just narrates
+      // it under the names the user already confirmed by navigating here.
+      // Room-level-only Organize Again ("Organize Another Area," areaId
+      // null) deliberately does NOT get this note - the Area itself is
+      // genuinely undetermined in that case, so there is no confirmed Area
+      // name yet to ground the prose with.
+      let knownIdentityNote = "";
+      if (returningContext?.spaceId && returningContext?.areaId) {
+        try {
+          let knownRoomName = rooms.find(r => r.id === returningContext.spaceId)?.displayName || null;
+          if (!knownRoomName) {
+            const spaceSnap = await getDoc(doc(db, "users", user.uid, "spaces", returningContext.spaceId));
+            knownRoomName = spaceSnap.exists() ? (spaceSnap.data().displayName || null) : null;
+          }
+          const areaSnap = await getDoc(doc(db, "users", user.uid, "spaces", returningContext.spaceId, "areas", returningContext.areaId));
+          const knownAreaName = areaSnap.exists() ? (areaSnap.data().displayName || null) : null;
+          if (knownRoomName && knownAreaName) {
+            knownIdentityNote = `\n\nThe user has confirmed they are organizing "${knownAreaName}" in their "${knownRoomName}". Use these exact names in all generated text (overview, tasks, recommendations, product suggestions, pro tip) - never refer to this space by any other room or area name, even if the photo visually resembles a different kind of room. Do not reclassify or rename the Room or Area. Still analyze the actual photo content for clutter, tasks, and recommendations - this only affects naming, not the organizing analysis itself.`;
+          }
+        } catch (identityLookupErr) {
+          // Non-fatal - proceed without the grounding note rather than
+          // blocking this analysis over a lookup failure, matching this
+          // function's existing tolerance for photo-pipeline failures
+          // (e.g. the prior-photo fetch above).
+          console.log("Known-identity lookup failed (proceeding without grounding):", identityLookupErr.message);
+        }
+      }
       // Same prompt as today, byte-for-byte, when priorPhotoBase64 is null
       // (every first-time analysis, and any returning visit whose prior
       // plan happened to have no progress photo) - priorPhotoPreamble and
@@ -4280,7 +4323,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // check as the last instruction before the JSON schema, closest to
       // where generation actually begins.
       const roomAreaInstruction = `Before returning your classification, answer three separate questions about this photo, in this exact order - do not let one contaminate another: (1) ORGANIZING TARGET - what is the primary thing or area the user appears to be asking Uncluttrd to organize in this photo? This is the organizing target: the specific thing they want help with, not a survey of everything visible in the frame. (2) PARENT ROOM - what room of the home is that organizing target located in? Use a short, common label (Living Room, Kitchen, Garage, Bedroom) for suggestedRoomName. (3) SCOPE - Before classifying areaScope, answer this question first: "Is there ONE primary thing or area that the user is asking Uncluttrd to organize in this photo?" If YES, the answer is sub-area, even if other furniture, walls, windows, or decorative items are visible in the background. Set suggestedAreaName to a short label for that organizing target. If NO - the photo genuinely depicts a general room with no single organizing focus and you cannot identify any one area the user is targeting - then the answer is whole-room and suggestedAreaName is null. Do NOT classify as whole-room merely because: multiple furniture types are visible; multiple furniture pieces are present; the photo captures several items across the room; you see decorative elements, plants, or windows alongside the main subject; the photo is not "tightly framed" on one fixture. Any of those can be true while the photo is still clearly ABOUT one organizing target. The question is always: what does the user want to organize? If you can name it, it's sub-area. The third possible classification is "ambiguous" (the room-level label itself commonly means either a fully independent room or a named zone within a larger room, depending on the specific home - for example Pantry, Closet, Mudroom, Laundry Area, or Home Office - and this one photo does not give you enough context to tell which this home means). When ambiguous, still provide your best suggestedRoomName as the standalone-room interpretation - the app will ask the user to confirm which it actually is. Never invent a numerical confidence score. For roomReason and areaReason, cite the specific visible evidence behind your classification (for example "multiple seating pieces and a TV console visible" or "photo is centered on a single shelving unit that is clearly the organizing target, with a couch and window only partially visible in the background") - never just restate the label itself as its own justification. SELF-CONSISTENCY CHECK (do this last, after you have drafted your overview and recommendations in your own reasoning): does your overview describe organizing ONE specific area, fixture, or piece of furniture? If yes, your areaScope MUST be "sub-area" and suggestedAreaName MUST name that area. Your overview and your classification must agree - they are describing the same photo, not answering different questions. If your overview says "your corner shelf" then areaScope cannot be "whole-room." Before returning your JSON, re-read your own overview field and your own areaScope field together and confirm they tell the same story.\n\n`;
-      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}${knownIdentityNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -6108,6 +6151,76 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <Text style={[s.startOverText, { color: "white" }]}>Organize Another Area</Text>
               </TouchableOpacity>
 
+              {/* Five Fixes pass, item 1 (2026-08-09): AREAS IN THIS ROOM
+                  moved above EARLIER ORGANIZING VISITS - Areas are
+                  navigational (start new work in a known Area), visit
+                  history is archival; navigation belongs above archive.
+                  Phase B prerequisite #2's own reasoning (still applies):
+                  the Phase A data path (organizeAgainContext.areaId ->
+                  finalizeAnalysisResult's areaId param) has existed since
+                  Phase A but had no live UI trigger once the per-Area
+                  grouped section was retired by the Layout Revision. This
+                  is a lightweight list, not a revival of that section - one
+                  row per durable Area still represented among this Room's
+                  visits (same "hide, don't delete" rule the rest of this
+                  screen already follows for a zero-visit Area). */}
+              {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).length > 0 && (
+                <>
+                  <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>AREAS IN THIS ROOM</Text>
+                  {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).map((area) => {
+                    // Item 3: area.latestPhotoUrl is derived by
+                    // updateAreaSummary, which writeSpaceShadowStructure
+                    // calls fire-and-forget (never awaited) from
+                    // savePlanToHistory - so on a REVISIT, there is a real
+                    // window where the plan/photo are already saved and the
+                    // user has already navigated away, but this Area's own
+                    // projected latestPhotoUrl hasn't caught up yet in
+                    // Firestore. A fast return to Room Detail during that
+                    // window reads the stale value; a later return (after
+                    // the fire-and-forget write lands) reads the correct
+                    // one - this is the "icon initially, photo after
+                    // navigation" behavior. Rather than making the save
+                    // path slower (touching every other consumer of that
+                    // fire-and-forget write), fall back to the most recent
+                    // matching PLAN's own photoUrl - which IS reliably set
+                    // by the time Room Detail's data loads, since
+                    // savePlanToHistory awaits the plan's own photo
+                    // upload/patch before ever returning. The icon renders
+                    // only when genuinely no photo can be found either way.
+                    const matchingPlans = roomDetailPlans.filter((p) => p.areaId === area.id && p.photoUrl);
+                    const fallbackPhotoUrl = matchingPlans.length
+                      ? matchingPlans.reduce((latest, p) => (new Date(p.createdAt) > new Date(latest.createdAt) ? p : latest)).photoUrl
+                      : null;
+                    const resolvedPhotoUrl = area.latestPhotoUrl || fallbackPhotoUrl;
+                    return (
+                      <View key={area.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                        {resolvedPhotoUrl ? (
+                          <Image source={{ uri: resolvedPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                        ) : (
+                          <View style={s.historyIcon}>
+                            <Text style={{ fontSize: 20 }}>🏠</Text>
+                          </View>
+                        )}
+                        {/* Item 2: name and "Organize Again" each on their
+                            own line (matching renderVisitRow's own fix) -
+                            no shared row width to truncate against. */}
+                        <View style={{ flex: 1 }}>
+                          <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
+                          <TouchableOpacity
+                            onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
+                            accessibilityLabel={`Organize Again in ${area.displayName}`}
+                            accessibilityRole="button"
+                            style={{ marginTop: 4, alignSelf: "flex-start" }}
+                          >
+                            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </>
+              )}
+
               {/* Room Detail Layout Revision, item 5: EARLIER ORGANIZING
                   VISITS - every visit except the one already shown in Last
                   Session, so no visit ever renders twice. Deliberately
@@ -6126,44 +6239,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <>
                   <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>{`EARLIER ORGANIZING VISITS (${earlierVisits.length})`}</Text>
                   {earlierVisits.map(renderVisitRow)}
-                </>
-              )}
-
-              {/* Phase B prerequisite #2: per-Area "Organize Again" entry
-                  point. The Phase A data path (organizeAgainContext.areaId
-                  -> finalizeAnalysisResult's areaId param) has existed since
-                  Phase A but had no live UI trigger once the per-Area
-                  grouped section above was retired by the Layout Revision.
-                  This is a lightweight list, not a revival of that section -
-                  one row per durable Area still represented among this
-                  Room's visits (same "hide, don't delete" rule the rest of
-                  this screen already follows for a zero-visit Area), each
-                  with its own small "Organize Again" link. Tapping it sets
-                  organizeAgainContext.areaId directly and skips straight to
-                  the camera - identity is already established by the tap
-                  itself, so no recognition/matching runs. */}
-              {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).length > 0 && (
-                <>
-                  <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>AREAS IN THIS ROOM</Text>
-                  {roomDetailAreas.filter((a) => !a.retired && roomDetailPlans.some((p) => p.areaId === a.id)).map((area) => (
-                    <View key={area.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
-                      {area.latestPhotoUrl ? (
-                        <Image source={{ uri: area.latestPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
-                      ) : (
-                        <View style={s.historyIcon}>
-                          <Text style={{ fontSize: 20 }}>🏠</Text>
-                        </View>
-                      )}
-                      <Text style={[s.historySpace, { flex: 1 }]} numberOfLines={1}>{area.displayName}</Text>
-                      <TouchableOpacity
-                        onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
-                        accessibilityLabel={`Organize Again in ${area.displayName}`}
-                        accessibilityRole="button"
-                      >
-                        <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
-                      </TouchableOpacity>
-                    </View>
-                  ))}
                 </>
               )}
 
