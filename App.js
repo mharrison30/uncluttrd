@@ -308,6 +308,120 @@ async function createAreaForPlan(uid, roomId, planId, areaName) {
   }
 }
 
+// Area Identity, Phase B: Visual Recognition (AreaRecognitionPhaseBImplementation.md,
+// AreaIdentityDesign.md §6). Same three-outcome pattern as Room recognition
+// (findRecognitionCandidates), but the comparison itself is a real
+// multimodal AI call (compareAreaCandidates, functions/index.js) - Room
+// membership (existingAreas is always pre-scoped to ONE Room by the
+// caller, never cross-Room) is the hard filter; visual similarity via the
+// photos themselves is the actual identity signal; suggestedAreaName is a
+// WEAK co-signal used ONLY to narrow which Areas get a visual comparison
+// when there are more than 3 eligible ones - never sufficient by itself to
+// establish a match (proven necessary by real evidence: the same physical
+// corner has been AI-labeled "Display Wall"/"Trophy Wall Display"/
+// "Entertainment Center"/"TV Console & Media Center" across different
+// visits). newPhotoBase64 (not a URL - deliberate deviation from the
+// originally-specified newPhotoUrl param name) because at the point this
+// runs, the plan has NOT been saved yet (governing invariant - see
+// beginAreaConfirmation below) and so no photoUrl exists yet; the already-
+// captured local photo is compressed to base64 by the caller instead,
+// exactly like every other multi-image comparison already in this file.
+async function findAreaRecognitionCandidates(roomId, newPhotoBase64, existingAreas, suggestedAreaName, uid) {
+  const eligible = (existingAreas || []).filter((a) => !a.retired);
+  if (eligible.length === 0) {
+    return { status: "NO_MATCH", candidates: [], diagnostics: { roomId, uid, reason: "no-existing-areas", totalAreas: 0, consideredAreas: 0, excludedAreas: [] } };
+  }
+
+  // Step 0 narrowing (measured, not guessed - see the implementation
+  // report): at most 3 candidate Areas go into the visual call (up to 2
+  // reference images each + today's photo = up to 7 images total). Real
+  // measurement against this exact function found zero accuracy
+  // degradation and ~4-5s latency up to 17 images, so 7 has ample
+  // headroom - the cap here is a deliberate cost/UX choice, not a
+  // technical necessity. When there are more than 3 eligible Areas,
+  // narrow by loose suggestedAreaName word-overlap - explicitly a WEAK
+  // co-signal for narrowing only, never the match decision itself (that's
+  // still made by the visual call, or not made at all). Excluded Areas
+  // are always reported in diagnostics, never silently dropped.
+  let consideredAreas = eligible;
+  let excludedAreas = [];
+  if (eligible.length > 3) {
+    const norm = (s) => (s || "").toLowerCase().split(/\W+/).filter(Boolean);
+    const targetWords = new Set(norm(suggestedAreaName));
+    const scored = eligible.map((a) => ({ area: a, score: norm(a.displayName).filter((w) => targetWords.has(w)).length }));
+    scored.sort((x, y) => y.score - x.score || new Date(y.area.lastOrganizedAt || 0) - new Date(x.area.lastOrganizedAt || 0));
+    consideredAreas = scored.slice(0, 3).map((s) => s.area);
+    excludedAreas = scored.slice(3).map((s) => ({ areaId: s.area.id, displayName: s.area.displayName, score: s.score }));
+  }
+
+  // Reference photos: originalPhotoUrl + latestPhotoUrl, deduplicated when
+  // they resolve to the same URL (an Area never revisited since creation
+  // has both fields pointing at the same file) - max 2 distinct images
+  // per Area, matching the design doc's own cap.
+  const candidatePayload = [];
+  const skippedAreas = [];
+  for (const area of consideredAreas) {
+    const urls = [...new Set([area.originalPhotoUrl, area.latestPhotoUrl].filter(Boolean))];
+    if (urls.length === 0) { skippedAreas.push({ areaId: area.id, reason: "no-reference-photos" }); continue; }
+    try {
+      const images = [];
+      for (const url of urls) {
+        const localUri = FileSystem.cacheDirectory + `area_recognition_ref_${area.id}_${images.length}.jpg`;
+        const { uri } = await FileSystem.downloadAsync(url, localUri);
+        const compressed = await manipulateAsync(uri, [{ resize: { width: 768 } }], { compress: 0.5, format: SaveFormat.JPEG, base64: true });
+        images.push(compressed.base64);
+      }
+      candidatePayload.push({ areaId: area.id, displayName: area.displayName, images });
+    } catch (e) {
+      dlog(`[AREA RECOGNITION] reference photo fetch failed for area ${area.id}: ${e.message}`);
+      skippedAreas.push({ areaId: area.id, reason: `fetch-failed: ${e.message}` });
+    }
+  }
+
+  const diagnostics = {
+    roomId, uid,
+    totalAreas: eligible.length,
+    consideredAreas: consideredAreas.length,
+    excludedAreas,
+    skippedAreas,
+    referenceImageCount: candidatePayload.reduce((n, c) => n + c.images.length, 0),
+  };
+
+  if (candidatePayload.length === 0) {
+    return { status: "NO_MATCH", candidates: [], diagnostics: { ...diagnostics, reason: "no-usable-reference-photos" } };
+  }
+
+  try {
+    const compareFn = httpsCallable(functions, "compareAreaCandidates");
+    const result = await compareFn({ todayImageBase64: newPhotoBase64, candidates: candidatePayload });
+    const text = result.data?.text || "";
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("No JSON object found in comparison response");
+    const parsed = JSON.parse(match[0]);
+    const rawCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+    // Map back to full Area objects for the proposal UI (photo,
+    // displayName, lastOrganizedAt, visitCount) - the model only ever
+    // sees/returns areaId + evidenceReason, never a confidence score
+    // (never requested in the prompt, never parsed here even if the model
+    // invented one anyway).
+    const candidates = rawCandidates
+      .map((c) => {
+        const area = consideredAreas.find((a) => a.id === c.areaId);
+        return area ? { ...area, evidenceReason: c.evidenceReason || null } : null;
+      })
+      .filter(Boolean);
+    dlog(`[AREA RECOGNITION] room=${roomId} consideredAreas=${consideredAreas.length} matchesReturned=${candidates.length}`);
+    return {
+      status: candidates.length > 0 ? "MATCH_FOUND" : "NO_MATCH",
+      candidates,
+      diagnostics: { ...diagnostics, usage: result.data?.usage || null },
+    };
+  } catch (e) {
+    dlog(`[AREA RECOGNITION] compareAreaCandidates call failed for room ${roomId}: ${e.message}`);
+    return { status: "RECOGNITION_FAILED", candidates: [], diagnostics: { ...diagnostics, error: e.message } };
+  }
+}
+
 // Area Identity, Phase A §7/§8: writes ONLY Area.displayName - never
 // touches any plan's own historical areaName field, mirroring
 // renameSpace's exact contract for Room.displayName one-to-one. No
@@ -2494,6 +2608,32 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // completeRoomConfirmation call after a failure - a ref, not state,
   // since it doesn't need its own render.
   const lastRoomConfirmationAttemptRef = useRef(null);
+  // Area Identity, Phase B (AreaRecognitionPhaseBImplementation.md): the
+  // Area-level analog of roomConfirmation above - null when not showing,
+  // else { status: "MATCH_FOUND" | "RECOGNITION_FAILED", candidates,
+  // existingAreas, roomId, view: "main" | "picker" }. NO_MATCH never
+  // reaches this state at all (beginAreaConfirmation resolves it
+  // immediately, no screen shown - "no unnecessary friction when there
+  // genuinely are no matches", per the design doc). Paused here means: the
+  // AI photo analysis already completed and Room identity is already
+  // confirmed, but NOTHING has been saved yet - the governing invariant
+  // (no plan saved until BOTH Room and Area identity are established).
+  const [areaConfirmation, setAreaConfirmation] = useState(null);
+  const [areaConfirmationSaving, setAreaConfirmationSaving] = useState(false);
+  const [areaConfirmationError, setAreaConfirmationError] = useState(null);
+  // Holds { saveContinuation } for the in-flight Area confirmation -
+  // saveContinuation(areaIntent) is what actually persists the plan, once
+  // called with the user's resolved Area identity ({kind:"matched"|"new"|
+  // "picked", areaId?}). A ref, not state (mirrors
+  // lastRoomConfirmationAttemptRef above) - holds a function, not
+  // renderable data, and both of Phase B's entry points (the generic-camera
+  // Room confirmation flow and the "Organize Another Area" returning-visit
+  // flow) populate it identically before ever showing the proposal screen.
+  const areaConfirmationPendingRef = useRef(null);
+  // Mirrors lastRoomConfirmationAttemptRef, one level down - lets
+  // retryAreaConfirmation re-invoke the exact same completeAreaConfirmation
+  // call after a failed save, without re-running recognition again.
+  const lastAreaConfirmationAttemptRef = useRef(null);
   // Remembered Home v1 Step 3, Phase D (RememberedHomeDesign.md §4): set
   // only by confirmRecognitionCandidate, read only by the Results screen's
   // own orientation banner. Not a separate timed sequence of screens (5s/
@@ -3932,6 +4072,140 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // have this (dedupeToKnownRooms's Room shape doesn't carry it), so
   // carry-forward simply doesn't fire there - a disclosed, low-stakes
   // limitation, not a silent gap (flagged in the implementation report).
+  // Area Identity Phase B: the actual save + Area association/creation +
+  // success bookkeeping, extracted from completeRoomConfirmation so it can
+  // run either immediately (whole-room, new-room, or NO_MATCH - no pause
+  // needed) or later, as the saveContinuation invoked once the user
+  // resolves the Area confirmation screen (MATCH_FOUND/RECOGNITION_FAILED
+  // - see beginAreaConfirmation). areaIntent is null for "no Area gating
+  // needed, behave exactly like Phase A always did" or
+  // {kind:"matched"|"picked", areaId} (associate with that existing Area,
+  // no creation) or {kind:"new"} (create a fresh Area, same as Phase A).
+  // Throws on failure rather than setting error state directly - the two
+  // callers (completeRoomConfirmation's own immediate path, and
+  // completeAreaConfirmation below) each display the error on whichever
+  // screen is actually showing.
+  const finishRoomConfirmationSave = async (resolvedResult, sourceCandidate, confirmedPlan, areaIntent) => {
+    const pending = recognitionPendingRef.current;
+    const planToSave = (areaIntent && areaIntent.kind !== "new") ? { ...confirmedPlan, areaId: areaIntent.areaId } : confirmedPlan;
+
+    let newPlanId = null;
+    if (resolvedResult.outcome === "existing-room") {
+      const returningResult = await createReturningPlan(planToSave, resolvedResult.canonicalSpaceId);
+      if (returningResult.outcome === "invalid-target-space") {
+        throw new Error("This room is no longer available. It may have been merged with another room.");
+      }
+      newPlanId = returningResult.planId;
+    } else {
+      newPlanId = await savePlanToHistory(planToSave);
+    }
+
+    if (!newPlanId) {
+      throw new Error("We couldn't save your plan. Please try again.");
+    }
+
+    // Area Identity: a whole-room outcome needs no action here at all -
+    // areaId stays null/absent per confirmedPlan's own default. A
+    // sub-area visit either associates with an EXISTING Area (matched via
+    // Phase B recognition, or manually picked/chosen after a recognition
+    // failure - areaId was already written directly onto the plan above,
+    // so just maintain that Area's projection fields the same way every
+    // other revisit already does, plus the same shadowSourceVersion
+    // bump + resync Phase A's own bug fix established) or creates a brand
+    // new one (Phase A's original path - no existing Areas, NO_MATCH, or
+    // the user explicitly chose "this is a new area"). Non-fatal by
+    // design either way (createAreaForPlan/updateAreaSummary never throw)
+    // - a failure here never blocks the confirmation flow the user is
+    // already past.
+    const roomIdForArea = resolvedResult.outcome === "existing-room" ? resolvedResult.canonicalSpaceId : newPlanId;
+    if (confirmedPlan.areaScope === "sub-area") {
+      if (areaIntent && areaIntent.kind !== "new") {
+        await updateDoc(doc(db, "users", user.uid, "plans", newPlanId), { shadowSourceVersion: increment(1) }).catch((e) => dlog(`[AREA RECOGNITION] shadowSourceVersion bump failed for plan ${newPlanId}: ${e.message}`));
+        await syncPlanToSpaceGraph(user.uid, newPlanId).catch((e) => dlog(`[AREA RECOGNITION] shadow resync failed for plan ${newPlanId}: ${e.message}`));
+        await updateAreaSummary(user.uid, roomIdForArea, areaIntent.areaId);
+      } else {
+        await createAreaForPlan(user.uid, roomIdForArea, newPlanId, confirmedPlan.areaName);
+      }
+    }
+
+    // Success - only now clear the pending/confirmation state and
+    // navigate. Everything above this point is retry-safe: a failure
+    // never touched roomConfirmation/areaConfirmation, recognitionPendingRef,
+    // or results.
+    lastRoomConfirmationAttemptRef.current = null;
+    lastAreaConfirmationAttemptRef.current = null;
+    recognitionPendingRef.current = null;
+    areaConfirmationPendingRef.current = null;
+    setRoomFreeformInput("");
+    setRoomConfirmationSaving(false);
+    setRoomConfirmationError(null);
+    setAreaConfirmationSaving(false);
+    setAreaConfirmationError(null);
+    setAreaConfirmation(null);
+    setPendingRoomConfirmationResult(resolvedResult);
+    dlog(`[ROOM-FIRST] resolved confirmation persisted: ${JSON.stringify(resolvedResult)}, planId=${newPlanId}, areaIntent=${JSON.stringify(areaIntent)}`);
+    logEvent(getAnalytics(), "room_confirmation_resolved", { outcome: resolvedResult.outcome });
+
+    // Point 3: welcome-back fires ONLY for a genuine returning
+    // confirmation - the user explicitly said "yes, I'm returning," so
+    // "Welcome back to your X" is honest, unlike Phase B's transitional
+    // state where nothing was actually confirmed yet.
+    if (resolvedResult.outcome === "existing-room") {
+      // unresolvedCount drives the banner's actionable-vs-quiet split
+      // below - the same signal already used to decide whether
+      // carryForwardUnresolvedItems fires at all (a few lines down), not
+      // a separate derivation. sourceCandidate carries this Room's own
+      // most-recent unresolved items regardless of what area within the
+      // Room today's photo targets (recognition matches at the Room
+      // level - see findRecognitionCandidates - so the same candidate,
+      // and the same unresolvedItems, come back whether today's
+      // suggestedAreaName is the whole Room or one specific area inside
+      // it). Only populated for outcome (a)/a b1 card (sourceCandidate is
+      // a real recognition candidate there); b2/b3/picker/freeform paths
+      // pass no sourceCandidate at all, so this is correctly 0 for them -
+      // a pre-existing, disclosed limitation (see completeRoomConfirmation's
+      // own comment above), not something this change introduces.
+      setJustConfirmedRecognition({
+        displayName: resolvedResult.confirmedRoomName,
+        unresolvedCount: sourceCandidate?.unresolvedItems?.length || 0,
+      });
+    }
+
+    setRoomConfirmation(null);
+    setResults(confirmedPlan);
+    logEvent(getAnalytics(), "plan_completed");
+
+    const validBatch = Array.isArray(confirmedPlan.firstActionBatch) && confirmedPlan.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+    if (validBatch) {
+      logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
+    } else {
+      logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
+    }
+    setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+    if (typeof pending?.analysesRemaining === "number") {
+      const newCount = Math.max(0, 3 - pending.analysesRemaining);
+      setAnalyses(newCount);
+      await AsyncStorage.setItem("analysisCount", newCount.toString());
+    }
+
+    // Carry-forward (Step 3's existing mechanism) - only when this
+    // confirmation came directly from a matched candidate that actually
+    // carries unresolvedItems (outcome a, or a b1 card).
+    if (sourceCandidate?.unresolvedItems?.length) {
+      await carryForwardUnresolvedItems(user.uid, newPlanId, sourceCandidate.unresolvedItems);
+    }
+  };
+
+  // ---- Room-First Identity, Phase C: Room confirmation -> persistence ----
+  // The single completion point for every outcome (a/b1/b2/b3/c, and every
+  // sub-path within them): builds the normalized confirmedPlan payload
+  // from the CONFIRMED facts (resolvedResult), never the raw AI
+  // suggestions directly, then either saves immediately (via
+  // finishRoomConfirmationSave, whole-room/new-room/no-existing-Areas) or
+  // pauses for Area Identity Phase B's own confirmation screen first
+  // (existing-room + sub-area + at least one existing Area) - the
+  // governing invariant: no plan is saved until BOTH Room and Area
+  // identity are established.
   const completeRoomConfirmation = async (resolvedResult, sourceCandidate) => {
     const pending = recognitionPendingRef.current;
     if (!pending) return; // defensive - not reachable while the screen isn't showing
@@ -3953,112 +4227,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       areaScope: resolvedResult.areaScope,
     };
 
-    try {
-      let newPlanId = null;
-      if (resolvedResult.outcome === "existing-room") {
-        const returningResult = await createReturningPlan(confirmedPlan, resolvedResult.canonicalSpaceId);
-        if (returningResult.outcome === "invalid-target-space") {
-          // Error handling, point 5: remain on the confirmation flow with
-          // the user's selection intact - roomConfirmation/
-          // recognitionPendingRef are deliberately NOT cleared here.
+    if (resolvedResult.outcome === "existing-room" && confirmedPlan.areaScope === "sub-area") {
+      try {
+        const areasSnap = await getDocs(collection(db, "users", user.uid, "spaces", resolvedResult.canonicalSpaceId, "areas"));
+        const existingAreas = areasSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((a) => !a.retired);
+        if (existingAreas.length > 0) {
           setRoomConfirmationSaving(false);
-          setRoomConfirmationError("This room is no longer available. It may have been merged with another room.");
-          return;
+          await beginAreaConfirmation({
+            roomId: resolvedResult.canonicalSpaceId,
+            existingAreas,
+            suggestedAreaName: confirmedPlan.areaName,
+            saveContinuation: (areaIntent) => finishRoomConfirmationSave(resolvedResult, sourceCandidate, confirmedPlan, areaIntent),
+          });
+          return; // paused - Area confirmation screen now showing, nothing saved yet
         }
-        newPlanId = returningResult.planId;
-      } else {
-        newPlanId = await savePlanToHistory(confirmedPlan);
+      } catch (e) {
+        dlog(`[AREA RECOGNITION] existing-areas lookup failed for room ${resolvedResult.canonicalSpaceId}, proceeding as a fresh Area (Phase A path): ${e.message}`);
+        // fall through - treated exactly like "zero existing areas"
       }
+    }
 
-      if (!newPlanId) {
-        setRoomConfirmationSaving(false);
-        setRoomConfirmationError("We couldn't save your plan. Please try again.");
-        return;
-      }
-
-      // Area Identity, Phase A §3: the ONE place a new Area gets created
-      // from the generic-camera path. Governing principle, restated:
-      // Phase A never attempts to match this sub-area visit against an
-      // existing Area by displayName or any other signal - every
-      // confirmed sub-area visit through THIS flow gets a brand-new Area,
-      // full stop. The only way a visit ever associates with a
-      // PRE-EXISTING Area is navigation (startOrganizeAgain's areaId
-      // option, threaded through finalizeAnalysisResult above - a
-      // completely different code path from this one). A whole-room
-      // outcome needs no action here at all - savePlanToHistory/
-      // createReturningPlan already wrote areaId: null via confirmedPlan
-      // not setting .areaId, per that field's own default. Non-fatal by
-      // design (createAreaForPlan never throws) - a failure here leaves
-      // the plan saved with areaId: null, same as a whole-Room visit,
-      // never blocks the confirmation flow the user is already past.
-      const roomIdForArea = resolvedResult.outcome === "existing-room" ? resolvedResult.canonicalSpaceId : newPlanId;
-      if (confirmedPlan.areaScope === "sub-area") {
-        await createAreaForPlan(user.uid, roomIdForArea, newPlanId, confirmedPlan.areaName);
-      }
-
-      // Success - only now clear the pending/confirmation state and
-      // navigate. Everything above this point is retry-safe: a failure
-      // never touched roomConfirmation, recognitionPendingRef, or results.
-      lastRoomConfirmationAttemptRef.current = null;
-      recognitionPendingRef.current = null;
-      setRoomFreeformInput("");
-      setRoomConfirmationSaving(false);
-      setRoomConfirmationError(null);
-      setPendingRoomConfirmationResult(resolvedResult);
-      dlog(`[ROOM-FIRST] resolved confirmation persisted: ${JSON.stringify(resolvedResult)}, planId=${newPlanId}`);
-      logEvent(getAnalytics(), "room_confirmation_resolved", { outcome: resolvedResult.outcome });
-
-      // Point 3: welcome-back fires ONLY for a genuine returning
-      // confirmation - the user explicitly said "yes, I'm returning," so
-      // "Welcome back to your X" is honest, unlike Phase B's transitional
-      // state where nothing was actually confirmed yet.
-      if (resolvedResult.outcome === "existing-room") {
-        // unresolvedCount drives the banner's actionable-vs-quiet split
-        // below - the same signal already used to decide whether
-        // carryForwardUnresolvedItems fires at all (a few lines down), not
-        // a separate derivation. sourceCandidate carries this Room's own
-        // most-recent unresolved items regardless of what area within the
-        // Room today's photo targets (recognition matches at the Room
-        // level - see findRecognitionCandidates - so the same candidate,
-        // and the same unresolvedItems, come back whether today's
-        // suggestedAreaName is the whole Room or one specific area inside
-        // it). Only populated for outcome (a)/a b1 card (sourceCandidate is
-        // a real recognition candidate there); b2/b3/picker/freeform paths
-        // pass no sourceCandidate at all, so this is correctly 0 for them -
-        // a pre-existing, disclosed limitation (see completeRoomConfirmation's
-        // own comment above), not something this change introduces.
-        setJustConfirmedRecognition({
-          displayName: resolvedResult.confirmedRoomName,
-          unresolvedCount: sourceCandidate?.unresolvedItems?.length || 0,
-        });
-      }
-
-      setRoomConfirmation(null);
-      setResults(confirmedPlan);
-      logEvent(getAnalytics(), "plan_completed");
-
-      const validBatch = Array.isArray(confirmedPlan.firstActionBatch) && confirmedPlan.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
-      if (validBatch) {
-        logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
-      } else {
-        logEvent(getAnalytics(), "batch_generation_failed", { planId: newPlanId, batchIndex: 1, reason: "missing_batch" });
-      }
-      setTimeout(() => resultsScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
-      if (typeof pending.analysesRemaining === "number") {
-        const newCount = Math.max(0, 3 - pending.analysesRemaining);
-        setAnalyses(newCount);
-        await AsyncStorage.setItem("analysisCount", newCount.toString());
-      }
-
-      // Carry-forward (Step 3's existing mechanism) - only when this
-      // confirmation came directly from a matched candidate that actually
-      // carries unresolvedItems (outcome a, or a b1 card).
-      if (sourceCandidate?.unresolvedItems?.length) {
-        await carryForwardUnresolvedItems(user.uid, newPlanId, sourceCandidate.unresolvedItems);
-      }
+    try {
+      await finishRoomConfirmationSave(resolvedResult, sourceCandidate, confirmedPlan, null);
     } catch (e) {
       setRoomConfirmationSaving(false);
-      setRoomConfirmationError("Something went wrong saving your plan. Please try again.");
+      setRoomConfirmationError(e.message || "Something went wrong saving your plan. Please try again.");
       console.log("Room confirmation save error:", e.message);
     }
   };
@@ -4066,6 +4259,119 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const retryRoomConfirmation = () => {
     const attempt = lastRoomConfirmationAttemptRef.current;
     if (attempt) completeRoomConfirmation(attempt.resolvedResult, attempt.sourceCandidate);
+  };
+
+  // Area Identity Phase B: the shared gate used by BOTH integration points
+  // (completeRoomConfirmation above, and analyze()'s "Organize Another
+  // Area" returning-visit branch) - each supplies its own saveContinuation
+  // (what to actually do once Area identity resolves) and otherwise goes
+  // through identical recognition/proposal logic, so the two entry paths
+  // can never drift into two different Area-recognition behaviors.
+  // NO_MATCH resolves immediately with zero UI friction (design doc's own
+  // explicit rule) - only MATCH_FOUND and RECOGNITION_FAILED ever show the
+  // proposal screen; a caller with zero existingAreas never even reaches
+  // recognition at all (Phase A path).
+  const beginAreaConfirmation = async ({ roomId, existingAreas, suggestedAreaName, saveContinuation }) => {
+    const eligible = (existingAreas || []).filter((a) => !a.retired);
+    if (eligible.length === 0) {
+      await saveContinuation({ kind: "new" });
+      return;
+    }
+
+    let newPhotoBase64 = null;
+    try {
+      const compressed = await manipulateAsync(photo.uri, [{ resize: { width: 768 } }], { compress: 0.5, format: SaveFormat.JPEG, base64: true });
+      newPhotoBase64 = compressed.base64;
+    } catch (e) {
+      dlog(`[AREA RECOGNITION] today's photo compression failed, treating as a recognition failure: ${e.message}`);
+      areaConfirmationPendingRef.current = { saveContinuation };
+      setAreaConfirmationError(null);
+      setAreaConfirmation({ status: "RECOGNITION_FAILED", candidates: [], existingAreas: eligible, roomId, view: "main" });
+      return;
+    }
+
+    const result = await findAreaRecognitionCandidates(roomId, newPhotoBase64, eligible, suggestedAreaName, user.uid);
+
+    if (result.status === "NO_MATCH") {
+      await saveContinuation({ kind: "new" });
+      return;
+    }
+
+    // MATCH_FOUND or RECOGNITION_FAILED - pause here, nothing saved yet.
+    areaConfirmationPendingRef.current = { saveContinuation };
+    setAreaConfirmationError(null);
+    setAreaConfirmation({ status: result.status, candidates: result.candidates, existingAreas: eligible, roomId, view: "main" });
+  };
+
+  const completeAreaConfirmation = async (areaIntent) => {
+    const pending = areaConfirmationPendingRef.current;
+    if (!pending) return; // defensive - not reachable while the screen isn't showing
+    lastAreaConfirmationAttemptRef.current = { areaIntent };
+    setAreaConfirmationError(null);
+    setAreaConfirmationSaving(true);
+    try {
+      // Success clears areaConfirmation/areaConfirmationPendingRef and
+      // navigates itself (inside finishRoomConfirmationSave, or the
+      // "Organize Another Area" continuation's own equivalent tail) -
+      // mirrors completeRoomConfirmation's "only clear on success"
+      // discipline, nothing further to do here on the happy path.
+      await pending.saveContinuation(areaIntent);
+    } catch (e) {
+      setAreaConfirmationSaving(false);
+      setAreaConfirmationError(e.message || "Something went wrong saving your plan. Please try again.");
+      console.log("Area confirmation save error:", e.message);
+    }
+  };
+
+  const retryAreaConfirmation = () => {
+    const attempt = lastAreaConfirmationAttemptRef.current;
+    if (attempt) completeAreaConfirmation(attempt.areaIntent);
+  };
+
+  // Area Identity Phase B: the "Organize Another Area" integration point's
+  // own saveContinuation (mirrors finishRoomConfirmationSave's role for
+  // the generic-camera path) - invoked once Area identity resolves (either
+  // immediately, via beginAreaConfirmation's NO_MATCH/zero-Areas shortcut,
+  // or after the user resolves the proposal screen). Sets results/clears
+  // organizeAgainContext here, at the point identity is actually final -
+  // relocated from analyze()'s own body (where this used to run
+  // unconditionally, before Area identity could possibly be known) to
+  // here, its natural new home. Throws on failure (mirrors
+  // finishRoomConfirmationSave) so completeAreaConfirmation's own catch
+  // surfaces it on whichever screen is showing.
+  const finishOrganizeAnotherAreaSave = async (parsed, returningContext, analysesRemaining, areaIntent) => {
+    setResults(parsed);
+    logEvent(getAnalytics(), "plan_completed");
+    setOrganizeAgainContext(null);
+
+    const resolvedAreaId = (areaIntent && areaIntent.kind !== "new") ? areaIntent.areaId : null;
+    const returningPlanId = await finalizeAnalysisResult(parsed, returningContext.spaceId, analysesRemaining, resolvedAreaId);
+    if (!returningPlanId) {
+      throw new Error("We couldn't save your plan. Please try again.");
+    }
+
+    if (areaIntent && areaIntent.kind !== "new") {
+      // Matched/picked an EXISTING Area - areaId was already written
+      // directly onto the plan above via finalizeAnalysisResult's own
+      // areaId param (same contract the existing-Area Organize Again path
+      // already uses). Maintain the Area's projection fields the same way
+      // every other revisit already does, plus the same
+      // shadowSourceVersion bump + resync Phase A's own bug fix
+      // established, for uniformity/defense in depth.
+      await updateDoc(doc(db, "users", user.uid, "plans", returningPlanId), { shadowSourceVersion: increment(1) }).catch((e) => dlog(`[AREA RECOGNITION] shadowSourceVersion bump failed for plan ${returningPlanId}: ${e.message}`));
+      await syncPlanToSpaceGraph(user.uid, returningPlanId).catch((e) => dlog(`[AREA RECOGNITION] shadow resync failed for plan ${returningPlanId}: ${e.message}`));
+      await updateAreaSummary(user.uid, returningContext.spaceId, areaIntent.areaId);
+    } else {
+      // NO_MATCH, zero existing Areas, or the user explicitly chose "this
+      // is a new area" - create fresh (Phase A's original path).
+      await createAreaForPlan(user.uid, returningContext.spaceId, returningPlanId, parsed.suggestedAreaName ?? null);
+    }
+
+    lastAreaConfirmationAttemptRef.current = null;
+    areaConfirmationPendingRef.current = null;
+    setAreaConfirmationSaving(false);
+    setAreaConfirmationError(null);
+    setAreaConfirmation(null);
   };
 
   // Declining outcome (a)/(b1)/(b2)/(b3) falls through to outcome (c) IN
@@ -4454,6 +4760,37 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         return;
       }
 
+      // Area Identity Phase B (supersedes the prior Area Creation
+      // stopgap): "Organize Another Area" (Room known via
+      // returningContext.spaceId, Area NOT known - returningContext.areaId
+      // null) must resolve Area identity BEFORE the plan is saved (the
+      // same governing invariant completeRoomConfirmation's own gate
+      // enforces) - pause here and let beginAreaConfirmation/
+      // completeAreaConfirmation finish the save via
+      // finishOrganizeAnotherAreaSave once the user resolves it. Skipped
+      // entirely when returningContext.areaId is already set (existing-Area
+      // Organize Again - identity established by navigation, falls
+      // straight through to the unchanged finalizeAnalysisResult call
+      // below) or areaScope isn't "sub-area" (nothing to resolve).
+      if (returningContext && !returningContext.areaId && parsed.areaScope === "sub-area") {
+        let existingAreas = [];
+        try {
+          const areasSnap = await getDocs(collection(db, "users", user.uid, "spaces", returningContext.spaceId, "areas"));
+          existingAreas = areasSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((a) => !a.retired);
+        } catch (e) {
+          dlog(`[AREA RECOGNITION] existing-areas lookup failed for room ${returningContext.spaceId}, proceeding as a fresh Area (Phase A path): ${e.message}`);
+        }
+        await beginAreaConfirmation({
+          roomId: returningContext.spaceId,
+          existingAreas,
+          suggestedAreaName: parsed.suggestedAreaName,
+          saveContinuation: (areaIntent) => finishOrganizeAnotherAreaSave(parsed, returningContext, analysesRemaining, areaIntent),
+        });
+        setLoading(false);
+        stopLoadMessages();
+        return; // paused (or already resolved+saved via NO_MATCH/zero-Areas) - see beginAreaConfirmation
+      }
+
       setResults(parsed);
       logEvent(getAnalytics(), "plan_completed");
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
@@ -4470,27 +4807,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // inside finalizeAnalysisResult - currentPlanId itself doesn't reflect
       // the new doc until a re-render, and every batch event is
       // planId-correlated (see Analytics.md).
-      const returningPlanId = await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining, returningContext?.areaId || null);
-      // Area Creation stopgap (2026-08-09): "Organize Another Area" (Room
-      // known via returningContext.spaceId, Area NOT known -
-      // returningContext.areaId null) skips the !returningContext branch
-      // above entirely, which is the ONLY other place createAreaForPlan is
-      // called - so a sub-area visit through THIS path never got an Area,
-      // ever (confirmed against real staging data: plan C9UGhJHh3ml3CI0aeX9J
-      // saved correctly with areaScope "sub-area" but areaId stayed null,
-      // zero Area docs existed). Runs ONLY after finalizeAnalysisResult has
-      // already returned a real newPlanId - never fires on a failed/rejected
-      // save (invalid-target-space returns null), so no orphan Area is ever
-      // created for a plan that doesn't exist. suggestedAreaName is used
-      // (not plan.areaName, which savePlanToHistory/createReturningPlan
-      // themselves fall back to it for exactly this call path) - matches
-      // completeRoomConfirmation's own areaName argument to createAreaForPlan
-      // by construction. This is a stopgap, not real Area matching - Phase B
-      // (recognition-then-confirm) replaces it; it always creates a fresh
-      // Area, same as the fresh-photo path already does today.
-      if (returningContext && !returningContext.areaId && parsed.areaScope === "sub-area" && returningPlanId) {
-        await createAreaForPlan(user.uid, returningContext.spaceId, returningPlanId, parsed.suggestedAreaName ?? null);
-      }
+      await finalizeAnalysisResult(parsed, returningContext?.spaceId || null, analysesRemaining, returningContext?.areaId || null);
     } catch (e) {
       lastFailedAnalysisRef.current = { analysisId: analysisIdRef.current, photoUri: photo?.uri };
       logEvent(getAnalytics(), "plan_failed", { reason: e.message });
@@ -5323,6 +5640,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // roomConfirmation/recognitionPendingRef with zero residual state
       // (test k) and returns to the photo-preview Home screen, keeping the
       // photo so the user can retry rather than losing it entirely.
+      // Area Identity Phase B: checked BEFORE roomConfirmation below, since
+      // areaConfirmation can be truthy while roomConfirmation itself is
+      // STILL truthy too (Room confirmation is paused, not cleared, while
+      // Area confirmation shows - see completeRoomConfirmation) - back
+      // must cancel the Area screen that's actually visible, not fall
+      // through to Room confirmation's own handling underneath it.
+      if (areaConfirmation) {
+        if (areaConfirmation.view !== "main") { setAreaConfirmation(prev => prev ? { ...prev, view: "main" } : prev); return true; }
+        areaConfirmationPendingRef.current = null;
+        setAreaConfirmation(null);
+        setAreaConfirmationError(null);
+        return true;
+      }
       if (roomConfirmation) {
         if (roomConfirmation.view !== "main") { backToRoomConfirmationMain(); return true; }
         // "failed" has no completed check to decline BACK to (unlike a/b1/
@@ -6770,6 +7100,176 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           </Modal>
 
+      </SafeAreaView>
+    );
+  }
+
+  // AREA CONFIRMATION SCREEN (Area Identity, Phase B - Visual Recognition,
+  // AreaRecognitionPhaseBImplementation.md). Checked BEFORE roomConfirmation
+  // below, same reason as the Android back-handler above: roomConfirmation
+  // stays truthy (paused, not cleared) while this screen shows, for the
+  // generic-camera entry point. Governing principle, restated: visual
+  // similarity may PROPOSE Area identity; only explicit user confirmation
+  // ESTABLISHES it - nothing here saves anything; every action routes
+  // through completeAreaConfirmation, which only ever touches local React
+  // state until the user actually picks one.
+  if (areaConfirmation) {
+    const daysAgo = (iso) => {
+      if (!iso) return null;
+      const ms = Date.now() - Date.parse(iso);
+      return Math.max(0, Math.round(ms / (24 * 60 * 60 * 1000)));
+    };
+    const { status, candidates, existingAreas, view } = areaConfirmation;
+
+    const AreaConfirmationHeader = ({ title }) => (
+      <>
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          {/* Cancels the whole Area confirmation - clears areaConfirmation/
+              areaConfirmationPendingRef with zero residual state (test m:
+              "back/cancel -> no plan, no Area" - nothing was ever saved
+              during the pause, so clearing local state is sufficient).
+              Disabled while a save is outstanding, same as
+              RoomConfirmationHeader's own cancel button. */}
+          <TouchableOpacity disabled={areaConfirmationSaving} onPress={() => { areaConfirmationPendingRef.current = null; setAreaConfirmation(null); setAreaConfirmationError(null); }} style={s.hdrMark} accessibilityLabel="Cancel and go home" accessibilityRole="button">
+            <DrawerIcon size={54} dark={true} />
+          </TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrPageName}>{title}</Text>
+          </View>
+        </View>
+        {areaConfirmationError && (
+          <View style={{ backgroundColor: "#FEF2F2", borderBottomWidth: 1, borderBottomColor: "#FCA5A5", padding: 12, flexDirection: "row", alignItems: "center", gap: 10 }}>
+            <Text style={{ flex: 1, fontSize: 13, color: "#B91C1C" }}>{areaConfirmationError}</Text>
+            <TouchableOpacity onPress={retryAreaConfirmation} style={{ paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#B91C1C", borderRadius: 8 }}>
+              <Text style={{ color: "white", fontSize: 13, fontFamily: "Inter_600SemiBold" }}>Try Again</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </>
+    );
+
+    // Mirrors Room Confirmation's own EvidenceCardForCandidate (LAST TIME/
+    // TODAY side-by-side, not the shared BeforeAfterStack component - see
+    // that component's own comment for why). evidenceReason is shown as a
+    // small caption - the model's own cited visible evidence for this
+    // specific match (never a numeric score, never requested/parsed).
+    const EvidenceCardForAreaCandidate = ({ area, onConfirm, confirmLabel }) => {
+      const days = daysAgo(area.lastOrganizedAt);
+      const priorPhotoUrl = area.latestPhotoUrl || area.originalPhotoUrl || null;
+      return (
+        <View style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 14 }}>
+          <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+            <View style={{ flex: 1 }}>
+              <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                {priorPhotoUrl && <Image source={{ uri: priorPhotoUrl }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                <Text style={s.beforeAfterStackLabel}>LAST TIME</Text>
+              </View>
+            </View>
+            <View style={{ flex: 1 }}>
+              <View style={[s.beforeAfterStackWrap, { height: 140 }]}>
+                {photo?.uri && <Image source={{ uri: photo.uri }} style={s.beforeAfterStackImage} resizeMode="cover" />}
+                <Text style={s.beforeAfterStackLabel}>TODAY</Text>
+              </View>
+            </View>
+          </View>
+          <Text style={{ fontSize: 15, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 2 }}>{area.displayName}</Text>
+          <Text style={{ fontSize: 12, color: "#64748B", marginBottom: area.evidenceReason ? 4 : 10 }}>
+            {days !== null ? `Last organized ${days} day${days === 1 ? "" : "s"} ago` : "Last organized a while ago"}
+            {` · ${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}
+          </Text>
+          {area.evidenceReason && (
+            <Text style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic", marginBottom: 10 }}>{area.evidenceReason}</Text>
+          )}
+          <TouchableOpacity disabled={areaConfirmationSaving} style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: areaConfirmationSaving ? 0.6 : 1 }]} onPress={onConfirm}>
+            <Text style={[s.startOverText, { color: "white" }]}>{confirmLabel}</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    };
+
+    // ---- Sub-view: picker - "Choose another saved area", lists every
+    // Area in this Room (not just the proposed candidates), no photos
+    // required, no auto-select - mirrors the Room picker's own plain-list
+    // pattern one level down. ----
+    if (view === "picker") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <AreaConfirmationHeader title="Choose a saved Area" />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            {existingAreas.map((area) => (
+              <TouchableOpacity key={area.id} disabled={areaConfirmationSaving} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12 }} onPress={() => completeAreaConfirmation({ kind: "picked", areaId: area.id })}>
+                {area.latestPhotoUrl || area.originalPhotoUrl ? (
+                  <Image source={{ uri: area.latestPhotoUrl || area.originalPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                ) : (
+                  <View style={s.historyIcon}><Text style={{ fontSize: 20 }}>🏠</Text></View>
+                )}
+                <Text style={{ fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink, flex: 1 }}>{area.displayName}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => setAreaConfirmation((prev) => (prev ? { ...prev, view: "main" } : prev))}>
+              <Text style={s.mergeSecondaryBtnText}>← Back</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // ---- Main view: RECOGNITION_FAILED - failure-state chooser. Never
+    // auto-creates an Area from a technical failure (governing principle).
+    // Same pattern as Room recognition's own "failed" outcome. ----
+    if (status === "RECOGNITION_FAILED") {
+      return (
+        <SafeAreaView style={s.safe}>
+          <StatusBar barStyle="light-content" />
+          <AreaConfirmationHeader title="We couldn't check your saved Areas right now." />
+          <ScrollView contentContainerStyle={s.scrollContent}>
+            <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>Choose an existing Area, or continue with a new one.</Text>
+            {existingAreas.map((area) => (
+              <TouchableOpacity key={area.id} disabled={areaConfirmationSaving} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12 }} onPress={() => completeAreaConfirmation({ kind: "picked", areaId: area.id })}>
+                {area.latestPhotoUrl || area.originalPhotoUrl ? (
+                  <Image source={{ uri: area.latestPhotoUrl || area.originalPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                ) : (
+                  <View style={s.historyIcon}><Text style={{ fontSize: 20 }}>🏠</Text></View>
+                )}
+                <Text style={{ fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink, flex: 1 }}>{area.displayName}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity disabled={areaConfirmationSaving} style={[s.startOverBtn, { marginTop: 10, backgroundColor: BRAND.green, borderWidth: 0, opacity: areaConfirmationSaving ? 0.6 : 1 }]} onPress={() => completeAreaConfirmation({ kind: "new" })}>
+              <Text style={[s.startOverText, { color: "white" }]}>This is a new area</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // ---- Main view: MATCH_FOUND - one candidate is a compact single-card
+    // confirmation; multiple candidates stack. No per-candidate reject
+    // button either way - either tap a match, or use one of the two
+    // options below (per the design doc's own explicit UI rule). ----
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="light-content" />
+        <AreaConfirmationHeader title="Have we worked on this area before?" />
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          {candidates.map((area) => (
+            <EvidenceCardForAreaCandidate
+              key={area.id}
+              area={area}
+              confirmLabel={`Yes, this is my ${area.displayName}`}
+              onConfirm={() => completeAreaConfirmation({ kind: "matched", areaId: area.id })}
+            />
+          ))}
+          <TouchableOpacity disabled={areaConfirmationSaving} style={s.mergeSecondaryBtn} onPress={() => completeAreaConfirmation({ kind: "new" })}>
+            <Text style={s.mergeSecondaryBtnText}>This is a new area</Text>
+          </TouchableOpacity>
+          {existingAreas.length > candidates.length && (
+            <TouchableOpacity disabled={areaConfirmationSaving} style={[s.mergeSecondaryBtn, { marginTop: 8 }]} onPress={() => setAreaConfirmation((prev) => (prev ? { ...prev, view: "picker" } : prev))}>
+              <Text style={s.mergeSecondaryBtnText}>Choose another saved area</Text>
+            </TouchableOpacity>
+          )}
+        </ScrollView>
       </SafeAreaView>
     );
   }

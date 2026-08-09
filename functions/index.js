@@ -300,6 +300,74 @@ exports.analyzePhoto = onCall(
   }
 );
 
+// Area Identity Phase B: Visual Recognition (AreaIdentityDesign.md §6).
+// Multimodal comparison, NOT a second analyzePhoto call - takes today's
+// already-analyzed photo plus up to 6 reference images (up to 3 candidate
+// Areas x up to 2 distinct photos each, narrowing/dedup done by the
+// caller) and asks Claude a single, narrow question: does today's photo
+// show the same physical area as any of the labeled candidates? No
+// numeric confidence ever requested or parsed - "ranked" means the
+// order the model lists candidates in, nothing more. Zero new
+// dependencies (same @anthropic-ai/sdk client, same secret, same model),
+// per the design doc's own explicit rejection of embeddings/vector DB at
+// this scale. Not gated by the free-plan analysis count - this is an
+// internal step of a single user-facing "take a photo" action, not a
+// separately-invoked feature, so it must never consume a second credit
+// against analyzePhoto's own limit.
+exports.compareAreaCandidates = onCall(
+  { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
+  async (request) => {
+    const { todayImageBase64, candidates } = request.data || {};
+
+    if (!todayImageBase64 || !Array.isArray(candidates) || candidates.length === 0) {
+      throw new HttpsError("invalid-argument", "Missing today's photo or candidate reference images.");
+    }
+    for (const c of candidates) {
+      if (!c || !c.areaId || !Array.isArray(c.images) || c.images.length === 0) {
+        throw new HttpsError("invalid-argument", "Each candidate needs an areaId and at least one reference image.");
+      }
+    }
+
+    const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
+    const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
+
+    // Fixed image order, narrated in the prompt text itself (same pattern
+    // as generateNextAction's original/before/after and analyzePhoto's
+    // priorPhotoBase64/today ordering) - Image 1 is always today's photo,
+    // then each candidate's reference photo(s) in sequence, so the model
+    // never has to guess which numbered image belongs to which areaId.
+    const content = [image(todayImageBase64)];
+    const legendLines = [];
+    let imageNumber = 2;
+    for (const c of candidates) {
+      const numbers = [];
+      for (const imgB64 of c.images) {
+        content.push(image(imgB64));
+        numbers.push(imageNumber);
+        imageNumber++;
+      }
+      legendLines.push(`Image${numbers.length > 1 ? "s" : ""} ${numbers.join(" and ")}: candidate Area "${c.areaId}"${c.displayName ? ` ("${c.displayName}")` : ""}.`);
+    }
+
+    const prompt = `Image 1 is TODAY's photo of a space the user just photographed. ${legendLines.join(" ")}\n\nDoes TODAY's photo (Image 1) show the SAME PHYSICAL AREA as any of the candidate Areas above? Compare the physical space, furniture, and fixtures themselves, not the level of organization or tidiness - the same shelf, desk, or corner can look very different messy vs. organized and still be the same physical area. A candidate Area with more than one reference image may show it in different states (freshly organized vs. later re-cluttered) - treat all of that candidate's images as evidence for the SAME physical area, not competing options.\n\nReturn ONLY valid JSON, nothing else (no markdown, no backticks): {"candidates":[{"areaId":"the matching candidate's exact areaId string","evidenceReason":"one short phrase citing the specific visible evidence (e.g. the same wavy-edged corner shelf, the same dark wood desk against a window)"}]}\n\nList candidates in the JSON array in descending order of how confident you are, but do NOT include any numeric score or percentage anywhere in your response - reasoning only. If NONE of the candidates show the same physical area as today's photo, return {"candidates":[]}. Never invent a match "candidates" array with more entries than the number of candidate Areas actually shown above.`;
+
+    content.push({ type: "text", text: prompt });
+
+    try {
+      const message = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1000,
+        messages: [{ role: "user", content }],
+      });
+      const text = message.content.find((b) => b.type === "text")?.text || "";
+      console.log(`compareAreaCandidates: candidateAreas=${candidates.length} totalImages=${content.length - 1} stop_reason=${message.stop_reason} inputTokens=${message.usage?.input_tokens} outputTokens=${message.usage?.output_tokens}`);
+      return { text, usage: message.usage || null };
+    } catch (err) {
+      throw new HttpsError("internal", err.message || "Area comparison failed.");
+    }
+  }
+);
+
 exports.generateNextAction = onCall(
   { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
   async (request) => {
