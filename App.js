@@ -1474,6 +1474,29 @@ function DrawerIcon({ size = 38, dark = false }) {
   );
 }
 
+// Room/Area Confirmation processing overlay (2026-08-09): the save
+// sequence a confirmation tap triggers (plan save, shadow sync, Area
+// creation/association, summary updates) is several awaited Firestore
+// round-trips, each of which can touch component state along the way -
+// visibly as flickering/blinking cards and photos on the confirmation
+// screen underneath, since React keeps re-rendering it while all of that
+// runs. Rather than chase down and silence every intermediate state
+// change (fragile, and the confirmation screen's own state legitimately
+// needs to update for retry/error handling), this simply covers the
+// whole screen the instant a save starts. position:"absolute" with
+// top/left/right/bottom:0 sizes itself to whatever View it's placed
+// inside (Yoga positions absolute children relative to their immediate
+// parent, no explicit position:"relative" needed the way web CSS would
+// require) - dropped in as the last child of each confirmation screen's
+// own <SafeAreaView>, so it sits on top of that screen's own content
+// without needing to touch the content itself.
+const ProcessingOverlay = ({ text = "Processing..." }) => (
+  <View style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(255,255,255,0.94)", alignItems: "center", justifyContent: "center", zIndex: 999 }}>
+    <ActivityIndicator size="large" color={BRAND.green} />
+    <Text style={{ marginTop: 14, fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink }}>{text}</Text>
+  </View>
+);
+
 // APP_ENV/IS_PRODUCTION are read above, before Firebase initializes, so the
 // selected firebaseConfig can never silently default to production.
 // IS_STAGING drives the persistent in-app banner below; there is no runtime
@@ -7218,6 +7241,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
+          {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7246,6 +7270,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={[s.startOverText, { color: "white" }]}>This is a new area</Text>
             </TouchableOpacity>
           </ScrollView>
+          {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7276,6 +7301,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </TouchableOpacity>
           )}
         </ScrollView>
+        {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
       </SafeAreaView>
     );
   }
@@ -7402,6 +7428,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7428,6 +7455,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7451,6 +7479,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>No, this is a new room</Text>
             </TouchableOpacity>
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7475,6 +7504,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>None of these - it's a new room</Text>
             </TouchableOpacity>
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7523,6 +7553,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </TouchableOpacity>
             )}
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7553,6 +7584,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>{`Continue as new: "${pendingParsed?.suggestedRoomName || "Room"}"`}</Text>
             </TouchableOpacity>
           </ScrollView>
+          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
         </SafeAreaView>
       );
     }
@@ -7575,6 +7607,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.mergeSecondaryBtnText}>Enter a different name</Text>
           </TouchableOpacity>
         </ScrollView>
+        {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
       </SafeAreaView>
     );
   }
