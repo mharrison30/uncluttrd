@@ -17,7 +17,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Share2, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment } from "firebase/firestore";
@@ -5176,36 +5176,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionEnteredFromResults(false);
     setRoomDetailRoomId(roomId);
   };
-  // Room Detail UX Revision, Section 1: Share as PDF is a PLAN-level
-  // action now (one visit row, or that plan's own Results screen - never
-  // a Room-level overflow menu, which is removed entirely). Mirrors
-  // Results' own "Share Your Room" Alert exactly (same PDF/Text/Cancel
-  // shape, same isPro gate) so a visit row offers the identical choice
-  // drilling into Results would, just without the extra tap.
-  const shareVisitPlan = (plan) => {
-    Alert.alert(
-      "Share Your Room",
-      isPro ? "How would you like to share?" : "Upgrade to Pro for a beautiful branded PDF",
-      isPro ? [
-        {
-          text: "📄 Share as PDF", onPress: () => {
-            setResults(plan);
-            setVizImage(plan.vizImages || {});
-            setVizLoading({});
-            setCurrentPlanId(plan.id);
-            restorePhotoFromPlan(plan);
-            setTimeout(() => generatePDF(), 100);
-          },
-        },
-        { text: "📝 Share as Text", onPress: () => { setResults(plan); setCurrentPlanId(plan.id); setTimeout(() => shareResults(), 100); } },
-        { text: "Cancel", style: "cancel" },
-      ] : [
-        { text: "📝 Share as Text (Free)", onPress: () => { setResults(plan); setCurrentPlanId(plan.id); setTimeout(() => shareResults(), 100); } },
-        { text: "⭐ Upgrade for PDF", onPress: () => setShowPaywall(true) },
-        { text: "Cancel", style: "cancel" },
-      ]
-    );
-  };
   // Room Detail UX Revision, Section 1: Room-level actions, placed as
   // quiet/destructive text links at the bottom of Room Detail's own
   // content (see the Room Detail render block) - not behind a three-dot
@@ -5983,30 +5953,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     };
 
     // Shared row renderer for every EARLIER ORGANIZING VISITS entry -
-    // photo, area label (resolveVisitAreaLabel above), date · status,
-    // independent share icon. Unchanged in shape from before this
-    // revision; only its area-label source changed (durable Area first).
+    // photo, area label (resolveVisitAreaLabel above), date and status
+    // each on their own line (no " · " join - that combined line was
+    // truncating with an ellipsis on longer status text; three
+    // independent short lines instead of one long one). No share icon -
+    // the row means exactly one thing now, "tap to open this visit" in
+    // Results, which already has its own sharing. Single tap target
+    // (the whole row), not split between a content area and a separate
+    // icon anymore.
     const renderVisitRow = (plan) => (
-      <View key={plan.id} style={s.historyItem}>
-        <TouchableOpacity onPress={() => openRoomDetailVisit(plan)} style={{ flexDirection: "row", alignItems: "center", flex: 1, gap: 12 }}>
-          {plan.photoUrl ? (
-            <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
-          ) : (
-            <View style={s.historyIcon}>
-              <Text style={{ fontSize: 20 }}>🏠</Text>
-            </View>
-          )}
-          <View style={{ flex: 1 }}>
-            {resolveVisitAreaLabel(plan) && (
-              <Text style={s.historySpace} numberOfLines={1}>{resolveVisitAreaLabel(plan)}</Text>
-            )}
-            <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(plan)} · ${visitStatusLabel(plan)}`}</Text>
+      <TouchableOpacity key={plan.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]} onPress={() => openRoomDetailVisit(plan)}>
+        {plan.photoUrl ? (
+          <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+        ) : (
+          <View style={s.historyIcon}>
+            <Text style={{ fontSize: 20 }}>🏠</Text>
           </View>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={() => shareVisitPlan(plan)} style={{ padding: 8 }} accessibilityLabel="Share this visit" accessibilityRole="button">
-          <Share2 size={18} color={BRAND.green} strokeWidth={2.25} />
-        </TouchableOpacity>
-      </View>
+        )}
+        <View style={{ flex: 1 }}>
+          {resolveVisitAreaLabel(plan) && (
+            <Text style={s.historySpace} numberOfLines={1}>{resolveVisitAreaLabel(plan)}</Text>
+          )}
+          <Text style={s.historyOverview} numberOfLines={1}>{formatVisitDate(plan)}</Text>
+          <Text style={s.historyOverview} numberOfLines={1}>{visitStatusLabel(plan)}</Text>
+        </View>
+      </TouchableOpacity>
     );
 
     return (
@@ -6090,7 +6061,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                       {resolveVisitAreaLabel(mostRecent) && (
                         <Text style={[s.historySpace, { fontSize: 16 }]} numberOfLines={1}>{resolveVisitAreaLabel(mostRecent)}</Text>
                       )}
-                      <Text style={s.historyOverview} numberOfLines={1}>{`${formatVisitDate(mostRecent)} · ${visitStatusLabel(mostRecent)}`}</Text>
+                      <Text style={s.historyOverview} numberOfLines={1}>{formatVisitDate(mostRecent)}</Text>
+                      <Text style={s.historyOverview} numberOfLines={1}>{visitStatusLabel(mostRecent)}</Text>
                     </TouchableOpacity>
                   </View>
                   {/* Only when THIS visit (Last Session) itself has
@@ -6113,7 +6085,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               )}
 
               <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => startOrganizeAgain(mostRecent || { id: room.id })}>
-                <Text style={[s.startOverText, { color: "white" }]}>Organize Again</Text>
+                <Text style={[s.startOverText, { color: "white" }]}>Organize Another Area</Text>
               </TouchableOpacity>
 
               {/* Room Detail Layout Revision, item 5: EARLIER ORGANIZING
