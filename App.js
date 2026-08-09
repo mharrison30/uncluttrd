@@ -6018,18 +6018,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <View style={{ flex: 1 }}>
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            {/* Room Detail Layout Revision: Room name only, larger than
-                the shared hdrPageName default (14px -> 20px, this screen
-                only, not the shared style - every other screen keeps its
-                existing size) - no sub-area subtitle line underneath
-                anymore. */}
+            {/* Room Detail Layout Revision: Room name only - no sub-area
+                subtitle line underneath anymore. Font size reverted to
+                the shared hdrPageName default (14px) - a 20px per-screen
+                override was tried and reverted, too close in size to the
+                Uncluttrd logo above it. */}
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Text style={[s.hdrPageName, { fontSize: 20 }]} numberOfLines={1}>{room.displayName}</Text>
+              <Text style={s.hdrPageName} numberOfLines={1}>{room.displayName}</Text>
               {/* roomId passed explicitly (3rd arg) - this Room's target plan
                   may not be in the capped `history` cache at all, so
                   handleSaveRename can't rely on resolving it from there. */}
               <TouchableOpacity onPress={() => openRenameSheet(mostRecent?.id || room.id, room.displayName, room.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel="Rename this room" accessibilityRole="button">
-                <Pencil size={16} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
+                <Pencil size={14} color="rgba(255,255,255,0.85)" strokeWidth={2.25} />
               </TouchableOpacity>
             </View>
           </View>
