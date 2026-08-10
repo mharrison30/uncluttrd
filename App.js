@@ -25,10 +25,10 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2 } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
-import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
+import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, Timestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
@@ -2289,6 +2289,38 @@ function applyDeterministicSpendRanges(parsed) {
   return parsed;
 }
 
+// Approach Selection Phase B (ApproachSelectionDesign.md Section 4): display
+// name/copy for each of the AI's three fixed approach ids. Client-owned,
+// not AI-authored, so copy can evolve without touching the prompt/schema.
+const APPROACH_META = {
+  simple: { name: "Keep It Simple", color: BRAND.green, bg: BRAND.greenLight, border: BRAND.greenMid },
+  polished: { name: "Polished & Practical", color: BRAND.tan, bg: BRAND.tanLight, border: BRAND.tanBorder },
+  elevated: { name: "Elevated Finish", color: BRAND.purple, bg: BRAND.purpleLight, border: BRAND.purpleBorder },
+};
+const APPROACH_ORDER = ["simple", "polished", "elevated"];
+
+// Maps a productRecommendation's `icon` category (fixed vocabulary enforced
+// by the analyze() prompt - see approachesInstruction) to a real
+// lucide-react-native component. Mirrors getRoomTypeIcon's established
+// keyword-table-with-fallback pattern. Falls back to Package for any
+// unrecognized/missing value so a malformed AI response can never crash on
+// an undefined icon component.
+const PRODUCT_CATEGORY_ICONS = {
+  cable: Cable,
+  basket: ShoppingBasket,
+  bin: Box,
+  shelf: ShelvingUnit,
+  hook: Anchor,
+  label: Tag,
+  "drawer-organizer": Archive,
+  hanger: Shirt,
+  bag: ShoppingBag,
+  other: Package,
+};
+function getProductCategoryIcon(iconKey) {
+  return PRODUCT_CATEGORY_ICONS[iconKey] || Package;
+}
+
 const REFERRAL_SOURCES = [
   { id: "instagram", label: "Instagram" },
   { id: "facebook", label: "Facebook" },
@@ -3334,6 +3366,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // the Room Detail destination wins, same "the whole session originated
   // there" reasoning already applied to Results' own back bar.
   const [companionEnteredFromResults, setCompanionEnteredFromResults] = useState(false);
+  // Approach Selection Phase B (ApproachSelectionDesign.md Section 4):
+  // which of the three approach cards is currently expanded on Results.
+  // Local/ephemeral only - never written to Firestore. Free, unlimited
+  // browsing between Simple/Polished/Elevated happens entirely here;
+  // durable commitment only happens via handleStartThisPlan.
+  const [previewApproach, setPreviewApproach] = useState(null);
+  const [startingPlan, setStartingPlan] = useState(false);
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1): set by
   // startOrganizeAgain when the user taps "Organize Again" from either
   // entry point (History row, Space Detail's own button) - carries the
@@ -3639,22 +3678,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // Initializes or resumes the Companion loop whenever a new plan's results arrive.
   // A reopened saved plan returns the persisted currentBatch shape
   // { batchIndex, suggestedAt, items: [{id, text, status}] } - handled by
-  // the first branch below either way, fresh or resumed, old-format or new
-  // (savePlanToHistory always writes a real currentBatch at save time now,
-  // old-format from firstActionBatch, new-format from the TEMPORARY
-  // simple.taskChecklist fallback - see savePlanToHistory's own comment).
-  // The second branch below only ever fires for a FRESH analysis, before
-  // its own save has round-tripped currentBatch back into `results` -
-  // Approach Selection Phase A (ApproachSelectionDesign.md Section 5,
-  // task instruction 7): reads approaches.simple.taskChecklist, not the
-  // old top-level firstActionBatch, which the new prompt no longer
-  // returns at all. TEMPORARY: deliberately does NOT set selectedApproach
-  // or write an approachHistory entry - the plan stays genuinely
-  // unselected, this exists purely so Companion has something to show
-  // before Phase B adds real approach-selection UI.
+  // the branch below, whether old-format (firstActionBatch) or new-format
+  // (currentBatch is null until the user explicitly taps "Start This Plan"
+  // on Results - see savePlanToHistory and handleStartThisPlan). A fresh
+  // new-format analysis has no currentBatch yet, so this effect leaves
+  // batchItems empty and Results renders the approach cards instead;
+  // Companion isn't populated until handleStartThisPlan seeds it directly.
   useEffect(() => {
     if (!results) return;
     setUnresolvedReview(null);
+    setPreviewApproach(null);
+    setStartingPlan(false);
     if (results.currentBatch?.items?.length) {
       setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
       setBatchItems(results.currentBatch.items);
@@ -3664,13 +3698,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // from analyze()/completeRoomConfirmation itself). This is a resumed
       // view, not a freshly generated one.
       logEvent(getAnalytics(), "batch_shown", { planId: currentPlanId, batchIndex: results.currentBatch.batchIndex || 1 });
-    } else if (Array.isArray(results.approaches?.simple?.taskChecklist)) {
-      const items = results.approaches.simple.taskChecklist
-        .filter(t => typeof t === "string" && t.trim())
-        .map(text => ({ id: makeItemId(), text, status: "pending" }));
-      setCompanionBatchIndex(1);
-      setBatchItems(items);
-      setCompanionStage("batch-active");
     } else {
       setBatchItems([]);
     }
@@ -4446,30 +4473,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         problemsFound: plan.problemsFound,
         scopeSize: plan.scopeSize,
         approaches: plan.approaches,
-        // Genuinely null - Phase A never sets this, even though the
-        // TEMPORARY currentBatch fallback below reads simple.taskChecklist.
-        // Those two facts don't contradict each other: this field records
-        // the user's own explicit choice, which doesn't exist yet (Phase B
-        // adds the selection UI) - reading one approach's tasks as a
-        // stand-in for "something to show Companion" is not the same as
-        // the user having selected that approach.
+        // Genuinely null at save time - this field records the user's own
+        // explicit approach choice, made on Results (Phase B's "Start This
+        // Plan" button), which by definition hasn't happened yet for a plan
+        // that's only just now being saved.
         selectedApproach: null,
         proTip: plan.proTip,
         vizImages: {},
-        // TEMPORARY (Approach Selection Phase A only - see selectedApproach
-        // above, and ApproachSelectionDesign.md Section 5 / task
-        // instruction 7): simple.taskChecklist stands in for the old
-        // top-level firstActionBatch purely so Companion has something to
-        // show before Phase B adds real approach selection. Remove this
-        // fallback once Phase B seeds Companion from the user's own
-        // selectedApproach instead.
-        currentBatch: Array.isArray(plan.approaches?.simple?.taskChecklist) && plan.approaches.simple.taskChecklist.length ? {
-          batchIndex: 1,
-          suggestedAt: new Date().toISOString(),
-          items: plan.approaches.simple.taskChecklist
-            .filter(t => typeof t === "string" && t.trim())
-            .map(text => ({ id: makeItemId(), text, status: "pending" })),
-        } : null,
+        // Approach Selection Phase B: Companion has nothing to show until
+        // the user explicitly taps "Start This Plan" on Results and
+        // handleStartThisPlan seeds currentBatch from their chosen
+        // approach's taskChecklist. No fallback here - looking at approach
+        // cards is free; only starting one produces a checklist.
+        currentBatch: null,
+        approachHistory: [],
         batchHistory: [],
         progressPhotos: [],
       };
@@ -4875,9 +4892,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     } else {
       newPlanId = await savePlanToHistory(planWithArea);
     }
-    // TEMPORARY (Approach Selection Phase A): checks the same
-    // simple.taskChecklist fallback the [results] effect and
-    // savePlanToHistory both use - see either's own comment.
+    // Approach Selection: "usable content produced" signal for analytics,
+    // not a currentBatch check - simple.taskChecklist is a reasonable proxy
+    // since every approach's checklist is generated together in the same
+    // AI call. Unrelated to whether the user has started a plan yet.
     const validBatch = Array.isArray(parsedResult.approaches?.simple?.taskChecklist) && parsedResult.approaches.simple.taskChecklist.filter(t => typeof t === "string" && t.trim()).length > 0;
     if (validBatch) {
       logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
@@ -5054,8 +5072,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setResults(confirmedPlan);
     logEvent(getAnalytics(), "plan_completed");
 
-    // TEMPORARY (Approach Selection Phase A) - same simple.taskChecklist
-    // fallback as finalizeAnalysisResult's own identical check.
+    // Approach Selection: same "usable content produced" analytics proxy as
+    // finalizeAnalysisResult's identical check - see its own comment.
     const validBatch = Array.isArray(confirmedPlan.approaches?.simple?.taskChecklist) && confirmedPlan.approaches.simple.taskChecklist.filter(t => typeof t === "string" && t.trim()).length > 0;
     if (validBatch) {
       logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
@@ -5908,6 +5926,60 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
 
   const openProduct = (q) => Linking.openURL(`https://www.amazon.com/s?k=${encodeURIComponent(q)}&tag=uncluttrd20-20`);
+
+  // Approach Selection Phase B (ApproachSelectionDesign.md Section 4): the
+  // ONLY place a preview (previewApproach) ever becomes a durable
+  // commitment. Two writes - selectedApproach and the first approachHistory
+  // entry - must both land before Companion is seeded/shown; on failure the
+  // user stays on Results with previewApproach untouched so they can retry
+  // the same tap immediately, no state lost.
+  const handleStartThisPlan = async () => {
+    if (!previewApproach || !currentPlanId || startingPlan) return;
+    const chosen = results.approaches?.[previewApproach];
+    if (!chosen) return;
+    setStartingPlan(true);
+    try {
+      // Firestore rejects the serverTimestamp() sentinel inside an array
+      // element passed to arrayUnion (it can only resolve at the top level
+      // of a write) - Timestamp.now() is the standard workaround: a real,
+      // already-resolved client timestamp instead of a server-resolved
+      // sentinel. Precise enough for a "when did the user pick this"
+      // record; nothing here depends on server-authoritative time.
+      const historyEntry = { approach: previewApproach, selectedAt: Timestamp.now() };
+      await updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        selectedApproach: previewApproach,
+        approachHistory: arrayUnion(historyEntry),
+      });
+      const items = (chosen.taskChecklist || [])
+        .filter(t => typeof t === "string" && t.trim())
+        .map(text => ({ id: makeItemId(), text, status: "pending" }));
+      const newBatch = { batchIndex: 1, suggestedAt: new Date().toISOString(), items };
+      logEvent(getAnalytics(), "approach_selected", { planId: currentPlanId, approach: previewApproach });
+      // Local echo of both writes, using the same historyEntry object
+      // already sent to Firestore (Timestamp.now() is a real resolved
+      // value, unlike the serverTimestamp() sentinel, so it's safe to
+      // reuse directly instead of constructing a second stand-in value).
+      setResults(prev => prev ? {
+        ...prev,
+        selectedApproach: previewApproach,
+        approachHistory: [...(prev.approachHistory || []), historyEntry],
+        currentBatch: newBatch,
+      } : prev);
+      setHistory(prev => prev.map(h => h.id === currentPlanId ? { ...h, selectedApproach: previewApproach, currentBatch: newBatch } : h));
+      setCompanionBatchIndex(1);
+      setBatchItems(items);
+      setCompanionStage("batch-active");
+      logEvent(getAnalytics(), "batch_shown", { planId: currentPlanId, batchIndex: 1 });
+      setShowCompanion(true);
+      setCompanionEnteredFromResults(true);
+      setTimeout(() => companionScrollRef.current?.scrollTo({ y: 0, animated: false }), 100);
+    } catch (e) {
+      console.log("Start This Plan error:", e.message);
+      Alert.alert("Couldn't start this plan", "Please check your connection and try again.");
+    } finally {
+      setStartingPlan(false);
+    }
+  };
 
   const shareResults = async () => {
     if (!results) return;
@@ -9100,47 +9172,107 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </View>
             );
           })}
-          {/* TEMPORARY (Approach Selection Phase A only -
-              ApproachSelectionDesign.md Section 4 is the REAL Results
-              redesign, not built yet - task instruction 6). Plain
-              dev/inspection rendering so the new schema is actually
-              visible on a real device during Phase A testing - not
-              styled, not final, not reachable by a real user doing
-              anything differently than before (no selection, no "Start
-              This Plan", nothing tappable here routes anywhere). Only
-              renders for a new-format plan (results.approaches present);
-              old-format plans keep rendering the unmodified tier cards
-              above, completely untouched. */}
-          {results.approaches && (
-            <View style={{ marginTop: 20, padding: 14, borderRadius: 10, borderWidth: 2, borderColor: "#DC2626", borderStyle: "dashed", backgroundColor: "#FEF2F2" }}>
-              <Text style={{ fontSize: 12, fontFamily: "Inter_700Bold", color: "#DC2626", marginBottom: 10 }}>
-                DEV ONLY - Approach Selection Phase A (not final UI)
-              </Text>
-              <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 12 }}>scopeSize: {results.scopeSize || "(missing)"}</Text>
-              {["simple", "polished", "elevated"].map((id) => {
+          {/* Approach Selection Phase B (ApproachSelectionDesign.md Section
+              4). Only renders for a new-format plan (results.approaches
+              present) that hasn't been started yet (no batchItems - once
+              "Start This Plan" succeeds, or a started plan is reopened,
+              the currentBatch-driven "Let's Get Started" button below takes
+              over instead). Old-format plans keep rendering the unmodified
+              tier cards above, completely untouched. */}
+          {results.approaches && !batchItems.length && (
+            <View style={{ marginTop: 20 }}>
+              <Text style={s.sectionLabel}>HOW WOULD YOU LIKE TO APPROACH THIS?</Text>
+              {APPROACH_ORDER.map((id) => {
                 const a = results.approaches?.[id];
-                if (!a) return <Text key={id} style={{ color: "#DC2626", marginBottom: 8 }}>{id}: MISSING</Text>;
+                if (!a) return null;
+                const meta = APPROACH_META[id];
+                const expanded = previewApproach === id;
+                // Section 5 (future service-referral extensibility): an
+                // ordered list of recommendation groups, not a single
+                // hardcoded productRecommendations.map(...) call. Today
+                // there is exactly one group (products); a future
+                // serviceRecommendations array joins this list as a second
+                // group with kind: "service" without any change to the
+                // card layout below - only a new branch in the per-item
+                // renderer, same pattern as the existing "product" branch.
+                const recommendationGroups = [
+                  { kind: "product", items: a.productRecommendations || [] },
+                ].filter(g => g.items.length > 0);
                 return (
-                  <View key={id} style={{ marginBottom: 16, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: "#FCA5A5" }}>
-                    <Text style={{ fontSize: 14, fontFamily: "Inter_700Bold", color: "#0F2A52" }}>{id} - {a.estimatedSpendRange}</Text>
-                    <Text style={{ fontSize: 13, color: "#334155", marginTop: 4 }}>{a.strategyDescription}</Text>
-                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>ORGANIZING GUIDANCE</Text>
-                    {(a.organizingGuidance || []).map((g, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• {g}</Text>)}
-                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>TASK CHECKLIST</Text>
-                    {(a.taskChecklist || []).map((t, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>{i + 1}. {t}</Text>)}
-                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>PRODUCT RECOMMENDATIONS ({(a.productRecommendations || []).length})</Text>
-                    {(a.productRecommendations || []).length === 0 ? (
-                      <Text style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic" }}>(none - valid outcome)</Text>
-                    ) : (a.productRecommendations || []).map((p, i) => (
-                      <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• [{p.icon}] {p.productType} - {p.reason} (problem: {p.relatedProblemId}, approach: {p.approachId})</Text>
-                    ))}
-                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>VISUALIZATION DIRECTION</Text>
-                    <Text style={{ fontSize: 12, color: "#334155" }}>{a.visualizationDirection}</Text>
+                  <View key={id} style={[s.approachCard, { borderColor: expanded ? meta.color : BRAND.stone }, expanded && { borderWidth: 2 }]}>
+                    <TouchableOpacity
+                      onPress={() => setPreviewApproach(id)}
+                      activeOpacity={0.8}
+                      accessibilityLabel={`${meta.name}, estimated ${a.estimatedSpendRange}${expanded ? ", expanded" : ""}`}
+                      accessibilityRole="button"
+                    >
+                      <View style={s.approachCardHead}>
+                        <View style={[s.approachPill, { backgroundColor: meta.bg, borderColor: meta.border }]}>
+                          <Text style={[s.approachPillText, { color: meta.color }]}>{meta.name}</Text>
+                        </View>
+                        <Text style={s.approachRange}>{a.estimatedSpendRange}</Text>
+                        <ChevronRight size={16} color={BRAND.mist} strokeWidth={2.25} />
+                      </View>
+                      <Text style={s.approachStrategy}>{a.strategyDescription}</Text>
+                    </TouchableOpacity>
+                    {expanded && (
+                      <View style={s.approachExpanded}>
+                        {(a.organizingGuidance || []).length > 0 && (
+                          <>
+                            <Text style={s.prodLabel}>ORGANIZING GUIDANCE</Text>
+                            {a.organizingGuidance.map((g, i) => (
+                              <View key={i} style={s.step}>
+                                <View style={[s.stepChk, { backgroundColor: meta.bg }]}>
+                                  <Text style={[s.stepChkText, { color: meta.color }]}>✓</Text>
+                                </View>
+                                <Text style={s.stepText}>{g}</Text>
+                              </View>
+                            ))}
+                          </>
+                        )}
+                        {recommendationGroups.length > 0 && (
+                          <>
+                            <Text style={s.prodLabel}>PRODUCT RECOMMENDATIONS</Text>
+                            {recommendationGroups.flatMap((group) => group.items.map((item, i) => {
+                              if (group.kind !== "product") return null;
+                              const Icon = getProductCategoryIcon(item.icon);
+                              return (
+                                <TouchableOpacity
+                                  key={`${group.kind}-${i}`}
+                                  style={s.prodRow}
+                                  onPress={() => { logEvent(getAnalytics(), "product_clicked", { product: item.productType, approach: id }); openProduct(item.searchTerms); }}
+                                  accessibilityLabel={`Shop options for ${item.productType}`}
+                                  accessibilityRole="button"
+                                >
+                                  <View style={[s.prodIco, { backgroundColor: meta.bg }]}>
+                                    <Icon size={15} color={meta.color} strokeWidth={2.25} />
+                                  </View>
+                                  <View style={{ flex: 1 }}>
+                                    <Text style={s.prodName}>{item.productType}</Text>
+                                    <Text style={s.approachProdReason}>{item.reason}</Text>
+                                  </View>
+                                  <Text style={s.approachShopLink}>Shop options →</Text>
+                                </TouchableOpacity>
+                              );
+                            }))}
+                          </>
+                        )}
+                      </View>
+                    )}
                   </View>
                 );
               })}
-              <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 4 }}>PROBLEMS FOUND</Text>
-              {(results.problemsFound || []).map((p, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• [{p.id}] {p.description}</Text>)}
+              {previewApproach && (
+                <TouchableOpacity
+                  style={[s.companionBtn, { marginTop: 8 }]}
+                  onPress={handleStartThisPlan}
+                  disabled={startingPlan}
+                  accessibilityLabel="Start this plan"
+                  accessibilityRole="button"
+                >
+                  <Text style={s.companionBtnText}>{startingPlan ? "Starting..." : "Start This Plan →"}</Text>
+                </TouchableOpacity>
+              )}
             </View>
           )}
           {renderPhotoZoomModal()}
@@ -9956,6 +10088,15 @@ const s = StyleSheet.create({
   prodPrice: { fontSize: 13, fontFamily: "Inter_700Bold" },
   amznBadge: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 },
   amznText: { fontSize: 9, fontFamily: "Inter_700Bold", color: BRAND.mist },
+  approachCard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderRadius: 16, padding: 16, marginBottom: 12 },
+  approachCardHead: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
+  approachPill: { borderWidth: 1, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 10 },
+  approachPillText: { fontSize: 13, fontFamily: "Inter_700Bold" },
+  approachRange: { flex: 1, fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate },
+  approachStrategy: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 19 },
+  approachExpanded: { marginTop: 4, paddingTop: 8, borderTopWidth: 1, borderTopColor: BRAND.offWhite },
+  approachProdReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
+  approachShopLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginLeft: 6 },
   tipBox: { backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 16, flexDirection: "row", marginTop: 4 },
   tipHead: { fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8, color: BRAND.green, marginBottom: 4 },
   tipBody: { fontSize: 14, fontFamily: "Inter_400Regular", color: "#166E38", lineHeight: 20 },
