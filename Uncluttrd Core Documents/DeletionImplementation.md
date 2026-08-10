@@ -116,3 +116,93 @@ function contains any Storage-touching code at all, exactly as designed. Re-runn
 check with a real per-plan upload would be needed to close it out cleanly in a future pass, but
 the design property it was meant to verify (soft-delete never touches Storage) is already
 provably true by inspection.
+
+# Phase C2: Recently Deleted UI with Restore — Implementation Report (2026-08-10)
+
+Builds the user-facing half of the soft-delete model: a small "Recently Deleted" section in My
+Rooms and Room Detail, and real Restore actions. Intentionally minimal — no archive browser, no
+filtering/sorting UI, no undo-toast pattern. Adds one new field (`deletedWithRoomId`) that makes
+cascade ownership deterministic, which Restore Room's own logic depends on.
+
+- Commit: `7bcf3b2` (deletedWithRoomId + restoreRoom/restoreArea + Recently Deleted UI, both
+  screens)
+- OTA (staging): iOS `019feb71-dc7b-7beb-a8f0-c43cbd44a864`, Android `019feb71-dc7b-7d8e-bc34-7fffeb061f8e`
+
+## 1. `deletedWithRoomId` — cascade-ownership marking
+
+`softDeleteRoom` now writes `deletedWithRoomId: roomId` (alongside the existing `retired: true,
+deletedAt`) onto every currently-*live* Area it cascades into, exactly as before except for this
+one extra field. An Area already retired at the time of the Room deletion — whether independently
+soft-deleted or a merge tombstone — is still explicitly skipped (unchanged from Phase C1), so it
+never receives `deletedWithRoomId` at all. This is the sole signal `restoreRoom` uses to decide
+which Areas come back with the Room:
+
+- Delete Area directly: `retired: true, deletedAt` — no `deletedWithRoomId`, ever.
+- Delete Room: Space gets `retired: true, deletedAt`. Each currently-live Area gets `retired:
+  true, deletedAt, deletedWithRoomId: roomId`.
+- Merge/reclassification tombstones: `retired: true` only — no `deletedAt`, no
+  `deletedWithRoomId`. Untouched by any of this, in either direction.
+
+## 2. `restoreRoom(uid, roomId)`
+
+One atomic `writeBatch`: un-retires the Space (clears `retired`/`deletedAt` via `deleteField()`),
+and un-retires only the Areas where `deletedWithRoomId === roomId` (clearing `retired`,
+`deletedAt`, and `deletedWithRoomId` on each). Idempotent — a Room that's already live is a
+no-op (`{outcome: "already-restored"}`), so a double-tap or retry can't do anything the first tap
+didn't. After the batch commits, recomputes the Room's summary and each restored Area's summary
+from live Projects (`updateSpaceRoomSummary`/`updateAreaSummary`, both already Phase-C1-correct
+about excluding retired Areas) — never trusts stale pre-delete summary values back to life
+verbatim.
+
+## 3. `restoreArea(uid, roomId, areaId)`
+
+Single-document mirror of `softDeleteArea`: clears `retired`, `deletedAt`, and
+`deletedWithRoomId` (if present) unconditionally — works identically whether the Area was
+cascade-deleted or independently deleted, since restoring an Area directly always means "bring
+this one back," regardless of how it got here. Also idempotent (`already-restored` no-op).
+Recomputes both the Room's and the Area's own summary afterward, same reasoning as `restoreRoom`.
+
+## 4. UI
+
+- **My Rooms** — new `recentlyDeletedRooms` state, populated in the existing `loadRooms` effect
+  from the *same* already-fetched `allSpaces` array (no second query). Filter:
+  `retired === true && deletedAt exists && within 30 days` — a bare merge tombstone (`retired`,
+  no `deletedAt`) never qualifies. Rendered below the active Room cards, under a "RECENTLY
+  DELETED" section label, only when the list is non-empty. Each row: Room name, "Deleted X days
+  ago" (`formatDeletedAgo`, handles Firestore `Timestamp` via `toMillis()`), and a "Restore"
+  link — gray/quiet text, no Room-type icon, `#F8F9FA` row background, visually secondary to the
+  BRAND-tinted active cards above.
+- **Room Detail** — new `recentlyDeletedAreas` computed inline from the already-loaded
+  `roomDetailAreas` state (same filter, zero new query), rendered as a "RECENTLY DELETED AREAS"
+  section directly below "AREAS IN THIS ROOM," same quiet styling and Restore link.
+- **Handlers** — `handleRestoreRoom` calls `restoreRoom` then refetches just that Space doc (its
+  own summary fields can genuinely change from what was cached pre-delete, unlike a plain
+  delete) and moves it from `recentlyDeletedRooms` into `rooms`. `handleRestoreArea` calls
+  `restoreArea` then locally patches the one Area's `retired`/`deletedAt`/`deletedWithRoomId` in
+  `roomDetailAreas` — the same "local patch, no full re-fetch" convention `handleDeleteArea`
+  already established.
+- No processing overlay, matching Phase C1's Delete actions — both Restore operations are a
+  single doc write or one small atomic batch, no meaningful async work to cover.
+
+## Test results (real staging, throwaway Room fully cleaned up afterward)
+
+30 of 30 assertions passed. Setup: Room with Area A (cascade-delete target), Area B (deleted
+independently *before* the Room), Area C (constructed directly as a merge-tombstone shape —
+`retired: true`, `redirectTo` set, no `deletedAt`, no plans).
+
+| # | Test | Result |
+|---|---|---|
+| a | Soft-delete a Room → retired+deletedAt set, matches My Rooms' Recently Deleted filter | **PASS** (2/2) |
+| b | Soft-delete an Area (B, independently) → retired+deletedAt set, matches Room Detail's Recently Deleted Areas filter | **PASS** (2/2) |
+| c | Restore Room → Room un-retired, cascade-deleted Area A restored, its plan/photo still exist, Room summary recomputed to include it again | **PASS** (5/5) |
+| d | Restore Area (B) → un-retired, plan/visit still exists, Room summary recomputed to include it | **PASS** (4/4) |
+| e | Restore Room with a merge-tombstoned Area (C) present: C stays retired, still no `deletedAt`, unaffected | **PASS** |
+| f | Recently Deleted only shows items within 30 days; after both restores, zero items remain in either section for this Room | **PASS** (4/4) |
+| g | A Room/Area soft-deleted 31 days ago is excluded from the Recently Deleted filter | **PASS** (2/2) |
+| h | Restore is idempotent — a second `restoreRoom` call and a second `restoreArea` call are both no-ops (`already-restored`), state unchanged | **PASS** (3/3) |
+| i | Area B, independently deleted before its Room was deleted, is untouched by the cascade (no `deletedWithRoomId`, `deletedAt` unchanged) and is NOT restored when the Room is restored | **PASS** (4/4) |
+| j | `deletedWithRoomId` present and correct on cascade-deleted Area A, absent on independently-deleted Area B | **PASS** (4/4) |
+
+No gaps found this phase — Phase C1's own retirement guards and hiding-consumer fixes already
+cover everything Restore reactivates (a restored Area/Room simply re-enters all the same
+already-correct `!retired` filters it left).
