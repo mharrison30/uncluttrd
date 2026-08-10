@@ -206,3 +206,180 @@ independently *before* the Room), Area C (constructed directly as a merge-tombst
 No gaps found this phase — Phase C1's own retirement guards and hiding-consumer fixes already
 cover everything Restore reactivates (a restored Area/Room simply re-enters all the same
 already-correct `!retired` filters it left).
+
+# Phase C3: Hard-Delete Engine — Implementation Report (2026-08-10)
+
+Builds the server-side, restartable, idempotent hard-delete primitives `hardDeleteAreaAdmin`/
+`hardDeleteRoomAdmin` (`scripts/runSpaceMigration.js`) — Admin-SDK only, never called from
+user-facing UI. These implement DeletionDesign.md's original Sections 1-3 execution phases
+(steps 3 onward; establishing `retired`/`deletionStatus` is the sweep-selection layer's job, not
+this primitive's), now repurposed as the background retention-cleanup job's (Phase C4) and
+account-deletion's (Phase C5) actual delete engine, per that doc's own "Soft-Delete Revision."
+Naming matches that doc's own forward-referencing snippets (`hardDeleteRoomAdmin`,
+`hardDeleteAreaAdmin`) exactly, so C4/C5 can call these functions as already sketched.
+
+- Commit: (this phase, code only — no OTA, no client changes)
+
+## 1. Recursive Storage cleanup
+
+`deleteStoragePrefixesAdmin(bucket, prefixes)` replaces `deletePlanAdmin`'s prior "no Storage
+cleanup at all" Admin-SDK gap. GCS object keys are flat — `bucket.getFiles({prefix})` already
+returns every object under a prefix at any nesting depth in one call, so `original.jpg` and
+`progress/{timestamp}.jpg` both come back together with no separate walk needed. This is
+categorically different from the client Storage SDK's `listAll()`, which partitions a single
+level into `.items` (this level only) and `.prefixes` (subfolders) and requires recursing into
+`.prefixes` to reach nested content — App.js's own `deletePlan` calls `listAll()` and only ever
+reads `.items` (App.js:6890-6895), which is the literal bug this phase's spec names: progress
+photos are never actually deleted by the client path today.
+
+**Scope decision, stated explicitly**: this phase fixes the gap only on the Admin-SDK path
+(`deletePlanAdmin`, and therefore every hard-delete call). The client-side `App.js` `deletePlan`
+bug is **not** fixed here — this phase's own closing instruction was explicit: "Admin-SDK only,
+no client changes." That client bug remains open, tracked here for a future phase: either apply
+the same one-level `.prefixes` walk `listAll()`'s account-deletion sibling already does
+(App.js:6752-6758, `viz/{uid}`), or replace the client's own Storage cleanup entirely with a call
+into this same Admin-SDK path via a Cloud Function.
+
+Throws (does not swallow) on any listing or delete failure — Invariant 2 requires
+`deletePlanAdmin`'s caller to be able to tell Storage cleanup genuinely completed, not just
+attempted.
+
+## 2. `deletePlanAdmin` revisions
+
+Two deliberate changes from the Phase C1/C2-era mirror, both required by this phase's Invariant 2:
+
+- **Storage-first ordering.** Storage cleanup now runs *before* the Firestore plan doc is
+  touched — the reverse of App.js's own `deletePlan` ordering (Firestore first, Storage
+  best-effort after, explicitly accepting an orphaned image as low-stakes for that single-tap
+  "delete from My Plans" flow). Hard-delete needs the opposite tradeoff: the plan document itself
+  is this function's own restart marker for its Storage cleanup. As long as it still exists, a
+  retried `hardDeleteAreaAdmin`'s own `where("areaId","==",areaId)` query finds it again and
+  retries Storage cleanup. Deleting the Firestore doc first would make a failed Storage cleanup
+  permanently unreachable on retry — nothing durable left to requery by (the exact gap
+  DeletionDesign.md's own Addendum already flagged: "Where live-state discovery genuinely falls
+  short: Storage, not Firestore"). This ordering change applies to **every** caller, not just
+  hard-delete, per the task's own "applies to ALL plan deletions going forward."
+- **`{ manageParentSpace = true }`.** When `false` (`hardDeleteAreaAdmin`/`hardDeleteRoomAdmin`'s
+  own usage), skips the "delete the Space if no sibling Projects remain" / summary-recompute
+  branch entirely. A real bug this closes, found while implementing (not hypothetical): without
+  this, `deletePlanAdmin`'s own existing "auto-delete the Space when its last Project goes" side
+  effect could delete the Room document mid-way through `hardDeleteRoomAdmin`'s own per-Area loop
+  — e.g. while processing Area 2 of 3, if that Area's last plan happens to also be the *Room's*
+  last surviving Project. If the process then crashed before Area 3 finished, a retry's own
+  first check (`spaceSnap.exists`) would see the Room already gone and report `already-deleted`,
+  **skipping Area 3 and its plans/Storage entirely** — a real data-loss-on-restart bug, not just
+  an ordering nicety. The parent Space/Area document must be removed *exclusively* by its own
+  engine's explicit final step. Every other caller (the original single-plan delete flow) keeps
+  the original auto-cleanup behavior, unchanged, as the default.
+
+## 3. Merge-candidate reconciliation, scoped (Invariant 3)
+
+`detectAndPersistMergeCandidatesForUser(db, uid, scopeSpaceTypes = null)` gained one optional
+parameter. When supplied, reconciliation is restricted to just those spaceTypes instead of the
+account's full spaceType set — every existing full-account caller (`main()`'s own detect pass)
+passes nothing and is unaffected.
+
+`snapshotAffectedMergeCandidates(db, uid, planIds)` — new — given a set of plan IDs about to be
+hard-deleted, finds every `mergeCandidates` document referencing at least one of them, captured
+**before** any deletion happens, returning `{ candidateIds, spaceTypes }`. Both
+`hardDeleteAreaAdmin` and `hardDeleteRoomAdmin` call this first, then pass the captured
+`spaceTypes` into the scoped reconciliation call after deletion — never rediscovering the
+plan↔candidate join from data the operation itself just destroyed. `candidateIds` is carried
+through into each function's own return value, for introspection/tests.
+
+The underlying reconciliation logic itself (`evaluateCandidateInvalidation`) is unmodified —
+still "reuse unmodified," per DeletionDesign.md Section 1's original decision. This phase only
+adds the ability to scope *which* spaceTypes a given call bothers reconciling, in service of
+Invariant 3.
+
+## 4. `hardDeleteAreaAdmin(db, uid, roomId, areaId)`
+
+a. Query `plans` where `areaId == areaId` (unscoped by Room — `areaId` has no Room prefix of its
+   own); verify each candidate's `computeShadowIds(planId, plan).spaceId === roomId` (Invariant 1)
+   before including it. A candidate whose own canonical Space resolves elsewhere is left
+   completely untouched, not just skipped-with-a-warning — returned in `skippedWrongRoomPlanIds`.
+b/c. Delete each verified plan via `deletePlanAdmin(..., {manageParentSpace: false})`. Abort
+   immediately on the first failure — the Area document is left exactly as-is, the restart marker.
+d. Reconcile merge candidates from the Invariant-3 snapshot.
+e. Recompute the parent Room's summary — safe even if the Room is itself mid-hard-delete or
+   already gone, since `updateSpaceRoomSummaryAdmin` already catches and no-ops internally.
+f. Hard-delete the Area document. Sole step that removes the restart marker.
+
+Idempotent/restartable **by construction**, not by any stored checkpoint (Restartability
+Principle, SpaceMemoryModel.md §12 — the same discipline this whole file already commits to
+elsewhere, not a new pattern introduced here): a missing Area doc is a no-op; a present one
+re-derives exactly which plans are still actually left via the same live query, regardless of how
+many prior attempts partially succeeded.
+
+## 5. `hardDeleteRoomAdmin(db, uid, roomId)`
+
+a. Load **all** Areas under the Room, including already-retired ones from prior merges — they
+   still have real shadow data (Projects/Sessions/Batches under whatever plans point at them)
+   needing the same cleanup as any live Area.
+b. Snapshot every plan genuinely belonging to this Room — its own founding plan (doc id ===
+   roomId) OR any plan whose `canonicalSpaceId === roomId` — captured before any deletion.
+   Separately compute `wholeRoomPlanIds` (no `areaId`) — the ones the per-Area loop below will
+   never see, since `hardDeleteAreaAdmin` only ever queries plans by `areaId`.
+c. Hard-delete every Area via `hardDeleteAreaAdmin` as a sub-routine — single source of truth for
+   Area-deletion semantics, not reimplemented inline. Abort immediately on the first failure — the
+   Space document (and any not-yet-processed Area) remains as the restart marker.
+d. Delete whatever plans remain directly under the Room — whole-Room visits and legacy
+   `areaId`-less plans.
+e. Reconcile merge candidates from the Invariant-3 snapshot — this pass specifically matters for
+   candidates referencing whole-Room-visit plans, which no per-Area reconciliation pass would ever
+   have seen. Also a harmless, idempotent second pass over any spaceType an Area-level call
+   already reconciled (confirmed by direct testing — a `"superseded"` candidate re-encountered
+   here is simply re-confirmed `"kept-superseded"`, never re-processed).
+f. Hard-delete the Space document. Sole step that removes the restart marker.
+
+**Invariant 4 (inbound tombstone policy), stated explicitly per the task spec**: neither function
+queries for, walks, or touches any *other* Space/Area elsewhere whose `redirectTo` points at the
+thing being deleted. Those are historical lineage from a prior merge/reclassification *into* the
+now-being-deleted target — already hidden from every user-facing surface via the existing
+`retired` filter regardless of whether their redirect target still exists (matches
+DeletionDesign.md Section 4's "leave orphaned redirects as-is" decision, and this codebase's
+established "never physically delete audit trail" convention for `mergeCandidates`/
+`reclassificationExecutions`). They remain, with a now-dangling historical `redirectTo`, until
+account deletion — which hard-deletes every Room the account owns, tombstones included, by
+iterating every Space document directly, never by following redirects.
+
+Both functions are unconditional destroy primitives: neither checks or requires
+`retired`/`deletedAt` itself. That decision belongs entirely to the caller — the retention sweep's
+own cutoff query (Phase C4), or account deletion bypassing retention checks entirely (Phase C5).
+
+## Test results (real staging, throwaway data fully cleaned up afterward)
+
+33 of 33 assertions passed. Setup: Room X with Area A (2 plans, one carrying real `progress/`
+Storage content), Area B (1 plan), Area C (0 plans), Area D (already-retired merge-tombstone
+shape, 1 live plan), Area E (1 plan, reserved for the Storage-failure simulation), Area F (3
+plans, reserved for the restart-after-partial-failure simulation), a whole-Room visit, a legacy
+plan with no `areaId` field at all, an unrelated "wrong-room" plan whose `areaId` collides with
+Area A's but whose own canonical Space is not Room X, a `mergeCandidates` document referencing two
+of Room X's plans, and a separate Room Z retired with `redirectTo` pointing at Room X (the inbound
+tombstone).
+
+| # | Test | Result |
+|---|---|---|
+| a | `hardDeleteAreaAdmin`(Area A): Area + both plans + shadow Project gone; parent Room survives with correctly recomputed `visitCount` | **PASS** (7/7) |
+| b | `hardDeleteRoomAdmin`(Room X): Room, all remaining Areas (B/D/E), all their plans/shadows, all Storage gone; nothing remains | **PASS** (5/5) |
+| c | Whole-Room visit (`areaId: null`) caught by `hardDeleteRoomAdmin` | **PASS** |
+| d | Legacy plan with no `areaId` field caught by `hardDeleteRoomAdmin` | **PASS** |
+| e | Recursive Storage cleanup: Area A's plan's `original.jpg` **and** `progress/` subfolder object both genuinely removed | **PASS** |
+| f | Already-retired Area D (merge-tombstone shape) — and its still-live plan — cleaned up by `hardDeleteRoomAdmin`; Area E (left fully untouched by test m's aborted attempt) cleaned up fresh in the same pass, Storage included | **PASS** (3/3) |
+| g | Merge candidate reconciled from the pre-deletion snapshot: a `"dismissed"` candidate referencing Area A's founding plan transitions to `"superseded"` once that plan is gone; `hardDeleteAreaAdmin`'s own return value lists the captured candidate id | **PASS** (2/2) |
+| h | Re-running `hardDeleteAreaAdmin` on an already-deleted Area is a no-op (`already-deleted`) | **PASS** |
+| i | Re-running `hardDeleteRoomAdmin` on an already-deleted Room is a no-op (`already-deleted`) | **PASS** |
+| j | Restart after partial failure: Area F with 2 of 3 plans already gone (simulated via direct out-of-band cleanup, deterministic rather than racing live query order mid-abort) and its Area doc still present — a fresh `hardDeleteAreaAdmin` call finds only the one remaining plan and completes correctly | **PASS** (3/3) |
+| k | `hardDeleteAreaAdmin` on a zero-plan Area (C): Area doc removed, `deletedPlanCount: 0`, no errors | **PASS** (2/2) |
+| l | Room-scoped verification: a plan with Area A's `areaId` but a different (self) canonical Space is never deleted, at both the Area level and confirmed still true after the Room-level pass; reported in `skippedWrongRoomPlanIds` | **PASS** (3/3) |
+| m | Storage failure (simulated via a targeted `File.prototype.delete` override for one exact object — every other Storage/Firestore operation in the run stayed fully real) aborts `hardDeleteAreaAdmin` *before* the Area doc or the plan's Firestore doc are touched; the real Storage object is confirmed still present, not silently gone | **PASS** (4/4) |
+| n | Inbound tombstone Room Z (`retired: true, redirectTo: roomId`) is not walked, not touched, not deleted by Room X's hard-delete — still present with its redirect intact afterward | **PASS** |
+
+**One real gap found and fixed during implementation, not just during testing**: the
+`manageParentSpace` option (Section 2) — without it, `hardDeleteRoomAdmin` could lose track of
+not-yet-processed Areas after a mid-run crash, because `deletePlanAdmin`'s own pre-existing
+"auto-delete the Space when its last Project goes" side effect could remove the Room's restart
+marker early. Caught by reasoning through the exact crash-recovery scenario while implementing,
+confirmed by direct code reading of `deletePlanAdmin`'s original sibling-Project-count logic, not
+by a failing test (the test suite's own restart scenario, test j, is scoped to the Area level,
+where this specific failure mode doesn't arise).

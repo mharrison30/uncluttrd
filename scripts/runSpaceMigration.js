@@ -187,24 +187,87 @@ async function backfillRoomSummariesAdmin(db) {
   return results;
 }
 
+// ---- Phase C3 (DeletionDesign.md, "Recursive Storage cleanup"): the
+// recursive Storage-prefix walk deletePlanAdmin now uses. ----
+// GCS object keys are flat - there is no real directory hierarchy, so
+// bucket.getFiles({prefix}) already returns EVERY object whose key starts
+// with that prefix, at any nesting depth, in one call: original.jpg AND
+// progress/{timestamp}.jpg under the same plans/{uid}/{planId}/ prefix
+// both come back together, with no separate walk needed for the
+// progress/ "subfolder". This is categorically different from the client
+// Storage SDK's listAll(), which partitions a single level into .items
+// (this level's files only) and .prefixes (subfolders), and requires
+// recursing into .prefixes to reach nested content - App.js's own
+// deletePlan calls listAll() and only ever reads .items (App.js:6890-6895),
+// which is the literal, still-open bug this phase's spec names: progress
+// photos are never actually deleted by the client path today. That
+// client-side fix is out of scope for this Admin-SDK-only phase (see the
+// implementation report) - this function closes the equivalent gap for
+// every Admin-SDK deletion path (hard-delete included) by construction,
+// not by literally recursing the same way the client would have to.
+// Throws (does not swallow) on any listing or delete failure - Invariant 2
+// requires deletePlanAdmin's caller to be able to tell Storage cleanup
+// genuinely completed.
+async function deleteStoragePrefixesAdmin(bucket, prefixes) {
+  for (const prefix of prefixes) {
+    // Trailing slash matters: without it, "plans/uid/abc" would also match
+    // a sibling "plans/uid/abc123/..." object by bare string-prefix
+    // collision. Astronomically unlikely with random plan IDs, but free to
+    // guard against and matches the client SDK's own folder-ref semantics.
+    const [files] = await bucket.getFiles({ prefix: `${prefix}/` });
+    await Promise.all(files.map((f) => f.delete()));
+  }
+}
+
 // ---- My Rooms -> True Room Grouping, rollout closeout item 2: deletePlan
 // summary maintenance (Admin-SDK mirror) ----
-// Mirrors App.js's deletePlan + deleteSpaceShadowGraph 1:1, including the
-// new item-2 step: if the Space survives (other Projects remain), its
-// summary is recomputed from what's actually left via
-// updateSpaceRoomSummaryAdmin - the exact same idempotent mechanism every
-// other mutation already uses. If the Space itself was the last Project
-// and got removed, there's nothing left to summarize, so it's skipped,
-// matching the real client's own new logic. Storage cleanup is
-// deliberately NOT mirrored here - that part of deletePlan is unchanged
-// by this task and isn't what's being tested.
-async function deletePlanAdmin(db, uid, planId) {
+// Mirrors App.js's deletePlan + deleteSpaceShadowGraph, with two Phase C3
+// (DeletionDesign.md/hard-delete Invariant 2) revisions from the original
+// 1:1 mirror:
+//
+// 1. Storage cleanup now runs FIRST, before the Firestore plan doc is
+//    touched, and THROWS on failure (never swallowed). This is a
+//    deliberate reversal of App.js's own deletePlan ordering (Firestore
+//    first, Storage best-effort after, explicitly accepting an orphaned
+//    image as a low-stakes failure mode for that single-tap "delete from
+//    My Plans" flow - see its own comment). Hard-delete needs the opposite
+//    tradeoff: the plan document itself is this function's own restart
+//    marker for its Storage cleanup. As long as it still exists, a retried
+//    hardDeleteAreaAdmin's own `where("areaId","==",areaId)` query will
+//    find it again and retry Storage cleanup. Delete the Firestore doc
+//    FIRST and a failed Storage cleanup becomes permanently unreachable on
+//    retry - nothing durable is left to requery by (see
+//    DeletionDesign.md's own Addendum on this exact Storage-orphan gap).
+//    This new ordering/throw behavior applies to every caller, not just
+//    hard-delete - "This applies to ALL plan deletions going forward."
+// 2. `{ manageParentSpace = true }`: when false (hardDeleteAreaAdmin/
+//    hardDeleteRoomAdmin's own usage), this function skips its own
+//    "delete the Space if no sibling Projects remain" / summary-recompute
+//    branch entirely. The Space (Room) document is the HARD-DELETE
+//    ENGINE's own parent-last restart marker (Invariant 2) - it must be
+//    removed exclusively by hardDeleteRoomAdmin's own explicit final step,
+//    never as an incidental side effect of deleting whichever plan happens
+//    to be a Room's last surviving Project mid-loop (which could delete
+//    the Space early, before later Areas/plans in the same hard-delete run
+//    have been processed - see the implementation report for the full
+//    failure scenario this prevents). Every other caller (the original
+//    single-plan "delete from My Plans" flow) keeps the original
+//    auto-cleanup behavior, unchanged, as the default.
+async function deletePlanAdmin(db, uid, planId, { manageParentSpace = true } = {}) {
   const userRef = db.collection("users").doc(uid);
   const planRef = userRef.collection("plans").doc(planId);
   const planSnap = await planRef.get();
   const canonicalSpaceId = planSnap.exists ? (planSnap.data().canonicalSpaceId || null) : null;
   // Area Identity, Phase A - mirrors App.js's deletePlan 1:1.
   const deletedPlanAreaId = planSnap.exists ? (planSnap.data().areaId || null) : null;
+
+  // Requires the caller's admin.initializeApp() to have set storageBucket
+  // (see scripts/seedMergeProposalTestData.js's own identical convention) -
+  // admin.storage().bucket() with no args resolves to that configured
+  // default bucket.
+  const bucket = admin.storage().bucket();
+  await deleteStoragePrefixesAdmin(bucket, [`plans/${uid}/${planId}`, `viz/${uid}/${planId}`]);
+
   await planRef.delete();
 
   const spaceId = canonicalSpaceId || planId;
@@ -220,17 +283,19 @@ async function deletePlanAdmin(db, uid, planId) {
   await projectRef.delete().catch(() => {});
 
   let spaceDeleted = false;
-  if (!hasSiblingProjects) {
-    await spaceRef.delete();
-    spaceDeleted = true;
-  } else {
-    await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
-  }
-  // Area Identity, Phase A - unconditional on spaceDeleted, mirrors
-  // App.js's deletePlan 1:1 (see its own comment for why - the Area
-  // document doesn't require its parent Space to still exist).
-  if (deletedPlanAreaId) {
-    await updateAreaSummaryAdmin(db, uid, spaceId, deletedPlanAreaId);
+  if (manageParentSpace) {
+    if (!hasSiblingProjects) {
+      await spaceRef.delete();
+      spaceDeleted = true;
+    } else {
+      await updateSpaceRoomSummaryAdmin(db, uid, spaceId);
+    }
+    // Area Identity, Phase A - unconditional on spaceDeleted, mirrors
+    // App.js's deletePlan 1:1 (see its own comment for why - the Area
+    // document doesn't require its parent Space to still exist).
+    if (deletedPlanAreaId) {
+      await updateAreaSummaryAdmin(db, uid, spaceId, deletedPlanAreaId);
+    }
   }
   return { outcome: "deleted", spaceDeleted, spaceId, areaId: deletedPlanAreaId };
 }
@@ -722,7 +787,7 @@ async function migratePlan(db, uid, planId, { dryRun }) {
  * genuine Firestore I/O failure, which the caller (main()) catches per
  * user, exactly mirroring migratePlan's per-plan isolation.
  */
-async function detectAndPersistMergeCandidatesForUser(db, uid) {
+async function detectAndPersistMergeCandidatesForUser(db, uid, scopeSpaceTypes = null) {
   const userRef = db.collection("users").doc(uid);
   const plansSnap = await userRef.collection("plans").get();
   const allPlans = plansSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
@@ -752,8 +817,20 @@ async function detectAndPersistMergeCandidatesForUser(db, uid) {
   // raw cluster has disappeared but a stale document still needs
   // reconciling).
   const existingSnap = await candidatesRef.get();
-  const spaceTypesToReconcile = new Set(currentBySpaceType.keys());
+  let spaceTypesToReconcile = new Set(currentBySpaceType.keys());
   existingSnap.docs.forEach((d) => spaceTypesToReconcile.add(d.data().spaceType));
+  // Phase C3 (hard-delete Invariant 3): a caller that already knows exactly
+  // which spaceTypes are affected - captured from a pre-deletion snapshot
+  // of the merge-candidate documents that referenced the plans about to be
+  // destroyed, via snapshotAffectedMergeCandidates below - can pass that
+  // set here to restrict reconciliation to just those, instead of the
+  // account's full spaceType set. Every full-account caller (main() below,
+  // hardDeleteAreaAdmin/hardDeleteRoomAdmin's own callers if they ever want
+  // a full sweep) passes nothing and is completely unaffected - default
+  // behavior, unchanged.
+  if (scopeSpaceTypes) {
+    spaceTypesToReconcile = new Set([...spaceTypesToReconcile].filter((st) => scopeSpaceTypes.has(st)));
+  }
 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const actions = [];
@@ -869,6 +946,221 @@ async function detectAndPersistMergeCandidatesForUser(db, uid) {
   return actions;
 }
 
+// ---- Phase C3: hard-delete engine (DeletionDesign.md's original Sections
+// 1-3, now the background-cleanup/account-deletion implementation - see
+// that doc's "Soft-Delete Revision" section). Admin-SDK only - never
+// called from user-facing UI. Both functions are unconditional destroy
+// primitives: neither checks/requires `retired`/`deletedAt` itself, since
+// by the time either is invoked (the retention sweep's own cutoff query,
+// or account deletion bypassing retention entirely) that decision has
+// already been made by the caller - these two only ever answer "make it
+// actually gone," never "should it be gone." ----
+
+// Invariant 3 (snapshot before delete): given the exact set of plan IDs
+// about to be hard-deleted, finds every mergeCandidates document that
+// references at least one of them, captured BEFORE any deletion happens -
+// so post-deletion reconciliation (detectAndPersistMergeCandidatesForUser's
+// own scopeSpaceTypes param, above) never has to rediscover this join from
+// plan/Area/Space data this same operation is about to destroy. Returns
+// { candidateIds, spaceTypes } - candidateIds purely for
+// logging/introspection/tests; spaceTypes is what reconciliation actually
+// consumes, since candidates are reconciled per-spaceType, not per-id.
+async function snapshotAffectedMergeCandidates(db, uid, planIds) {
+  const candidateIds = [];
+  const spaceTypes = new Set();
+  if (!planIds || !planIds.length) return { candidateIds, spaceTypes };
+  const planIdSet = new Set(planIds);
+  const candidatesSnap = await db.collection("users").doc(uid).collection("mergeCandidates").get();
+  candidatesSnap.docs.forEach((d) => {
+    const data = d.data();
+    if ((data.planIds || []).some((pid) => planIdSet.has(pid))) {
+      candidateIds.push(d.id);
+      spaceTypes.add(data.spaceType);
+    }
+  });
+  return { candidateIds, spaceTypes };
+}
+
+/**
+ * hardDeleteAreaAdmin(db, uid, roomId, areaId) - DeletionDesign.md Section
+ * 1/2 "Delete Area", steps 3-5 (steps 1-2, establishing `retired`/
+ * `deletionStatus`, belong to the soft-delete/sweep-selection layer, not
+ * this primitive).
+ *
+ * Restartable/idempotent by construction, not by any stored checkpoint
+ * (Restartability Principle, SpaceMemoryModel.md §12, same discipline this
+ * whole file already commits to elsewhere): every call re-derives "what's
+ * left" from a live query. An Area doc that's already gone (prior run
+ * completed) is a no-op. An Area doc that's still present because a prior
+ * run aborted partway through its plan loop (Invariant 2) is safe to
+ * re-enter - step (a)'s own query naturally only finds whatever plans are
+ * still actually there.
+ */
+async function hardDeleteAreaAdmin(db, uid, roomId, areaId) {
+  const areaRef = db.collection("users").doc(uid).collection("spaces").doc(roomId).collection("areas").doc(areaId);
+  const areaSnap = await areaRef.get();
+  if (!areaSnap.exists) return { outcome: "already-deleted" };
+
+  // a. Snapshot candidate plans by areaId, then verify Room ownership
+  // (Invariant 1) - areaId alone is not sufficient authorization for
+  // permanent deletion. A candidate plan whose OWN canonical Space
+  // (computeShadowIds, the same resolution every other shadow function in
+  // this file uses) doesn't actually resolve to roomId is left completely
+  // untouched, not just skipped-with-a-warning.
+  const candidateSnap = await db.collection("users").doc(uid).collection("plans").where("areaId", "==", areaId).get();
+  const verifiedPlanIds = [];
+  const skippedWrongRoomPlanIds = [];
+  candidateSnap.docs.forEach((d) => {
+    const plan = d.data();
+    if (computeShadowIds(d.id, plan).spaceId === roomId) verifiedPlanIds.push(d.id);
+    else skippedWrongRoomPlanIds.push(d.id);
+  });
+
+  // Invariant 3: captured now, from the verified set, before any plan is
+  // touched.
+  const { candidateIds: affectedCandidateIds, spaceTypes: affectedSpaceTypes } = await snapshotAffectedMergeCandidates(db, uid, verifiedPlanIds);
+
+  // b/c. Delete each verified plan (Storage-first, throws on failure - see
+  // deletePlanAdmin's own comment); abort immediately at the first failure
+  // (Invariant 2) - the Area document remains exactly as-is, the restart
+  // marker for a future retry. manageParentSpace:false - the parent Room
+  // is hardDeleteRoomAdmin's own concern, never an incidental side effect
+  // of an Area-level plan deletion (see deletePlanAdmin's own comment for
+  // the specific failure scenario this avoids).
+  let deletedPlanCount = 0;
+  for (const planId of verifiedPlanIds) {
+    try {
+      await deletePlanAdmin(db, uid, planId, { manageParentSpace: false });
+      deletedPlanCount++;
+    } catch (e) {
+      return { outcome: "failed", reason: "plan-delete-failed", planId, error: e.message, deletedPlanCount, areaId, roomId };
+    }
+  }
+
+  // d. Reconcile from the Invariant-3 snapshot, not by rediscovering
+  // references from data this function just destroyed.
+  if (affectedSpaceTypes.size) {
+    await detectAndPersistMergeCandidatesForUser(db, uid, affectedSpaceTypes);
+  }
+
+  // e. Recompute the parent Room's summary, if it still exists.
+  // updateSpaceRoomSummaryAdmin already no-ops safely on its own (catches
+  // internally, logs, returns null) against a Room that's mid-hard-delete
+  // of its own or already gone - no existence check needed first.
+  await updateSpaceRoomSummaryAdmin(db, uid, roomId);
+
+  // f. Only now - every verified plan confirmed gone - remove the Area
+  // document itself. Sole step that removes the restart marker.
+  await areaRef.delete();
+  return { outcome: "hard-deleted", deletedPlanCount, skippedWrongRoomPlanIds, affectedCandidateIds, roomId, areaId };
+}
+
+/**
+ * hardDeleteRoomAdmin(db, uid, roomId) - DeletionDesign.md Section 1/2
+ * "Delete Room", steps 3-6 (steps 1-2/7-8 - establishing `retired`/
+ * `deletionStatus`, and the no-op confirmation that reclassification/merge
+ * lineage is untouched - belong to the sweep-selection layer/are asserted
+ * by Invariant 4 below, not implemented as code here).
+ *
+ * Same Restartability Principle as hardDeleteAreaAdmin above: a Space doc
+ * that's already gone (prior run completed) is a no-op; one still present
+ * because a prior run aborted mid-Area-loop resumes correctly, since every
+ * enumeration step (Areas, whole-Room plans) is a live query against
+ * whatever actually remains.
+ *
+ * Invariant 4 (inbound tombstone policy), stated explicitly per the task
+ * spec: this function does NOT query for, walk, or touch any OTHER
+ * Space/Area elsewhere whose `redirectTo` happens to point at this roomId
+ * (or at an Area under it). Those are historical lineage from a PRIOR
+ * merge/reclassification into this now-being-deleted Room - already
+ * hidden from every user-facing surface via the existing `retired` filter,
+ * regardless of whether their redirect target still exists (matches
+ * DeletionDesign.md Section 4's "leave orphaned redirects as-is" decision
+ * and this codebase's established "never physically delete audit trail"
+ * convention for mergeCandidates/reclassificationExecutions). They remain,
+ * with a now-dangling historical redirectTo, until account deletion (which
+ * hard-deletes every Room the account owns, tombstones included, by
+ * iterating every Space document directly rather than by following
+ * redirects).
+ */
+async function hardDeleteRoomAdmin(db, uid, roomId) {
+  const spaceRef = db.collection("users").doc(uid).collection("spaces").doc(roomId);
+  const spaceSnap = await spaceRef.get();
+  if (!spaceSnap.exists) return { outcome: "already-deleted" };
+
+  // a. Load ALL Areas under this Room, including already-retired ones from
+  // prior merges - they still have their own shadow data (Projects/
+  // Sessions/Batches under whatever plans point at them) that needs the
+  // same cleanup as any live Area's.
+  const areasSnap = await spaceRef.collection("areas").get();
+  const areaIds = areasSnap.docs.map((d) => d.id);
+
+  // b. Snapshot every plan genuinely belonging to this Room - its own
+  // founding plan (doc id === roomId, the computeShadowIds default when no
+  // canonicalSpaceId is set) OR any plan whose canonicalSpaceId === roomId
+  // - captured BEFORE any deletion, per Invariant 3, so post-deletion
+  // merge-candidate reconciliation never has to rediscover this join from
+  // data this very function is about to destroy.
+  const [byCanonicalSnap, ownPlanSnap] = await Promise.all([
+    db.collection("users").doc(uid).collection("plans").where("canonicalSpaceId", "==", roomId).get(),
+    db.collection("users").doc(uid).collection("plans").doc(roomId).get(),
+  ]);
+  const roomPlanDataById = new Map();
+  byCanonicalSnap.docs.forEach((d) => roomPlanDataById.set(d.id, d.data()));
+  if (ownPlanSnap.exists) roomPlanDataById.set(ownPlanSnap.id, ownPlanSnap.data());
+  const allRoomPlanIds = [...roomPlanDataById.keys()];
+  // Whole-Room visits (areaId: null) and legacy plans (areaId absent) -
+  // the ones NOT covered by the per-Area loop below, since
+  // hardDeleteAreaAdmin only ever queries plans by areaId.
+  const wholeRoomPlanIds = allRoomPlanIds.filter((id) => !roomPlanDataById.get(id).areaId);
+
+  const { candidateIds: affectedCandidateIds, spaceTypes: affectedSpaceTypes } = await snapshotAffectedMergeCandidates(db, uid, allRoomPlanIds);
+
+  // c. Hard-delete every Area, via hardDeleteAreaAdmin as a sub-routine -
+  // single source of truth for Area-deletion semantics, not reimplemented
+  // inline. Abort immediately on the first failure - the Space document
+  // (and any not-yet-processed Area) remains as the restart marker,
+  // Invariant 2's parent-last rule one level up.
+  for (const areaId of areaIds) {
+    const areaResult = await hardDeleteAreaAdmin(db, uid, roomId, areaId);
+    if (areaResult.outcome !== "hard-deleted" && areaResult.outcome !== "already-deleted") {
+      return { outcome: "failed", reason: "area-delete-failed", areaId, areaResult, roomId };
+    }
+  }
+
+  // d. Delete whatever plans remain directly under this Room - whole-Room
+  // visits and legacy areaId-less plans, never touched by the per-Area
+  // loop above. Same manageParentSpace:false reasoning as hardDeleteAreaAdmin.
+  let deletedWholeRoomPlanCount = 0;
+  for (const planId of wholeRoomPlanIds) {
+    try {
+      await deletePlanAdmin(db, uid, planId, { manageParentSpace: false });
+      deletedWholeRoomPlanCount++;
+    } catch (e) {
+      return { outcome: "failed", reason: "plan-delete-failed", planId, error: e.message, deletedWholeRoomPlanCount, roomId };
+    }
+  }
+
+  // e. Reconcile merge candidates from the Invariant-3 snapshot - this
+  // pass specifically matters for candidates referencing whole-Room-visit
+  // plans, which no per-Area reconciliation pass above would ever have
+  // seen (each of those only scans plans by areaId). Also a harmless,
+  // idempotent second pass over any spaceType an Area-level call already
+  // reconciled.
+  if (affectedSpaceTypes.size) {
+    await detectAndPersistMergeCandidatesForUser(db, uid, affectedSpaceTypes);
+  }
+
+  // f. Only now - every child Area and every remaining plan confirmed
+  // gone - remove the Space document itself. Sole step that removes the
+  // restart marker. Tolerant of not-found: deletePlanAdmin's own
+  // manageParentSpace:false calls above never touch this doc, but a
+  // hypothetical stray external delete between step (a) and here is still
+  // handled gracefully by Firestore's own delete-of-nonexistent-doc no-op.
+  await spaceRef.delete();
+  return { outcome: "hard-deleted", areaCount: areaIds.length, deletedWholeRoomPlanCount, affectedCandidateIds, roomId };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const projectId = args.project || "cluttrd-3e335";
@@ -970,5 +1262,6 @@ if (require.main === module) {
     syncPlanToSpaceGraphAdmin, renameSpaceAdmin, savePlanToHistoryAdmin, findRecognitionCandidatesAdmin,
     carryForwardUnresolvedItemsAdmin, updateSpaceRoomSummaryAdmin, backfillRoomSummariesAdmin, deletePlanAdmin,
     updateAreaSummaryAdmin, createAreaForPlanAdmin, renameAreaAdmin,
+    deleteStoragePrefixesAdmin, snapshotAffectedMergeCandidates, hardDeleteAreaAdmin, hardDeleteRoomAdmin,
   };
 }
