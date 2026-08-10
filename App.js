@@ -24,7 +24,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -1224,6 +1224,368 @@ async function renameSpace(uid, planId, newName) {
     .catch((e) => dlog(`[SPACE RENAME] displayName propagation failed for space ${spaceId}: ${e.message}`));
   syncPlanToSpaceGraph(uid, planId).catch((e) => dlog(`[SPACE SHADOW SYNC] rename sync failed for plan ${planId}: ${e.message}`));
   return { outcome: "renamed", planId, spaceName: newName };
+}
+
+// ---- Legacy Reclassification, Client-SDK mirror
+// (LegacyReclassificationDesign.md §2) - Room Rename's "Move plans to
+// [Room]" correction path (Room Rename Validation, 2026-08-10). Line-for-
+// line the same phase sequence and status machine as
+// scripts/reclassifyLegacyPlan.js's Admin-SDK version, already proven
+// against the real Entertainment Center case - that script is left
+// completely unchanged for CLI/staging-test use; this is a parallel
+// client-SDK shell around the identical logic so an ordinary user's tap
+// in the live app can drive it directly. Every phase is independently
+// resumable via the same reclassificationExecutions/{planId} status
+// document; the orchestrator (reclassifyLegacyPlan, below) is safe to
+// call repeatedly.
+//
+// One deliberate difference from the Admin version: cleanUpOldSpace can't
+// use listCollections() (Admin-SDK-only, no client-SDK equivalent - the
+// client security model doesn't allow subcollection discovery) - it
+// walks the KNOWN, fixed shadow shape (Project -> Sessions -> Batches,
+// the only shape deriveFullReprojectionDocs ever writes) explicitly
+// instead of a generic recursive delete.
+async function deleteProjectSubtree(uid, spaceId, projectId) {
+  const sessionsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions"));
+  for (const sessionDoc of sessionsSnap.docs) {
+    const batchesSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects", projectId, "sessions", sessionDoc.id, "batches"));
+    for (const batchDoc of batchesSnap.docs) {
+      await deleteDoc(batchDoc.ref);
+    }
+    await deleteDoc(sessionDoc.ref);
+  }
+  await deleteDoc(doc(db, "users", uid, "spaces", spaceId, "projects", projectId)).catch(() => {});
+}
+
+// ---- Phase 1: claim (validate target, idempotency, capture oldSpaceId) ----
+async function claimReclassification(uid, planId, request) {
+  const { targetSpaceId, requestedRoomName, requestedAreaName, requestedAreaScope = "sub-area" } = request;
+  const planRef = doc(db, "users", uid, "plans", planId);
+  const targetSpaceRef = doc(db, "users", uid, "spaces", targetSpaceId);
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+
+  return runTransaction(db, async (tx) => {
+    const planSnap = await tx.get(planRef);
+    if (!planSnap.exists()) return { outcome: "plan-missing", planId };
+    const plan = planSnap.data();
+
+    const targetSpaceSnap = await tx.get(targetSpaceRef);
+    const validation = validateTargetSpace(targetSpaceSnap.exists() ? targetSpaceSnap.data() : null);
+    if (!validation.valid) return { outcome: "invalid-target-space", planId, targetSpaceId, reason: validation.reason };
+
+    const executionSnap = await tx.get(executionRef);
+
+    const requestTuple = { targetSpaceId, requestedRoomName, requestedAreaName, requestedAreaScope };
+    if (executionSnap.exists()) {
+      const execution = executionSnap.data();
+      const tupleMatches = execution.targetSpaceId === targetSpaceId
+        && execution.requestedRoomName === requestedRoomName
+        && execution.requestedAreaName === requestedAreaName
+        && execution.requestedAreaScope === requestedAreaScope;
+
+      if (execution.status !== "completed" && execution.status !== "blocked") {
+        if (tupleMatches) return { outcome: "resumed", planId, status: execution.status };
+        return { outcome: "conflict", planId, reason: "a different reclassification is already in progress for this plan", inProgress: { targetSpaceId: execution.targetSpaceId, requestedRoomName: execution.requestedRoomName } };
+      }
+      if (execution.status === "completed" && tupleMatches) {
+        return { outcome: "already-completed", planId, status: execution.status };
+      }
+      // blocked+matches (retry), blocked+differs (fresh), or completed+differs
+      // (fresh, later correction) - all fall through to a fresh claim below.
+    }
+
+    // oldSpaceId is captured HERE, before anything changes it - the plan's
+    // shadow location as it exists right now, whatever that is.
+    const oldSpaceId = computeShadowIds(planId, plan).spaceId;
+    const oldSpaceSnap = oldSpaceId === targetSpaceId ? targetSpaceSnap : await tx.get(doc(db, "users", uid, "spaces", oldSpaceId));
+    const oldSpaceDisplayNameAtClaim = oldSpaceSnap.exists() ? (oldSpaceSnap.data().displayName || null) : null;
+    const targetSpaceDisplayNameAtClaim = targetSpaceSnap.data().displayName || null;
+
+    const now = serverTimestamp();
+    const attempt = executionSnap.exists() ? (executionSnap.data().attempt || 1) + 1 : 1;
+
+    tx.set(executionRef, {
+      planId, oldSpaceId, targetSpaceId,
+      requestedRoomName, requestedAreaName, requestedAreaScope,
+      oldSpaceDisplayNameAtClaim, targetSpaceDisplayNameAtClaim,
+      status: "claimed",
+      blockedReasons: null,
+      reconciledCandidateIds: [],
+      attempt,
+      claimedAt: now,
+      completedAt: null,
+    });
+
+    return { outcome: "claimed", planId, oldSpaceId, targetSpaceId, attempt };
+  });
+}
+
+// ---- Phase 2: establish the target projection ----
+async function establishTargetProjection(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (execution.status !== "claimed") {
+    return { outcome: "already-established", planId, status: execution.status };
+  }
+
+  const planRef = doc(db, "users", uid, "plans", planId);
+  const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", execution.targetSpaceId));
+  const inheritedSpaceName = targetSpaceSnap.exists() ? (targetSpaceSnap.data().displayName || null) : execution.requestedRoomName;
+
+  await updateDoc(planRef, {
+    canonicalSpaceId: execution.targetSpaceId,
+    spaceName: inheritedSpaceName,
+    areaName: execution.requestedAreaName,
+    areaScope: execution.requestedAreaScope,
+    shadowSourceVersion: increment(1),
+  });
+
+  const reprojectResult = await forceFullReprojection(uid, planId);
+  if (reprojectResult.outcome === "source-plan-missing") {
+    await updateDoc(executionRef, { status: "blocked", blockedReasons: ["source plan disappeared during reprojection"] });
+    return { outcome: "blocked", planId, reason: "source plan disappeared during reprojection" };
+  }
+
+  await updateDoc(executionRef, { status: "target-established" });
+  return { outcome: "established", planId, targetSpaceId: execution.targetSpaceId, reprojectResult };
+}
+
+// ---- Phase 3: validate the target projection (read-only) ----
+async function validateTargetProjection(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (execution.status === "claimed") return { outcome: "target-not-yet-established", planId };
+  if (execution.status !== "target-established") {
+    return { outcome: "already-validated-or-later", planId, status: execution.status };
+  }
+
+  const completeness = await checkMigrationCompleteness(uid, planId);
+  const projectSnap = await getDoc(doc(db, "users", uid, "spaces", execution.targetSpaceId, "projects", planId));
+  const scopedCorrectly = projectSnap.exists() && projectSnap.data().scopeId === execution.targetSpaceId;
+  const reasons = [...completeness.reasons];
+  if (!scopedCorrectly) reasons.push(`Project.scopeId does not equal target Space ${execution.targetSpaceId}`);
+
+  if (reasons.length) {
+    await updateDoc(executionRef, { status: "blocked", blockedReasons: reasons });
+    return { outcome: "invalid", planId, reasons };
+  }
+  await updateDoc(executionRef, { status: "target-validated" });
+  return { outcome: "valid", planId };
+}
+
+// ---- Phase 4: clean up the old Space (Case A guard lives here) ----
+async function cleanUpOldSpace(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (execution.status === "claimed" || execution.status === "target-established") {
+    return { outcome: "not-yet-validated", planId, status: execution.status };
+  }
+  if (execution.status !== "target-validated") {
+    return { outcome: "already-cleaned-up-or-later", planId, status: execution.status };
+  }
+
+  // CASE A GUARD: source and target are the same Space - nothing is
+  // retired, no self-redirect is ever written.
+  if (execution.oldSpaceId === execution.targetSpaceId) {
+    await updateDoc(executionRef, { status: "old-space-cleaned-up" });
+    return { outcome: "case-a-no-op", planId, reason: "oldSpaceId === targetSpaceId, nothing to retire" };
+  }
+
+  await deleteProjectSubtree(uid, execution.oldSpaceId, planId);
+
+  const siblingProjectsSnap = await getDocs(collection(db, "users", uid, "spaces", execution.oldSpaceId, "projects"));
+  const hasSiblingProjects = siblingProjectsSnap.docs.some((d) => d.id !== planId);
+
+  let spaceRetired = false;
+  if (!hasSiblingProjects) {
+    // Tombstone, not hard-delete - preserves the old Space's own original
+    // displayName forever (merge, not overwrite) for lineage.
+    await setDoc(doc(db, "users", uid, "spaces", execution.oldSpaceId), {
+      retired: true,
+      redirectTo: execution.targetSpaceId,
+      retiredAt: serverTimestamp(),
+      reclassificationExecutionId: planId,
+    }, { merge: true });
+    spaceRetired = true;
+  } else {
+    // Defensive - should not happen for a genuinely self-owned legacy
+    // plan, but handled rather than assumed away. Real for the batch
+    // case (mergeRoomIntoRoom below): every plan except the LAST one
+    // moved out of a multi-plan source Room hits this branch, since its
+    // siblings haven't moved yet.
+    await updateSpaceRoomSummary(uid, execution.oldSpaceId);
+  }
+
+  await updateDoc(executionRef, { status: "old-space-cleaned-up" });
+  return { outcome: "cleaned-up", planId, oldSpaceId: execution.oldSpaceId, spaceRetired };
+}
+
+// ---- Phase 5: confirm summaries ----
+async function confirmSummaries(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (["claimed", "target-established", "target-validated"].includes(execution.status)) {
+    return { outcome: "not-yet-cleaned-up", planId, status: execution.status };
+  }
+  if (execution.status !== "old-space-cleaned-up") {
+    return { outcome: "already-confirmed-or-later", planId, status: execution.status };
+  }
+
+  await updateSpaceRoomSummary(uid, execution.targetSpaceId);
+
+  await updateDoc(executionRef, { status: "summaries-confirmed" });
+  return { outcome: "confirmed", planId };
+}
+
+// ---- Phase 6: reconcile merge candidates ----
+async function reconcileMergeCandidates(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (["claimed", "target-established", "target-validated", "old-space-cleaned-up"].includes(execution.status)) {
+    return { outcome: "not-yet-ready", planId, status: execution.status };
+  }
+  if (execution.status !== "summaries-confirmed") {
+    return { outcome: "already-reconciled-or-later", planId, status: execution.status };
+  }
+
+  const candidatesSnap = await getDocs(query(collection(db, "users", uid, "mergeCandidates"), where("planIds", "array-contains", planId)));
+  const reconciled = [];
+  for (const candDoc of candidatesSnap.docs) {
+    const candidateDoc = candDoc.data();
+    if (candidateDoc.resolutionStatus === "superseded" || candidateDoc.resolutionStatus === "stale-confirmed" || candidateDoc.resolutionStatus === "merged") {
+      reconciled.push({ candidateId: candDoc.id, action: "skip-terminal", resolutionStatus: candidateDoc.resolutionStatus });
+      continue;
+    }
+    const currentPlansById = {};
+    for (const pid of candidateDoc.planIds || []) {
+      const pSnap = await getDoc(doc(db, "users", uid, "plans", pid));
+      currentPlansById[pid] = pSnap.exists() ? pSnap.data() : null;
+    }
+    const decision = evaluateCandidateInvalidation(candidateDoc, currentPlansById);
+    if (decision.action === "keep") {
+      reconciled.push({ candidateId: candDoc.id, action: "keep" });
+      continue;
+    }
+    if (decision.action === "mark-stale") {
+      await updateDoc(candDoc.ref, { resolutionStatus: "stale-confirmed", staleReason: decision.staleReason, staleDetectedAt: serverTimestamp() });
+      reconciled.push({ candidateId: candDoc.id, action: "mark-stale", staleReason: decision.staleReason });
+      continue;
+    }
+    await updateDoc(candDoc.ref, { resolutionStatus: "superseded", supersededAt: serverTimestamp(), supersededBy: [] });
+    reconciled.push({ candidateId: candDoc.id, action: "supersede" });
+  }
+
+  await updateDoc(executionRef, { status: "candidates-reconciled", reconciledCandidateIds: reconciled.map((r) => r.candidateId) });
+  return { outcome: "reconciled", planId, reconciled };
+}
+
+// ---- Phase 7: finalize ----
+async function finalizeReclassification(uid, planId) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+  const executionSnap = await getDoc(executionRef);
+  if (!executionSnap.exists()) return { outcome: "execution-missing", planId };
+  const execution = executionSnap.data();
+  if (execution.status === "completed") return { outcome: "already-completed", planId };
+  if (execution.status !== "candidates-reconciled") return { outcome: "not-yet-reconciled", planId, status: execution.status };
+
+  await updateDoc(executionRef, { status: "completed", completedAt: serverTimestamp() });
+  return { outcome: "completed", planId };
+}
+
+// ---- Orchestrator: resumable, safe to call repeatedly ----
+async function reclassifyLegacyPlan(uid, planId, request) {
+  const executionRef = doc(db, "users", uid, "reclassificationExecutions", planId);
+
+  const claim = await claimReclassification(uid, planId, request);
+  if (claim.outcome === "plan-missing" || claim.outcome === "invalid-target-space" || claim.outcome === "conflict") {
+    return { outcome: "blocked-at-claim", detail: claim };
+  }
+  if (claim.outcome === "already-completed") {
+    const executionSnap = await getDoc(executionRef);
+    return { outcome: "completed", planId, alreadyCompleted: true, execution: executionSnap.data() };
+  }
+
+  const executionSnap = await getDoc(executionRef);
+  if (executionSnap.exists() && executionSnap.data().status === "completed") {
+    return { outcome: "completed", planId, alreadyCompleted: true, execution: executionSnap.data() };
+  }
+
+  const established = await establishTargetProjection(uid, planId);
+  if (established.outcome === "blocked") return { outcome: "blocked-at-establish", detail: established };
+
+  const validated = await validateTargetProjection(uid, planId);
+  if (validated.outcome === "invalid") return { outcome: "blocked-at-validation", detail: validated };
+
+  const cleanedUp = await cleanUpOldSpace(uid, planId);
+  const confirmed = await confirmSummaries(uid, planId);
+  const reconciled = await reconcileMergeCandidates(uid, planId);
+  const finalized = await finalizeReclassification(uid, planId);
+
+  return { outcome: "completed", planId, claim, established, validated, cleanedUp, confirmed, reconciled, finalized };
+}
+
+// ---- Batch wrapper: move EVERY plan out of one Room into another
+// (Room Rename Validation §2, "Move plans to [Room]"). reclassifyLegacyPlan
+// itself only ever handles one plan - proven safe to call once per plan,
+// in sequence, for this exact multi-plan case: cleanUpOldSpace's own
+// "hasSiblingProjects" check (above) means the source Room is only ever
+// tombstoned once the LAST plan has moved out, never prematurely - no
+// change to the underlying phases was needed, just this loop. Sequential,
+// not parallel (Promise.all) - deliberately, so each plan's cleanup step
+// sees an accurate, already-updated sibling count from the plan(s) moved
+// immediately before it, rather than every plan racing to read the same
+// stale "who else is still here" snapshot at once.
+async function mergeRoomIntoRoom(uid, sourceRoomId, targetRoomId) {
+  const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", targetRoomId));
+  const targetRoomName = targetSpaceSnap.exists() ? (targetSpaceSnap.data().displayName || null) : null;
+
+  const canonicalPlansSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("canonicalSpaceId", "==", sourceRoomId)));
+  const planIds = canonicalPlansSnap.docs.map((d) => d.id);
+  const selfPlanSnap = await getDoc(doc(db, "users", uid, "plans", sourceRoomId));
+  if (selfPlanSnap.exists()) planIds.push(sourceRoomId);
+
+  const results = [];
+  for (const planId of planIds) {
+    const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
+    const planData = planSnap.exists() ? planSnap.data() : {};
+    // Each plan's OWN existing areaName/areaScope is preserved through the
+    // move (a whole-room visit stays whole-room, a sub-area visit keeps
+    // its sub-area label) - never collapsed to a single value for the
+    // whole batch, since different plans under the same misidentified
+    // Room can legitimately have different area context.
+    const result = await reclassifyLegacyPlan(uid, planId, {
+      targetSpaceId: targetRoomId,
+      requestedRoomName: targetRoomName,
+      requestedAreaName: planData.areaName ?? null,
+      requestedAreaScope: planData.areaScope ?? "whole-room",
+    });
+    results.push({ planId, result });
+    // Durable Area references (Phase A/B) are Room-scoped by construction
+    // (Area.roomId) - a plan moving to a different Room invalidates any
+    // areaId it had (the Area it pointed to still belongs to the OLD
+    // Room). Cleared explicitly rather than left silently dangling; the
+    // plan's own areaName/areaScope text above still describes what the
+    // visit was about. Not handled by reclassifyLegacyPlan itself (it
+    // never touches areaId, matching the already-proven Entertainment
+    // Center precedent, which also had areaId: null) - handled here,
+    // once, after a successful move.
+    if (planData.areaId) {
+      await updateDoc(doc(db, "users", uid, "plans", planId), { areaId: null }).catch((e) => dlog(`[RECLASSIFY BATCH] areaId clear failed for plan ${planId}: ${e.message}`));
+    }
+  }
+
+  const failed = results.filter((r) => r.result.outcome !== "completed");
+  return { outcome: failed.length === 0 ? "completed" : "partial", sourceRoomId, targetRoomId, movedCount: results.length - failed.length, totalCount: results.length, results, failed };
 }
 
 // Read-only. Snapshots each selected plan's Project shadow document's
@@ -2472,6 +2834,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [renamePlanTarget, setRenamePlanTarget] = useState(null);
   const [renameSheetValue, setRenameSheetValue] = useState("");
   const [renameSheetSaving, setRenameSheetSaving] = useState(false);
+  // Room Rename Validation (2026-08-10): shown INSTEAD OF the immediate
+  // rename when the submitted name matches an existing non-retired Room
+  // (case-insensitive) other than the one being renamed. null when not
+  // showing. { matchedRoom: { id, displayName }, newName, sourceRoomId }.
+  // Duplicate names are not prohibited (two legitimate bedrooms) - this is
+  // a conscious-choice gate, not a hard block.
+  const [renameDuplicateDialog, setRenameDuplicateDialog] = useState(null);
+  const [mergeRoomsSaving, setMergeRoomsSaving] = useState(false);
+  const [mergeRoomsError, setMergeRoomsError] = useState(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deletePassword, setDeletePassword] = useState("");
   const [deleteError, setDeleteError] = useState("");
@@ -5304,29 +5675,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setRenamePlanTarget(null);
     setRenameSheetValue("");
   };
-  const handleSaveRename = async () => {
+  // Resolves which Room id a plan-rename target actually belongs to - the
+  // same resolution renameSpace itself performs server-side. Shared by
+  // the duplicate-name check and the actual save, so they can never
+  // disagree about which Room is being renamed.
+  const resolveRenameTargetRoomId = () => {
+    if (!renamePlanTarget || renamePlanTarget.kind === "area") return null;
+    const cachedForRename = history.find((h) => h.id === renamePlanTarget.id);
+    return renamePlanTarget.roomId || (cachedForRename ? (cachedForRename.canonicalSpaceId || cachedForRename.id) : null);
+  };
+
+  // The actual Room rename save + local-cache patching - extracted so
+  // both the direct (no-duplicate) path and "Rename anyway" (Room Rename
+  // Validation, 2026-08-10) call the exact same save logic, never two
+  // parallel implementations of it.
+  const performRoomRename = async () => {
     const trimmed = renameSheetValue.trim();
-    if (!renamePlanTarget || !trimmed) return;
     setRenameSheetSaving(true);
-    // Area Identity, Phase A §7/§8: a completely separate, much smaller
-    // save path - writes ONLY Area.displayName (renameArea's own
-    // contract), never touches any plan's spaceName/areaName field, and
-    // patches only roomDetailAreas (the one place an Area's name is
-    // rendered in Phase A). Does not fall through to the plan-rename
-    // logic below at all.
-    if (renamePlanTarget.kind === "area") {
-      try {
-        await renameArea(user.uid, renamePlanTarget.roomId, renamePlanTarget.id, trimmed);
-        setRoomDetailAreas((prev) => prev.map((a) => (a.id === renamePlanTarget.id ? { ...a, displayName: trimmed } : a)));
-        setRenamePlanTarget(null);
-        setRenameSheetValue("");
-      } catch (e) {
-        Alert.alert("Couldn't rename", e.message);
-      } finally {
-        setRenameSheetSaving(false);
-      }
-      return;
-    }
     try {
       await renameSpace(user.uid, renamePlanTarget.id, trimmed);
       // Patch every local cache that might be displaying this plan's name
@@ -5342,22 +5707,95 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // primary source Room Detail's header (and My Rooms' own cards) read
       // displayName from - without this patch a rename wouldn't visibly
       // "stick" on either screen until the next loadRooms() re-fetch.
-      // Resolves the target Room id from the explicit roomId Room Detail
-      // passes, falling back to the cached plan's own canonicalSpaceId (or
-      // its own id) when no explicit roomId was given - same resolution
-      // renameSpace itself performs server-side.
-      const cachedForRename = history.find((h) => h.id === renamePlanTarget.id);
-      const renamedRoomId = renamePlanTarget.roomId || (cachedForRename ? (cachedForRename.canonicalSpaceId || cachedForRename.id) : null);
+      const renamedRoomId = resolveRenameTargetRoomId();
       if (renamedRoomId) {
         setRooms((prev) => prev.map((r) => (r.id === renamedRoomId ? { ...r, displayName: trimmed } : r)));
       }
       setRoomDetailPlans((prev) => prev.map((p) => (p.id === renamePlanTarget.id ? { ...p, spaceName: trimmed } : p)));
       setRenamePlanTarget(null);
       setRenameSheetValue("");
+      setRenameDuplicateDialog(null);
     } catch (e) {
       Alert.alert("Couldn't rename", e.message);
     } finally {
       setRenameSheetSaving(false);
+    }
+  };
+
+  const handleSaveRename = async () => {
+    const trimmed = renameSheetValue.trim();
+    if (!renamePlanTarget || !trimmed) return;
+    setRenameSheetSaving(true);
+    // Area Identity, Phase A §7/§8: a completely separate, much smaller
+    // save path - writes ONLY Area.displayName (renameArea's own
+    // contract), never touches any plan's spaceName/areaName field, and
+    // patches only roomDetailAreas (the one place an Area's name is
+    // rendered in Phase A). Does not fall through to the plan-rename
+    // logic below at all. No duplicate-name check either - Room Rename
+    // Validation is a Room-level concern only (an Area's uniqueness scope
+    // is a whole separate question the task doesn't ask for).
+    if (renamePlanTarget.kind === "area") {
+      try {
+        await renameArea(user.uid, renamePlanTarget.roomId, renamePlanTarget.id, trimmed);
+        setRoomDetailAreas((prev) => prev.map((a) => (a.id === renamePlanTarget.id ? { ...a, displayName: trimmed } : a)));
+        setRenamePlanTarget(null);
+        setRenameSheetValue("");
+      } catch (e) {
+        Alert.alert("Couldn't rename", e.message);
+      } finally {
+        setRenameSheetSaving(false);
+      }
+      return;
+    }
+
+    // Room Rename Validation (2026-08-10): case-insensitive match against
+    // every OTHER non-retired Room (rooms is already filtered to
+    // non-retired at load time - see loadRooms). Duplicate names are
+    // allowed (two legitimate bedrooms) - this only gates on it being a
+    // CONSCIOUS choice, never blocks outright. No match -> proceed
+    // exactly as before, unchanged.
+    const renamedRoomId = resolveRenameTargetRoomId();
+    const existingMatch = rooms.find((r) => r.id !== renamedRoomId && (r.displayName || "").trim().toLowerCase() === trimmed.toLowerCase());
+    if (existingMatch) {
+      setRenameSheetSaving(false);
+      setMergeRoomsError(null);
+      setRenameDuplicateDialog({ matchedRoom: { id: existingMatch.id, displayName: existingMatch.displayName }, newName: trimmed, sourceRoomId: renamedRoomId });
+      return;
+    }
+
+    await performRoomRename();
+  };
+
+  // Room Rename Validation option (b): "this IS the existing Room, the AI
+  // just got it wrong" - moves every plan out of the misidentified Room
+  // into the matched existing one via the proven reclassification
+  // workflow, then closes both the dialog and the rename sheet (renaming
+  // the source Room's own displayName would be meaningless - it's about
+  // to be retired). If the Room Detail screen for the source Room happens
+  // to be open right now, it's no longer a valid destination (the Room
+  // was just retired) - back out to My Rooms rather than leave a dead
+  // screen showing.
+  const handleMovePlansIntoExisting = async () => {
+    if (!renameDuplicateDialog) return;
+    setMergeRoomsSaving(true);
+    setMergeRoomsError(null);
+    try {
+      const result = await mergeRoomIntoRoom(user.uid, renameDuplicateDialog.sourceRoomId, renameDuplicateDialog.matchedRoom.id);
+      if (result.outcome !== "completed") {
+        throw new Error(`${result.movedCount}/${result.totalCount} plans moved - one or more failed. Please try again.`);
+      }
+      setRooms((prev) => prev.filter((r) => r.id !== renameDuplicateDialog.sourceRoomId));
+      if (roomDetailRoomId === renameDuplicateDialog.sourceRoomId) {
+        setRoomDetailRoomId(null);
+        setShowHistory(true);
+      }
+      setRenamePlanTarget(null);
+      setRenameSheetValue("");
+      setRenameDuplicateDialog(null);
+    } catch (e) {
+      setMergeRoomsError(e.message || "Something went wrong moving your plans. Please try again.");
+    } finally {
+      setMergeRoomsSaving(false);
     }
   };
 
@@ -5383,48 +5821,100 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // render, regardless of which screen triggered it) - defined once here
   // so neither branch duplicates the JSX itself.
   const renderRenameSheet = () => (
-    <Modal visible={!!renamePlanTarget} animationType="slide" transparent onRequestClose={closeRenameSheet}>
-      <View style={s.renameSheetBackdrop}>
-        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
-        <View style={s.renameSheetCard}>
-          <Text style={s.renameSheetTitle}>{renamePlanTarget?.kind === "area" ? "Rename Area" : "Rename Room"}</Text>
-          <TextInput
-            style={s.renameSheetInput}
-            value={renameSheetValue}
-            onChangeText={setRenameSheetValue}
-            maxLength={50}
-            placeholder="e.g. Kitchen"
-            placeholderTextColor="#94A3B8"
-            autoFocus
-            editable={!renameSheetSaving}
-          />
-          {renameSuggestions().length > 0 && (
-            <>
-              <Text style={s.renameSuggestionsLabel}>Names you've used before</Text>
-              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
-                {renameSuggestions().map((name) => (
-                  <TouchableOpacity key={name} style={s.renameSuggestionChip} onPress={() => setRenameSheetValue(name)} disabled={renameSheetSaving}>
-                    <Text style={s.renameSuggestionChipText}>{name}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </>
-          )}
-          <View style={{ flexDirection: "row", gap: 10 }}>
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={closeRenameSheet} disabled={renameSheetSaving}>
-              <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[s.startOverBtn, { flex: 1, marginTop: 0, backgroundColor: (renameSheetValue.trim() && !renameSheetSaving) ? BRAND.green : "#CBD5E1", borderWidth: 0 }]}
-              onPress={handleSaveRename}
-              disabled={!renameSheetValue.trim() || renameSheetSaving}
-            >
-              <Text style={[s.startOverText, { color: "white" }]}>{renameSheetSaving ? "Saving..." : "Save"}</Text>
-            </TouchableOpacity>
+    <>
+      <Modal visible={!!renamePlanTarget} animationType="slide" transparent onRequestClose={closeRenameSheet}>
+        <View style={s.renameSheetBackdrop}>
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
+          <View style={s.renameSheetCard}>
+            <Text style={s.renameSheetTitle}>{renamePlanTarget?.kind === "area" ? "Rename Area" : "Rename Room"}</Text>
+            <TextInput
+              style={s.renameSheetInput}
+              value={renameSheetValue}
+              onChangeText={setRenameSheetValue}
+              maxLength={50}
+              placeholder="e.g. Kitchen"
+              placeholderTextColor="#94A3B8"
+              autoFocus
+              editable={!renameSheetSaving}
+            />
+            {renameSuggestions().length > 0 && (
+              <>
+                <Text style={s.renameSuggestionsLabel}>Names you've used before</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                  {renameSuggestions().map((name) => (
+                    <TouchableOpacity key={name} style={s.renameSuggestionChip} onPress={() => setRenameSheetValue(name)} disabled={renameSheetSaving}>
+                      <Text style={s.renameSuggestionChipText}>{name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </>
+            )}
+            <View style={{ flexDirection: "row", gap: 10 }}>
+              <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={closeRenameSheet} disabled={renameSheetSaving}>
+                <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.startOverBtn, { flex: 1, marginTop: 0, backgroundColor: (renameSheetValue.trim() && !renameSheetSaving) ? BRAND.green : "#CBD5E1", borderWidth: 0 }]}
+                onPress={handleSaveRename}
+                disabled={!renameSheetValue.trim() || renameSheetSaving}
+              >
+                <Text style={[s.startOverText, { color: "white" }]}>{renameSheetSaving ? "Saving..." : "Save"}</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
-      </View>
-    </Modal>
+      </Modal>
+
+      {/* Room Rename Validation (2026-08-10): shown INSTEAD OF an
+          immediate rename when the submitted name matches an existing
+          non-retired Room. Three options, per the design's own explicit
+          rule - no per-candidate reject, just these three: (a) rename
+          anyway (duplicate names are allowed, this just makes it a
+          conscious choice), (b) move plans into the existing Room (the
+          actual "this was a misclassification, not a rename" correction
+          path - reclassifyLegacyPlan/mergeRoomIntoRoom above), (c) cancel
+          (back out, nothing changes, the rename sheet stays open with the
+          typed name intact so the user can edit it). Rendered as a
+          second Modal stacked on top of the rename sheet's own Modal,
+          same pattern this function already uses for one screen showing
+          two modals. */}
+      <Modal visible={!!renameDuplicateDialog} animationType="fade" transparent onRequestClose={() => { if (!mergeRoomsSaving) setRenameDuplicateDialog(null); }}>
+        <View style={s.renameSheetBackdrop}>
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => { if (!mergeRoomsSaving) setRenameDuplicateDialog(null); }} accessibilityLabel="Close" accessibilityRole="button" />
+          <View style={s.renameSheetCard}>
+            <Text style={s.renameSheetTitle}>{`You already have a Room called "${renameDuplicateDialog?.matchedRoom?.displayName || ""}"`}</Text>
+            <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>Are you sure you want to use this name - or is this actually the same Room, just misidentified?</Text>
+            {mergeRoomsError && (
+              <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+                <Text style={{ fontSize: 13, color: "#B91C1C" }}>{mergeRoomsError}</Text>
+              </View>
+            )}
+            <TouchableOpacity
+              disabled={mergeRoomsSaving}
+              style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: mergeRoomsSaving ? 0.6 : 1 }]}
+              onPress={performRoomRename}
+              accessibilityLabel="Rename anyway"
+              accessibilityRole="button"
+            >
+              <Text style={[s.startOverText, { color: "white" }]}>Rename anyway</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={mergeRoomsSaving}
+              style={[s.startOverBtn, { marginTop: 10, backgroundColor: BRAND.green, borderWidth: 0, opacity: mergeRoomsSaving ? 0.6 : 1 }]}
+              onPress={handleMovePlansIntoExisting}
+              accessibilityLabel={`Move plans to ${renameDuplicateDialog?.matchedRoom?.displayName || "existing Room"}`}
+              accessibilityRole="button"
+            >
+              <Text style={[s.startOverText, { color: "white" }]}>{mergeRoomsSaving ? "Moving..." : `Move plans to ${renameDuplicateDialog?.matchedRoom?.displayName || ""}`}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity disabled={mergeRoomsSaving} style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => setRenameDuplicateDialog(null)}>
+              <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+            </TouchableOpacity>
+            {mergeRoomsSaving && <ProcessingOverlay text="Moving plans..." />}
+          </View>
+        </View>
+      </Modal>
+    </>
   );
 
   // Full-screen photo viewer - reuses the existing vizModal/vizModalKey
