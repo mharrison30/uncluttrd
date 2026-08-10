@@ -1545,47 +1545,209 @@ async function reclassifyLegacyPlan(uid, planId, request) {
 // sees an accurate, already-updated sibling count from the plan(s) moved
 // immediately before it, rather than every plan racing to read the same
 // stale "who else is still here" snapshot at once.
+// ---- Area Preservation for Room Merges (AreaMergePreservation.md).
+// establishTargetArea and mergeRoomIntoRoom below replace the prior
+// "always clear areaId" behavior, which destroyed durable Area identity
+// (visit history, reference photos, recognition eligibility) on every
+// Room merge - exactly the regression Phase A/B's own work was meant to
+// prevent. ----
+
+// Idempotent, restartable target-twin establishment - the critical
+// correction over an earlier, in-memory-only version of this idea:
+// establishing the target twin and retiring the source Area are SEPARATE
+// steps, tracked by a field PERSISTED on the source Area document itself
+// (migrationTargetAreaId), not just a Map living in one function call's
+// stack. A crash between "target created" and "source retired" must never
+// be able to orphan or duplicate anything - re-calling this after a crash
+// reads the already-set migrationTargetAreaId and returns the existing
+// target id rather than creating a second twin. retired/redirectTo are
+// NEVER written here - only mergeRoomIntoRoom's own later phase (once it
+// has verified zero plans still reference the source Area) writes those,
+// so a source Area with plans still pointing at it can never look
+// retired just because its target twin already exists.
+async function establishTargetArea(uid, oldRoomId, oldAreaId, targetRoomId) {
+  const oldAreaRef = doc(db, "users", uid, "spaces", oldRoomId, "areas", oldAreaId);
+  const oldAreaSnap = await getDoc(oldAreaRef);
+  if (!oldAreaSnap.exists()) return null; // defensive - Area vanished somehow, nothing to migrate
+  const oldArea = oldAreaSnap.data();
+
+  if (oldArea.migrationTargetAreaId) {
+    return oldArea.migrationTargetAreaId;
+  }
+
+  // displayName/createdAt/originalPhotoUrl preserved from the source Area
+  // - createdAt is the ORIGINAL value, not migration time: a Room merge
+  // is an administrative correction, not a new organizing event, and
+  // createdAt means "when the user first organized this physical spot"
+  // everywhere else in this data model (same lineage-preservation
+  // philosophy as Space tombstoning's own "preserves the old Space's
+  // displayName forever" comment). visitCount/lastOrganizedAt/
+  // latestPhotoUrl are seeded but explicitly NOT trusted - recomputed for
+  // real by updateAreaSummary once the migrated plans actually land under
+  // the target Room (mergeRoomIntoRoom's own later phase), matching this
+  // codebase's "recompute, never copy" convention for summary fields.
+  const newAreaRef = await addDoc(collection(db, "users", uid, "spaces", targetRoomId, "areas"), {
+    roomId: targetRoomId,
+    displayName: oldArea.displayName,
+    createdAt: oldArea.createdAt,
+    originalPhotoUrl: oldArea.originalPhotoUrl,
+    latestPhotoUrl: oldArea.latestPhotoUrl,
+    lastOrganizedAt: oldArea.lastOrganizedAt,
+    visitCount: 0,
+    retired: false,
+    redirectTo: null,
+  });
+
+  // Item 5 (design doc): never searched for an existing same-named target
+  // Area to merge into - addDoc above always creates a fresh document.
+  // "TV Console" migrating into a target Room that already has its own
+  // "TV Console" simply produces two separate Areas; reconciling them is
+  // explicitly out of scope (a future capability), matching Room Rename's
+  // own "duplicate names are allowed" philosophy one level down.
+  await updateDoc(oldAreaRef, { migrationTargetAreaId: newAreaRef.id });
+  return newAreaRef.id;
+}
+
+// Single-plan reclassification's own Area handling (design doc §3) - a
+// wrapper around reclassifyLegacyPlan, not a change to it, for the same
+// reason mergeRoomIntoRoom's own Area logic lives outside it: this
+// decision needs to know about every OTHER plan currently referencing the
+// same Area, which is not something a single-plan-scoped function can
+// determine about itself. Call this AFTER reclassifyLegacyPlan has
+// already completed the Room move for oldAreaId's own plan; sourceAreaId
+// must be the plan's ORIGINAL areaId, captured before reclassification
+// (see mergeRoomIntoRoom's own Phase 1 snapshot for why - reclassifyLegacyPlan
+// never touches areaId itself, but a caller must never assume that and
+// read it fresh afterward instead of using its own already-known value).
+async function resolveAreaForSinglePlanMove(uid, planId, oldRoomId, oldAreaId, targetRoomId) {
+  if (!oldAreaId) return { action: "none" }; // whole-room visit - no Area involvement (design doc item 3, "no areaId")
+
+  const siblingSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("areaId", "==", oldAreaId)));
+  const othersStillReference = siblingSnap.docs.some((d) => d.id !== planId);
+  if (othersStillReference) {
+    // Leaving the Area behind - other plans still need it in the source
+    // Room. Do NOT touch the source Area at all.
+    return { action: "clear" };
+  }
+
+  // Last remaining member - establish -> move -> verify -> recompute ->
+  // retire, the same sequence mergeRoomIntoRoom uses for every Area, just
+  // for this one.
+  const newAreaId = await establishTargetArea(uid, oldRoomId, oldAreaId, targetRoomId);
+  if (!newAreaId) return { action: "clear" }; // defensive - establishment failed, don't leave the plan pointing at a half-migrated Area
+
+  const stillReferencedSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("areaId", "==", oldAreaId)));
+  const verifiedEmpty = stillReferencedSnap.docs.every((d) => d.id === planId); // only this plan itself, which is about to be repointed
+
+  await updateAreaSummary(uid, targetRoomId, newAreaId);
+
+  if (verifiedEmpty) {
+    await updateDoc(doc(db, "users", uid, "spaces", oldRoomId, "areas", oldAreaId), {
+      retired: true, redirectTo: newAreaId, retiredAt: serverTimestamp(),
+    });
+  }
+
+  return { action: "migrate", newAreaId };
+}
+
+// ---- mergeRoomIntoRoom: the full-Room-merge case (design doc §2),
+// corrected 7-phase sequence. Phase numbering matches the design report
+// 1:1 for traceability. ----
 async function mergeRoomIntoRoom(uid, sourceRoomId, targetRoomId) {
   const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", targetRoomId));
   const targetRoomName = targetSpaceSnap.exists() ? (targetSpaceSnap.data().displayName || null) : null;
 
+  // ---- Phase 1: snapshot every source plan's CURRENT areaId BEFORE any
+  // plan moves - the authoritative record of Area membership for this
+  // whole run, independent of whatever reclassifyLegacyPlan does to the
+  // plan's own fields afterward (it never touches areaId, but this
+  // function must never assume that silently). Self-plan (founding visit,
+  // doc id === sourceRoomId) is only included if it hasn't ALREADY moved
+  // on a prior, interrupted attempt - its own doc id never changes, so
+  // existence alone can't distinguish "not yet processed" from "already
+  // done"; canonicalSpaceId can. ----
   const canonicalPlansSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("canonicalSpaceId", "==", sourceRoomId)));
   const planIds = canonicalPlansSnap.docs.map((d) => d.id);
   const selfPlanSnap = await getDoc(doc(db, "users", uid, "plans", sourceRoomId));
-  if (selfPlanSnap.exists()) planIds.push(sourceRoomId);
-
-  const results = [];
-  for (const planId of planIds) {
-    const planSnap = await getDoc(doc(db, "users", uid, "plans", planId));
-    const planData = planSnap.exists() ? planSnap.data() : {};
-    // Each plan's OWN existing areaName/areaScope is preserved through the
-    // move (a whole-room visit stays whole-room, a sub-area visit keeps
-    // its sub-area label) - never collapsed to a single value for the
-    // whole batch, since different plans under the same misidentified
-    // Room can legitimately have different area context.
-    const result = await reclassifyLegacyPlan(uid, planId, {
-      targetSpaceId: targetRoomId,
-      requestedRoomName: targetRoomName,
-      requestedAreaName: planData.areaName ?? null,
-      requestedAreaScope: planData.areaScope ?? "whole-room",
-    });
-    results.push({ planId, result });
-    // Durable Area references (Phase A/B) are Room-scoped by construction
-    // (Area.roomId) - a plan moving to a different Room invalidates any
-    // areaId it had (the Area it pointed to still belongs to the OLD
-    // Room). Cleared explicitly rather than left silently dangling; the
-    // plan's own areaName/areaScope text above still describes what the
-    // visit was about. Not handled by reclassifyLegacyPlan itself (it
-    // never touches areaId, matching the already-proven Entertainment
-    // Center precedent, which also had areaId: null) - handled here,
-    // once, after a successful move.
-    if (planData.areaId) {
-      await updateDoc(doc(db, "users", uid, "plans", planId), { areaId: null }).catch((e) => dlog(`[RECLASSIFY BATCH] areaId clear failed for plan ${planId}: ${e.message}`));
+  if (selfPlanSnap.exists()) {
+    const selfPlanData = selfPlanSnap.data();
+    if (!selfPlanData.canonicalSpaceId || selfPlanData.canonicalSpaceId === sourceRoomId) {
+      planIds.push(sourceRoomId);
     }
   }
 
+  const planSnapshots = planIds.map((planId) => ({ planId }));
+  for (const snap of planSnapshots) {
+    const planSnap = await getDoc(doc(db, "users", uid, "plans", snap.planId));
+    const planData = planSnap.exists() ? planSnap.data() : {};
+    snap.areaId = planData.areaId ?? null;
+    snap.areaName = planData.areaName ?? null;
+    snap.areaScope = planData.areaScope ?? "whole-room";
+  }
+
+  // ---- Phase 2: establish a target twin for every DISTINCT source Area
+  // referenced by any of these plans. Source Areas are NOT retired here -
+  // see establishTargetArea's own comment for why that separation is the
+  // whole point of this correction. ----
+  const uniqueSourceAreaIds = [...new Set(planSnapshots.map((s) => s.areaId).filter(Boolean))];
+  const areaMigrationMap = new Map(); // oldAreaId -> newAreaId
+  for (const oldAreaId of uniqueSourceAreaIds) {
+    const newAreaId = await establishTargetArea(uid, sourceRoomId, oldAreaId, targetRoomId);
+    if (newAreaId) areaMigrationMap.set(oldAreaId, newAreaId);
+  }
+
+  // ---- Phase 3: move every plan (Room move unchanged), then repoint its
+  // areaId at the durable mapping from Phase 2 - never null-by-default
+  // for a plan that had a real Area, and never left at a stale
+  // old-Room-scoped id either. ----
+  const results = [];
+  for (const snap of planSnapshots) {
+    const result = await reclassifyLegacyPlan(uid, snap.planId, {
+      targetSpaceId: targetRoomId,
+      requestedRoomName: targetRoomName,
+      requestedAreaName: snap.areaName,
+      requestedAreaScope: snap.areaScope,
+    });
+    results.push({ planId: snap.planId, result });
+
+    if (result.outcome === "completed") {
+      const newAreaId = snap.areaId ? (areaMigrationMap.get(snap.areaId) ?? null) : null;
+      await updateDoc(doc(db, "users", uid, "plans", snap.planId), { areaId: newAreaId, shadowSourceVersion: increment(1) })
+        .catch((e) => dlog(`[ROOM MERGE] areaId repoint failed for plan ${snap.planId}: ${e.message}`));
+      await syncPlanToSpaceGraph(uid, snap.planId).catch((e) => dlog(`[ROOM MERGE] shadow resync failed for plan ${snap.planId}: ${e.message}`));
+    }
+  }
   const failed = results.filter((r) => r.result.outcome !== "completed");
-  return { outcome: failed.length === 0 ? "completed" : "partial", sourceRoomId, targetRoomId, movedCount: results.length - failed.length, totalCount: results.length, results, failed };
+
+  // ---- Phase 4 (verify) + Phase 5 (recompute) + Phase 6 (retire, only
+  // now) - per migrated Area. A source Area with ANY plan still pointing
+  // at it (e.g. one plan in its group failed Phase 3) is explicitly never
+  // retired - design doc item j's own governing rule. ----
+  const areaMigrations = [];
+  for (const [oldAreaId, newAreaId] of areaMigrationMap.entries()) {
+    const remainingSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("areaId", "==", oldAreaId)));
+    const stillReferenced = remainingSnap.size > 0;
+
+    await updateAreaSummary(uid, targetRoomId, newAreaId);
+
+    if (stillReferenced) {
+      areaMigrations.push({ oldAreaId, newAreaId, retired: false, reason: "plans still reference source Area", remainingCount: remainingSnap.size });
+      continue;
+    }
+
+    await updateDoc(doc(db, "users", uid, "spaces", sourceRoomId, "areas", oldAreaId), {
+      retired: true, redirectTo: newAreaId, retiredAt: serverTimestamp(),
+    });
+    areaMigrations.push({ oldAreaId, newAreaId, retired: true });
+  }
+
+  // ---- Phase 7: final verification / return summary. ----
+  return {
+    outcome: failed.length === 0 ? "completed" : "partial",
+    sourceRoomId, targetRoomId,
+    movedCount: results.length - failed.length, totalCount: results.length,
+    results, failed, areaMigrations,
+  };
 }
 
 // Read-only. Snapshots each selected plan's Project shadow document's
