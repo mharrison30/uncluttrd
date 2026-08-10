@@ -7,6 +7,15 @@ const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const { toFile } = require("openai/uploads");
 const admin = require("firebase-admin");
+// Phase C4 (DeletionImplementation.md): the REAL Phase C3 hard-delete
+// engine, not a second implementation. Firebase Functions deploy only
+// bundles this "functions" source directory (firebase.json), so
+// scripts/runSpaceMigration.js (and its own shared/spaceMigration.js
+// dependency) can't be required from outside it directly - ./scripts and
+// ./shared here are generated copies, kept in sync automatically by
+// scripts/prepareFunctionsDeploy.js (see that script's own header for the
+// full reasoning; it runs as this functions codebase's predeploy hook).
+const { hardDeleteAreaAdmin, hardDeleteRoomAdmin } = require("./scripts/runSpaceMigration");
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -941,3 +950,123 @@ exports.reengagementNudge = onSchedule(
     }
   }
 );
+
+// --- Phase C4: retention cleanup job (DeletionDesign.md's "Soft-Delete
+// Revision" background job / DeletionImplementation.md Phase C4) ---------
+// Hard-deletes Rooms/Areas once their 30-day soft-delete retention window
+// has passed, by calling the Phase C3 hard-delete engine
+// (hardDeleteRoomAdmin/hardDeleteAreaAdmin, required above) - this file
+// deliberately contains no deletion logic of its own, only the
+// discovery/scheduling/logging around calling that engine.
+//
+// Exported as a plain, directly-callable function (not just the
+// onSchedule wrapper below) specifically so a real-staging test can
+// invoke it with a shorter/overridden retentionDays, the same pattern
+// DeletionDesign.md's own background-job sketch already called for -
+// proving this against real 30-day-old data would mean waiting 30 real
+// days. `db` is an explicit parameter (matching every function in
+// scripts/runSpaceMigration.js's own dependency-injection convention)
+// rather than reaching for this file's own module-level `db`, so a test
+// script can pass in its own Admin app's Firestore instance directly.
+async function runExpiredDeletionSweep(db, { retentionDays = 30 } = {}) {
+  const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  const summary = {
+    rooms: { discovered: 0, deleted: 0, alreadyGone: 0, failed: 0 },
+    areas: { discovered: 0, deleted: 0, alreadyGone: 0, skippedParentDeleted: 0, failed: 0 },
+  };
+  const fmtDeletedAt = (ts) => (ts && typeof ts.toDate === "function" ? ts.toDate().toISOString() : String(ts));
+
+  // Pass 1: expired Rooms, first. hardDeleteRoomAdmin already recursively
+  // hard-deletes every Area under it (Phase C3), so this pass alone fully
+  // closes out a Room-level soft-delete, Areas included - matching
+  // DeletionDesign.md's own "Rooms first" ordering.
+  //
+  // deletedAt <= cutoff alone (no separate retired == true clause) is a
+  // sufficient filter, not an oversight: deletedAt is NEVER set without
+  // retired: true also being set (softDeleteRoom/softDeleteArea's own
+  // contract) and a bare merge/reclassification tombstone (retired: true,
+  // no deletedAt) never matches a range filter on a field it doesn't have
+  // - Invariant/requirement 4's "naturally excludes them," confirmed by
+  // testing (d) below, not just asserted. This also keeps the query on a
+  // single field, servable by a collection-group field-override index
+  // (firestore.indexes.json) rather than a composite index, matching this
+  // file's own established preference (see checkOrphanedUserDeletions/
+  // reengagementNudge's identical reasoning for their own range queries).
+  const spacesSnap = await db.collectionGroup("spaces").where("deletedAt", "<=", cutoff).get();
+  for (const spaceDoc of spacesSnap.docs) {
+    summary.rooms.discovered++;
+    const uid = spaceDoc.ref.parent.parent.id;
+    const roomId = spaceDoc.id;
+    const deletedAt = spaceDoc.data().deletedAt;
+    try {
+      const result = await hardDeleteRoomAdmin(db, uid, roomId);
+      const outcome = result.outcome === "hard-deleted" ? "deleted" : result.outcome === "already-deleted" ? "already-gone" : "failed";
+      if (outcome === "deleted") summary.rooms.deleted++;
+      else if (outcome === "already-gone") summary.rooms.alreadyGone++;
+      else summary.rooms.failed++;
+      console.log(`[cleanupExpiredDeletions] Room uid=${uid} roomId=${roomId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=${outcome}${outcome === "failed" ? ` detail=${JSON.stringify(result)}` : ""}`);
+    } catch (e) {
+      summary.rooms.failed++;
+      console.error(`[cleanupExpiredDeletions] Room uid=${uid} roomId=${roomId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=failed error=${e.message}`);
+    }
+  }
+
+  // Pass 2: expired standalone Areas - independently soft-deleted, not via
+  // a Room-level cascade. Governing rule (stated explicitly, not just
+  // implemented): once a Room is soft-deleted, its child Areas become
+  // part of THAT Room's retained/restorable graph - the Room's own
+  // expiration governs the whole subtree from that point on, regardless
+  // of any individual Area's own (possibly much older) deletedAt. Cleaning
+  // up such an Area early, ahead of its parent Room, would make a future
+  // Restore Room incomplete. So every candidate here is skipped whenever
+  // its parent Space is itself currently user-deleted (retired === true
+  // AND has a deletedAt) - independent of whether the ROOM has reached
+  // its own cutoff yet; Pass 1 above is the only thing that ever cleans up
+  // that subtree, whenever the ROOM's own deletedAt expires.
+  const areasSnap = await db.collectionGroup("areas").where("deletedAt", "<=", cutoff).get();
+  for (const areaDoc of areasSnap.docs) {
+    summary.areas.discovered++;
+    const roomRef = areaDoc.ref.parent.parent;
+    const uid = roomRef.parent.parent.id;
+    const roomId = roomRef.id;
+    const areaId = areaDoc.id;
+    const deletedAt = areaDoc.data().deletedAt;
+    try {
+      const spaceSnap = await roomRef.get();
+      const parentIsUserDeleted = spaceSnap.exists && spaceSnap.data().retired === true && !!spaceSnap.data().deletedAt;
+      if (parentIsUserDeleted) {
+        summary.areas.skippedParentDeleted++;
+        console.log(`[cleanupExpiredDeletions] Area uid=${uid} roomId=${roomId} areaId=${areaId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=skipped-parent-deleted`);
+        continue;
+      }
+      const result = await hardDeleteAreaAdmin(db, uid, roomId, areaId);
+      const outcome = result.outcome === "hard-deleted" ? "deleted" : result.outcome === "already-deleted" ? "already-gone" : "failed";
+      if (outcome === "deleted") summary.areas.deleted++;
+      else if (outcome === "already-gone") summary.areas.alreadyGone++;
+      else summary.areas.failed++;
+      console.log(`[cleanupExpiredDeletions] Area uid=${uid} roomId=${roomId} areaId=${areaId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=${outcome}${outcome === "failed" ? ` detail=${JSON.stringify(result)}` : ""}`);
+    } catch (e) {
+      summary.areas.failed++;
+      console.error(`[cleanupExpiredDeletions] Area uid=${uid} roomId=${roomId} areaId=${areaId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=failed error=${e.message}`);
+    }
+  }
+
+  console.log(`[cleanupExpiredDeletions] SUMMARY: ${JSON.stringify(summary)}`);
+  return summary;
+}
+
+exports.cleanupExpiredDeletions = onSchedule(
+  { schedule: "0 3 * * *", timeZone: "UTC" },
+  async () => {
+    await runExpiredDeletionSweep(db, { retentionDays: 30 });
+  }
+);
+
+// Not a Cloud Function - a plain export. firebase-functions v2 only treats
+// exports created via its own builders (onCall/onSchedule/etc, which
+// attach internal __endpoint metadata) as deployable; a bare function like
+// this is inert to `firebase deploy` and simply available to
+// require("./index.js") from a real-staging test script, matching
+// DeletionDesign.md's own explicit reasoning for why this needs to exist
+// as a directly-callable export in the first place.
+exports.runExpiredDeletionSweep = runExpiredDeletionSweep;

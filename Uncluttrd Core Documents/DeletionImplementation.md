@@ -383,3 +383,146 @@ marker early. Caught by reasoning through the exact crash-recovery scenario whil
 confirmed by direct code reading of `deletePlanAdmin`'s original sibling-Project-count logic, not
 by a failing test (the test suite's own restart scenario, test j, is scoped to the Area level,
 where this specific failure mode doesn't arise).
+
+# Phase C4: Retention Cleanup Job — Implementation Report (2026-08-10)
+
+Builds the scheduled Cloud Function (`functions/index.js`'s `cleanupExpiredDeletions`) that
+hard-deletes soft-deleted Rooms/Areas once their 30-day retention window passes, by calling the
+real Phase C3 engine (`hardDeleteRoomAdmin`/`hardDeleteAreaAdmin`) — this file contains no deletion
+logic of its own, only discovery/scheduling/logging around calling that engine.
+
+- Commit: (this phase)
+- Deployed: `cleanupExpiredDeletions` (staging, `us-central1`, daily at 03:00 UTC), plus two
+  Firestore collection-group field-override indexes (`spaces.deletedAt`, `areas.deletedAt`)
+
+## 1. Reusing the C3 engine across a deploy boundary
+
+Firebase Functions deploy only bundles the `functions` source directory (`firebase.json`) —
+`functions/index.js` cannot `require("../scripts/runSpaceMigration")` in production; that path
+simply won't exist in the deployed container. To call the *real* C3 engine rather than write a
+second implementation, `scripts/prepareFunctionsDeploy.js` (new) copies
+`shared/spaceMigration.js`, `shared/spaceShadowValidation.js` (its own sibling dependency,
+discovered when the first copy attempt threw `Cannot find module './spaceShadowValidation'` —
+fixed by adding it to the copy list, not by trimming the dependency), and
+`scripts/runSpaceMigration.js` into `functions/shared/` and `functions/scripts/`, preserving the
+exact same relative directory shape so the copied `runSpaceMigration.js`'s own
+`require("../shared/spaceMigration")` resolves unchanged — a byte-for-byte copy (each prefixed
+with a "GENERATED FILE, do not hand-edit" header inserted *after* `runSpaceMigration.js`'s own
+`#!/usr/bin/env node` shebang, which only Node-special-cases as the literal first line), not a
+transcription that could drift.
+
+Wired as this functions codebase's `predeploy` hook (`firebase.json`:
+`"predeploy": ["node scripts/prepareFunctionsDeploy.js"]`), so every real
+`firebase deploy --only functions` refreshes the copies from the canonical source automatically.
+The generated copies are committed to git (not `.gitignore`'d) — not because they're meant to be
+hand-edited, but so a clone always has a deployable `functions/` directory even if a deploy is
+ever triggered without this predeploy hook firing; `git diff` on `functions/shared/`/
+`functions/scripts/` without a corresponding root-level `shared/`/`scripts/` change in the same
+commit is the tell that something touched the wrong copy.
+
+`functions/index.js` requires `hardDeleteAreaAdmin`/`hardDeleteRoomAdmin` from `./scripts/runSpaceMigration`
+(the generated copy) at module load — verified deployed and callable via the real staging test
+suite below, which requires the actual `functions/index.js` module directly (not a stand-in).
+
+## 2. Firestore indexes
+
+`db.collectionGroup("spaces")`/`.collectionGroup("areas")` range queries on `deletedAt` need an
+explicit collection-group index — Firestore's automatic single-field indexing does not extend to
+collection-group scope by default. Added `firestore.indexes.json` (new) with `fieldOverrides` for
+both collection groups (not a composite `indexes` entry — a field override is the correct,
+minimal config for "extend automatic indexing to collection-group scope for this one field",
+avoiding a full composite index for what is, and stays, a single-field query — matching this
+file's own established "avoid composite indexes where a single-field range suffices" preference,
+see `checkOrphanedUserDeletions`/`reengagementNudge`'s identical reasoning). Wired into
+`firebase.json`'s `firestore.indexes` pointer and deployed ahead of the function itself
+(`firebase deploy --only firestore:indexes --project cluttrd-staging`).
+
+## 3. `runExpiredDeletionSweep(db, { retentionDays = 30 })`
+
+Exported as a plain function (`exports.runExpiredDeletionSweep = runExpiredDeletionSweep`), not
+wrapped in `onCall`/`onSchedule` — firebase-functions v2 only treats exports created via its own
+builders (which attach internal `__endpoint` metadata) as deployable, so this export is inert to
+`firebase deploy` (confirmed: it did not appear as a created/updated function in the real deploy
+output) and exists solely so a real-staging test can `require("./functions/index.js")` and invoke
+it directly with a shorter retention window — matching DeletionDesign.md's own original sketch of
+this exact requirement almost verbatim. `db` is an explicit parameter (this file's own
+`db = admin.firestore()` is not reached for directly), matching the dependency-injection
+convention every function in `scripts/runSpaceMigration.js` already uses, so a test's own Admin
+app's Firestore instance can be passed straight through.
+
+**Pass 1 (Rooms)**: `collectionGroup("spaces").where("deletedAt", "<=", cutoff)`, then
+`hardDeleteRoomAdmin(db, uid, roomId)` per result — which already recursively hard-deletes every
+Area under it (Phase C3), so this pass alone fully closes out a Room-level soft-delete.
+
+**Pass 2 (standalone Areas)**: `collectionGroup("areas").where("deletedAt", "<=", cutoff)`. For
+each: derive `uid`/`roomId` from `areaDoc.ref.parent.parent`, read the parent Space, and skip
+(outcome `skipped-parent-deleted`) whenever the parent is itself currently user-deleted
+(`retired === true` and has its own `deletedAt`) — **regardless of the Room's own cutoff status**,
+per the task's own governing rule: once a Room is soft-deleted, its child Areas belong to that
+Room's retained/restorable graph; the Room's own expiration governs the whole subtree, an
+individual Area's (possibly much older) `deletedAt` never overrides that. Only processed
+(`hardDeleteAreaAdmin`) when the parent is active or a bare merge tombstone (`retired`, no
+`deletedAt`) — i.e. genuinely not user-deleted.
+
+**deletedAt alone (no separate `retired == true` clause) is a sufficient, deliberate filter** —
+never set without `retired: true` also being set (the soft-delete contract from Phase C1/C2), and
+a bare tombstone categorically lacks the field, so it can never match a range filter on it. Test
+(d) below confirms this directly, including under a 0-day retention window, not just by code
+inspection.
+
+**A real, correct interaction found while testing, not a bug**: when a Room-level hard-delete
+*fails* partway (Storage cleanup failure, Phase C3's own abort-before-parent-removal guarantee),
+its own cascade-Area is still fully present in Firestore, unchanged — so Pass 2's *independent*
+query, running moments later in the *same* sweep call, discovers it too, and correctly skips it
+(its parent Room is still very much soft-deleted). Harmless: not a double-delete, no data lost —
+just confirmation that a partially-failed Room stays consistently "still retained" from both
+passes' point of view within one run, and fully resolves itself (Pass 1 succeeds, Pass 2 no longer
+even discovers that Area, since it's already gone) on the very next scheduled run.
+
+## 4. Scheduling and logging
+
+`exports.cleanupExpiredDeletions = onSchedule({ schedule: "0 3 * * *", timeZone: "UTC" }, ...)` —
+daily at 03:00 UTC, explicit timezone (Firebase's own default is project-local, not UTC, so this
+is stated rather than assumed).
+
+Every item logs `uid`, `roomId`/`areaId`, `deletedAt` (ISO string, converted from the Firestore
+`Timestamp`), and outcome (`deleted` / `already-gone` / `skipped-parent-deleted` / `failed`, the
+last with the full result detail attached) via `console.log`/`console.error`, matching this file's
+own `[tagName]`-prefixed logging convention throughout. A final `SUMMARY` line logs the complete
+counts object.
+
+**One structural note, worth stating explicitly rather than leaving implicit**: `alreadyGone` will
+realistically always read `0` in a real sweep run. `hardDeleteRoomAdmin`/`hardDeleteAreaAdmin`'s own
+`already-deleted` outcome only fires when the target document doesn't exist at all — but the sweep
+only ever calls either function for an id it *just* discovered via a live query in the same pass,
+so the document, by definition, existed a moment earlier. A nonzero `alreadyGone` would only occur
+under a genuine concurrent-run race (two sweep invocations overlapping) — vanishingly unlikely for
+a once-daily cron, and not something this test suite forces, for that reason.
+
+## Test results (real staging, throwaway data fully cleaned up afterward; the sweep's own final
+0-day run did most of that cleanup itself, by design)
+
+18 of 18 assertions passed, across three consecutive `runExpiredDeletionSweep` calls against the
+real deployed module. Setup: Room A (cascade-soft-deleted 31 days ago), Room B (active) with
+independently-soft-deleted Area B1 (31 days ago), Room C (soft-deleted today), Room D (genuine
+merge tombstone), Room E (soft-deleted today) with independently-soft-deleted Area E1 (31 days
+ago), and Rooms F1/F2 (both cascade-soft-deleted 31 days ago, F1's own plan's Storage cleanup
+forced to fail via the same `File.prototype.delete` targeted-override technique the Phase C3 suite
+established).
+
+| # | Test | Result |
+|---|---|---|
+| a | Expired Room A: `hardDeleteRoomAdmin` removes the Room, its Area, its plan, all Storage | **PASS** |
+| b | Independently-expired standalone Area B1 (parent Room B active): `hardDeleteAreaAdmin` removes just the Area and its plan; Room B untouched | **PASS** |
+| c | Room C, soft-deleted today (within 30 days): not touched | **PASS** |
+| d | Merge tombstone Room D (`retired`, no `deletedAt`): not touched — re-confirmed even under a 0-day retention window (run 3) | **PASS** (2/2) |
+| e | Re-running the sweep: no errors; already-cleaned items aren't rediscovered (fully gone); still-pending items (Room F1 after recovery, Area E1's stable skip) behave identically on every subsequent run | **PASS** (4/4) |
+| f | Room E soft-deleted today (not expired) + its Area E1 independently expired 31 days ago: **neither** touched — the Area stays preserved as part of the Room's still-retained graph | **PASS** (2/2) |
+| g | Partial failure (Room F1's forced Storage failure) does not block Room F2 (sibling, same run) from completing; F1 recovers cleanly on the very next run once the failure is no longer forced | **PASS** (3/3) |
+| h | Summary counts are correct — including accounting for the real Pass-1/Pass-2 interaction on a partially-failed Room (Section 3's own note), verified against a captured pre-test baseline so the assertion is robust to any unrelated pre-existing data, not a fragile absolute number | **PASS** (2/2) |
+| (bonus) | `retentionDays: 0` genuinely changes sweep behavior (Room C and Room E, both untouched under the real 30-day window, are newly eligible and cleaned up) — proves the directly-callable export's own parameter is honored, not hardcoded, satisfying item 2's own explicit reason for existing | **PASS** (2/2) |
+
+No gaps found this phase. The one non-obvious finding (Section 3's Pass-1/Pass-2 interaction on a
+partially-failed Room) was caught by the test suite itself — an initial hardcoded expected-count
+assertion failed, and root-causing it confirmed the actual behavior was correct, not a bug; the
+test's own expectation was wrong, not the implementation.
