@@ -20,7 +20,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
-import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment } from "firebase/firestore";
+import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
@@ -507,12 +507,71 @@ async function softDeleteRoom(uid, roomId) {
   let areasDeletedCount = 0;
   areasSnap.docs.forEach((areaDoc) => {
     if (!areaDoc.data().retired) {
-      batch.set(areaDoc.ref, { retired: true, deletedAt: now }, { merge: true });
+      // Phase C2: deletedWithRoomId marks this Area as CASCADE-deleted by
+      // this specific Room deletion - the deterministic signal
+      // restoreRoom uses to decide which Areas come back with the Room
+      // and which don't (an Area independently soft-deleted before the
+      // Room was must stay deleted; only ITS OWN "Restore" ever brings it
+      // back). Never written by softDeleteArea (direct, independent
+      // delete) - its absence there is exactly what distinguishes the
+      // two cases.
+      batch.set(areaDoc.ref, { retired: true, deletedAt: now, deletedWithRoomId: roomId }, { merge: true });
       areasDeletedCount++;
     }
   });
   await batch.commit();
   return { outcome: "soft-deleted", areasDeletedCount };
+}
+
+// Restore Room (Recently Deleted's own action, Phase C2). One atomic
+// writeBatch: un-retires the Space, and un-retires ONLY the Areas this
+// exact Room deletion cascade-deleted (deletedWithRoomId === roomId) -
+// never a merge tombstone (retired:true, no deletedAt - never matches
+// deletedWithRoomId either, since it's never set on one), and never an
+// Area that was independently soft-deleted before the Room was (has its
+// own deletedAt but a different, or absent, deletedWithRoomId). Idempotent:
+// a Room already live (not retired) is a no-op, so tapping Restore twice
+// can't do anything the first tap didn't already do.
+async function restoreRoom(uid, roomId) {
+  const spaceRef = doc(db, "users", uid, "spaces", roomId);
+  const spaceSnap = await getDoc(spaceRef);
+  if (!spaceSnap.exists() || !spaceSnap.data().retired) return { outcome: "already-restored" };
+
+  const areasSnap = await getDocs(collection(db, "users", uid, "spaces", roomId, "areas"));
+  const areasToRestore = areasSnap.docs.filter((a) => a.data().deletedWithRoomId === roomId);
+
+  const batch = writeBatch(db);
+  batch.update(spaceRef, { retired: false, deletedAt: deleteField() });
+  areasToRestore.forEach((areaDoc) => {
+    batch.update(areaDoc.ref, { retired: false, deletedAt: deleteField(), deletedWithRoomId: deleteField() });
+  });
+  await batch.commit();
+
+  // Recompute, never trust the pre-delete values back to life verbatim -
+  // same "recompute from live Projects" discipline every other summary
+  // maintenance path in this file already follows.
+  await updateSpaceRoomSummary(uid, roomId);
+  for (const areaDoc of areasToRestore) {
+    await updateAreaSummary(uid, roomId, areaDoc.id);
+  }
+
+  return { outcome: "restored", restoredAreaCount: areasToRestore.length };
+}
+
+// Restore Area (Recently Deleted Areas' own action, Phase C2). Single
+// document write - the mirror image of softDeleteArea. Works identically
+// whether the Area was cascade-deleted (has deletedWithRoomId) or
+// independently deleted (doesn't) - restoring an Area directly always
+// clears all three fields regardless of how it got here. Idempotent, same
+// reasoning as restoreRoom.
+async function restoreArea(uid, roomId, areaId) {
+  const areaRef = doc(db, "users", uid, "spaces", roomId, "areas", areaId);
+  const snap = await getDoc(areaRef);
+  if (!snap.exists() || !snap.data().retired) return { outcome: "already-restored" };
+  await updateDoc(areaRef, { retired: false, deletedAt: deleteField(), deletedWithRoomId: deleteField() });
+  await updateSpaceRoomSummary(uid, roomId);
+  await updateAreaSummary(uid, roomId, areaId);
+  return { outcome: "restored" };
 }
 
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
@@ -3182,6 +3241,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // Space document's data plus its own doc id (the canonical Space id /
   // Room id).
   const [rooms, setRooms] = useState([]);
+  // Phase C2: Recently Deleted (My Rooms' own section) - populated from
+  // the SAME already-fetched allSpaces list loadRooms below reads, not a
+  // second query. Only Rooms with a real deletedAt (user soft-delete, not
+  // a bare merge tombstone) within the last 30 days.
+  const [recentlyDeletedRooms, setRecentlyDeletedRooms] = useState([]);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
   // Room Detail screen (My Rooms -> True Room Grouping, Phase B) - replaces
   // the old single-plan Space Detail as the primary destination from My
@@ -4112,6 +4176,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         nonRetired.sort((a, b) => toMillis(b.lastOrganizedAt || b.createdAt) - toMillis(a.lastOrganizedAt || a.createdAt));
         console.log("Loaded", nonRetired.length, "rooms from Firestore (", allSpaces.length - nonRetired.length, "retired, filtered)");
         setRooms(nonRetired);
+
+        // Phase C2: Recently Deleted - deletedAt is the load-bearing
+        // filter, not retired alone (a bare merge tombstone has retired
+        // but no deletedAt, and must never appear here - see
+        // DeletionImplementation.md's contract). 30-day window enforced
+        // client-side too, defense in depth ahead of the eventual
+        // background purge sweep.
+        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+        const recentlyDeleted = allSpaces
+          .filter((s) => s.retired === true && s.deletedAt && (Date.now() - toMillis(s.deletedAt)) <= THIRTY_DAYS_MS)
+          .sort((a, b) => toMillis(b.deletedAt) - toMillis(a.deletedAt));
+        setRecentlyDeletedRooms(recentlyDeleted);
       } catch (e) {
         console.log("Load rooms error:", e.message, e.code);
       }
@@ -6455,6 +6531,37 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       ]
     );
   };
+  // Restore Room (Phase C2, Recently Deleted's own action, My Rooms
+  // screen). Mirrors handleDeleteRoom's structure, but unlike delete this
+  // can't just patch the old pre-delete object back into `rooms` -
+  // restoreRoom's own server-side recompute (updateSpaceRoomSummary) can
+  // change visitCount/lastOrganizedAt/etc. from whatever they were at
+  // delete time, so this refetches the Space doc instead.
+  const handleRestoreRoom = async (room) => {
+    try {
+      await restoreRoom(user.uid, room.id);
+      const spaceSnap = await getDoc(doc(db, "users", user.uid, "spaces", room.id));
+      const restored = { id: room.id, ...spaceSnap.data() };
+      setRecentlyDeletedRooms((prev) => prev.filter((r) => r.id !== room.id));
+      setRooms((prev) => [restored, ...prev.filter((r) => r.id !== room.id)]);
+    } catch (e) {
+      Alert.alert("Couldn't restore", e.message);
+    }
+  };
+  // Restore Area (Phase C2, Recently Deleted Areas' own action, Room
+  // Detail screen). Local patch only, same convention handleDeleteArea
+  // already established - AREAS IN THIS ROOM re-derives its rows from
+  // roomDetailPlans + roomDetailAreas.retired, not from any cached
+  // visitCount here, so a full re-fetch isn't needed for the Area to
+  // reappear.
+  const handleRestoreArea = async (area) => {
+    try {
+      await restoreArea(user.uid, roomDetailRoomId, area.id);
+      setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: false, deletedAt: undefined, deletedWithRoomId: undefined } : a)));
+    } catch (e) {
+      Alert.alert("Couldn't restore", e.message);
+    }
+  };
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): the one flow
   // behind every "Organize Again" entry point (originally the History
   // row's Alert action and Space Detail's own button; now Room Detail's
@@ -7042,6 +7149,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (days === 1) return "Organized yesterday";
       return `Organized ${days} days ago`;
     };
+    // Phase C2: deletedAt is a Firestore serverTimestamp() once round-tripped
+    // through Firestore (has toMillis()), not an ISO string like
+    // lastOrganizedAt above - can't reuse formatLastOrganized's Date.parse.
+    const formatDeletedAgo = (deletedAt) => {
+      const ms = deletedAt && typeof deletedAt.toMillis === "function" ? deletedAt.toMillis() : (typeof deletedAt === "string" ? Date.parse(deletedAt) : 0);
+      const days = Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Deleted today";
+      if (days === 1) return "Deleted yesterday";
+      return `Deleted ${days} days ago`;
+    };
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="dark-content" />
@@ -7100,6 +7217,34 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 </TouchableOpacity>
               );
             })
+          )}
+          {/* Phase C2: Recently Deleted - deliberately small (no fancy
+              archive browser, per the task spec). Quiet/secondary styling
+              throughout: gray text, no Room-type icon, no BRAND-tinted
+              historyIcon - visually distinct from the active-Room cards
+              above so it doesn't read as "just another room". Omitted
+              entirely when nothing qualifies (recentlyDeletedRooms is
+              already 30-day-filtered in loadRooms). */}
+          {recentlyDeletedRooms.length > 0 && (
+            <>
+              <Text style={[s.sectionLabel, { marginTop: 20 }]}>RECENTLY DELETED</Text>
+              {recentlyDeletedRooms.map((room) => (
+                <View key={room.id} style={[s.historyItem, { backgroundColor: "#F8F9FA", alignItems: "center" }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }} numberOfLines={1}>{room.displayName}</Text>
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{formatDeletedAgo(room.deletedAt)}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => handleRestoreRoom(room)}
+                    accessibilityLabel={`Restore ${room.displayName}`}
+                    accessibilityRole="button"
+                    style={{ paddingHorizontal: 12, paddingVertical: 8 }}
+                  >
+                    <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Restore</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </>
           )}
         </ScrollView>
         {renderRenameSheet()}
@@ -7166,6 +7311,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // ones (see its own loading effect) - reused here, not a new query.
     const retiredAreaIdsInRoom = new Set(roomDetailAreas.filter((a) => a.retired).map((a) => a.id));
     const visiblePlans = roomDetailPlans.filter((p) => !p.areaId || !retiredAreaIdsInRoom.has(p.areaId));
+
+    // Phase C2: Recently Deleted Areas - sourced entirely from the
+    // already-loaded roomDetailAreas (zero new query), same reuse
+    // discipline as retiredAreaIdsInRoom above. deletedAt is the
+    // load-bearing filter, not retired alone - a bare merge tombstone
+    // (retired:true, no deletedAt) must never appear here.
+    const toMillisDeletedAt = (ts) => (ts && typeof ts.toMillis === "function" ? ts.toMillis() : (typeof ts === "string" ? Date.parse(ts) : 0));
+    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+    const recentlyDeletedAreas = roomDetailAreas
+      .filter((a) => a.retired === true && a.deletedAt && (Date.now() - toMillisDeletedAt(a.deletedAt)) <= THIRTY_DAYS_MS)
+      .sort((a, b) => toMillisDeletedAt(b.deletedAt) - toMillisDeletedAt(a.deletedAt));
+    const formatDeletedAgo = (deletedAt) => {
+      const days = Math.max(0, Math.round((Date.now() - toMillisDeletedAt(deletedAt)) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Deleted today";
+      if (days === 1) return "Deleted yesterday";
+      return `Deleted ${days} days ago`;
+    };
 
     // Room Detail Layout Revision: LAST SESSION shows exactly the most
     // recent visit; EARLIER ORGANIZING VISITS shows every visit except
@@ -7454,6 +7616,32 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                       </View>
                     );
                   })}
+                </>
+              )}
+
+              {/* Phase C2: Recently Deleted Areas - deliberately small,
+                  same quiet/secondary styling as My Rooms' own Recently
+                  Deleted section (gray text, no photo/icon). Omitted
+                  entirely when nothing qualifies. */}
+              {recentlyDeletedAreas.length > 0 && (
+                <>
+                  <Text style={[s.sectionLabel, { marginTop: 20, marginBottom: 10 }]}>RECENTLY DELETED AREAS</Text>
+                  {recentlyDeletedAreas.map((area) => (
+                    <View key={area.id} style={[s.historyItem, { backgroundColor: "#F8F9FA", alignItems: "center" }]}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }} numberOfLines={1}>{area.displayName}</Text>
+                        <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{formatDeletedAgo(area.deletedAt)}</Text>
+                      </View>
+                      <TouchableOpacity
+                        onPress={() => handleRestoreArea(area)}
+                        accessibilityLabel={`Restore ${area.displayName}`}
+                        accessibilityRole="button"
+                        style={{ paddingHorizontal: 12, paddingVertical: 8 }}
+                      >
+                        <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Restore</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
                 </>
               )}
 
