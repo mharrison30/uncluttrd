@@ -83,10 +83,18 @@ const {
 // idempotency contract: recomputes every summary field fresh from the
 // actual Project documents every call, never increments anything. See
 // the client function's own comment for the full reasoning.) ----
+// Mirrors App.js's updateSpaceRoomSummary 1:1, including the Phase C1
+// retired-Area exclusion - see that function's own comment for the full
+// reasoning.
 async function updateSpaceRoomSummaryAdmin(db, uid, spaceId) {
   try {
-    const projectsSnap = await db.collection("users").doc(uid).collection("spaces").doc(spaceId).collection("projects").get();
-    const summary = computeRoomSummaryFields(projectsSnap.docs.map((d) => d.data()));
+    const [projectsSnap, areasSnap] = await Promise.all([
+      db.collection("users").doc(uid).collection("spaces").doc(spaceId).collection("projects").get(),
+      db.collection("users").doc(uid).collection("spaces").doc(spaceId).collection("areas").get(),
+    ]);
+    const retiredAreaIds = new Set(areasSnap.docs.filter((d) => d.data().retired).map((d) => d.id));
+    const liveProjects = projectsSnap.docs.map((d) => d.data()).filter((p) => !p.areaId || !retiredAreaIds.has(p.areaId));
+    const summary = computeRoomSummaryFields(liveProjects);
     await db.collection("users").doc(uid).collection("spaces").doc(spaceId).update(summary);
     return summary;
   } catch (e) {
@@ -296,6 +304,15 @@ async function forceFullReprojectionAdmin(db, uid, planId) {
     // 1:1: read before write (required inside a transaction), whether the
     // Space already exists decides which payload gets written.
     const spaceSnap = await tx.get(spaceRef);
+
+    // Retirement guard (DeletionDesign.md Addendum/Phase C1) - mirrors
+    // App.js's forceFullReprojection 1:1: a retired Space (merge tombstone
+    // or soft-deleted) must never receive a fresh projection write.
+    if (spaceSnap.exists && spaceSnap.data().retired === true) {
+      console.log(`[FULL REPROJECTION ADMIN] refusing to write under retired Space ${spaceId} for plan ${planId}`);
+      return { outcome: "target-retired", spaceId };
+    }
+
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     if (spaceSnap.exists) {

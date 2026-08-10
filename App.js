@@ -216,10 +216,29 @@ function buildShadowDocs({ planId, entry, photoUrl }) {
 // save, or a genuinely new visit) is always idempotent by construction,
 // never an increment. Calling it twice in a row for the same Space
 // produces byte-identical output both times.
+// Soft-Delete Primitives (Phase C1, DeletionDesign.md Soft-Delete
+// Revision): a Room's own visitCount/latestPhotoUrl/etc. must not count a
+// visit that belongs to a now-retired Area - the shadow Project for that
+// visit is still fully live (soft-delete never touches plans/shadows,
+// only sets retired+deletedAt on the Area itself), so without this
+// exclusion the Room's summary would silently keep counting a
+// soft-deleted Area's visits forever. Costs one extra subcollection read
+// (areas) alongside the existing projects read - modest, and this
+// function is already called sparingly (post-mutation, not per-render).
+// A retired Area for ANY reason (merge tombstone OR soft-delete) is
+// excluded identically - safe for the merge-tombstone case too, since a
+// correctly-migrated Area should have zero live Projects still pointing
+// at it by construction (every one of its plans was already repointed to
+// the migration target before the source Area was ever retired).
 async function updateSpaceRoomSummary(uid, spaceId) {
   try {
-    const projectsSnap = await getDocs(collection(db, "users", uid, "spaces", spaceId, "projects"));
-    const summary = computeRoomSummaryFields(projectsSnap.docs.map((d) => d.data()));
+    const [projectsSnap, areasSnap] = await Promise.all([
+      getDocs(collection(db, "users", uid, "spaces", spaceId, "projects")),
+      getDocs(collection(db, "users", uid, "spaces", spaceId, "areas")),
+    ]);
+    const retiredAreaIds = new Set(areasSnap.docs.filter((d) => d.data().retired).map((d) => d.id));
+    const liveProjects = projectsSnap.docs.map((d) => d.data()).filter((p) => !p.areaId || !retiredAreaIds.has(p.areaId));
+    const summary = computeRoomSummaryFields(liveProjects);
     await updateDoc(doc(db, "users", uid, "spaces", spaceId), summary);
   } catch (e) {
     dlog(`[ROOM SUMMARY] update failed for space ${spaceId}: ${e.message}`);
@@ -437,6 +456,63 @@ async function findAreaRecognitionCandidates(roomId, newPhotoBase64, existingAre
 // hook points.
 async function renameArea(uid, roomId, areaId, newName) {
   await updateDoc(doc(db, "users", uid, "spaces", roomId, "areas", areaId), { displayName: newName });
+}
+
+// ---- Soft-Delete Primitives (Phase C1, DeletionDesign.md Soft-Delete
+// Revision). Contract, load-bearing for everything downstream (Recently
+// Deleted, restore, the future 30-day hard-purge sweep): retired:true
+// ALONE (no deletedAt) is a structural tombstone from a merge/
+// reclassification - never user-initiated, never eligible for restore or
+// purge. retired:true WITH deletedAt is a user-initiated soft delete -
+// eligible for both. The two must never be confused, which is why
+// softDeleteRoom below explicitly skips any Area that's already retired
+// (a merge tombstone) rather than blindly setting deletedAt on it too.
+//
+// Both operations are intentionally the ENTIRE delete action - no plan
+// deletion, no shadow removal, no Storage cleanup. The existing !retired
+// filters already used everywhere (My Rooms, Room Detail, Area
+// recognition, Room recognition, merge-candidate detection - all
+// pre-existing, none modified by this change) do the rest: the instant
+// this write lands, the target is fully hidden from the whole app, with
+// zero new filtering code needed at any of those call sites. ----
+
+// Delete Area (Room Detail's per-Area "Delete" action). Single document
+// write - nearly instant, no processing overlay needed. Idempotent: a
+// second call against an already-retired Area is a no-op, specifically so
+// a double-tap (or a retry after a dropped network response) can never
+// reset deletedAt and silently restart the 30-day retention countdown.
+async function softDeleteArea(uid, roomId, areaId) {
+  const areaRef = doc(db, "users", uid, "spaces", roomId, "areas", areaId);
+  const snap = await getDoc(areaRef);
+  if (!snap.exists() || snap.data().retired) return { outcome: "already-deleted" };
+  await updateDoc(areaRef, { retired: true, deletedAt: serverTimestamp() });
+  return { outcome: "soft-deleted" };
+}
+
+// Delete Room (Room Detail's "Delete Room" action). One atomic writeBatch
+// covering the Space document AND every currently-LIVE Area under it (an
+// Area already retired via a prior merge is deliberately left untouched -
+// see the contract comment above). Firestore batches cap at 500 writes; a
+// Room with >499 live Areas would need chunking, not engineered for here
+// given real Rooms in this app have single-digit Area counts.
+async function softDeleteRoom(uid, roomId) {
+  const spaceRef = doc(db, "users", uid, "spaces", roomId);
+  const spaceSnap = await getDoc(spaceRef);
+  if (!spaceSnap.exists() || spaceSnap.data().retired) return { outcome: "already-deleted" };
+
+  const areasSnap = await getDocs(collection(db, "users", uid, "spaces", roomId, "areas"));
+  const batch = writeBatch(db);
+  const now = serverTimestamp();
+  batch.set(spaceRef, { retired: true, deletedAt: now }, { merge: true });
+  let areasDeletedCount = 0;
+  areasSnap.docs.forEach((areaDoc) => {
+    if (!areaDoc.data().retired) {
+      batch.set(areaDoc.ref, { retired: true, deletedAt: now }, { merge: true });
+      areasDeletedCount++;
+    }
+  });
+  await batch.commit();
+  return { outcome: "soft-deleted", areasDeletedCount };
 }
 
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
@@ -870,6 +946,25 @@ async function syncPlanToSpaceGraph(uid, planId) {
     // already exists decides which of the two payloads below gets written
     // (Canonical Space Preservation - see deriveFullReprojectionDocs).
     const [spaceSnap, projectSnap] = await Promise.all([tx.get(spaceRef), tx.get(projectRef)]);
+
+    // Retirement guard (DeletionDesign.md Addendum/Phase C1): a Space
+    // retired for ANY reason - merge/reclassification tombstone or, as of
+    // the soft-delete model, a user-initiated delete sitting in its 30-day
+    // retention window - must never receive a fresh projection write.
+    // Without this, a stale session's fire-and-forget live-mutation sync
+    // (Companion batch pause/wrap-up/completion, next-batch, rename) could
+    // silently resurrect real data under a Room the user already deleted -
+    // invisible (still retired, still hidden by every existing !retired
+    // filter) but real, and a race against the eventual hard-delete sweep's
+    // own "verify nothing references this Space" check. Not an error - the
+    // plan itself is perfectly valid, it just must not project into a
+    // retired destination. Only checked when the Space already exists; a
+    // brand-new Space can't be retired before it's ever been created.
+    if (spaceSnap.exists() && spaceSnap.data().retired === true) {
+      dlog(`[SPACE SHADOW SYNC] refusing to write under retired Space ${spaceId} for plan ${planId}`);
+      return { outcome: "target-retired", spaceId };
+    }
+
     const existingVersion = projectSnap.exists() && typeof projectSnap.data().sourceVersion === "number"
       ? projectSnap.data().sourceVersion
       : -1; // no shadow yet - always proceed
@@ -1080,6 +1175,16 @@ async function forceFullReprojection(uid, planId) {
     // whether the Space already exists decides which payload gets
     // written (Canonical Space Preservation - see deriveFullReprojectionDocs).
     const spaceSnap = await tx.get(spaceRef);
+
+    // Retirement guard - same reasoning as syncPlanToSpaceGraph's own
+    // identical check above (this function's sibling, not a separate
+    // concern): a retired Space (merge tombstone or soft-deleted, either
+    // way) must never receive a fresh projection write, even from the
+    // unconditional migration engine.
+    if (spaceSnap.exists() && spaceSnap.data().retired === true) {
+      dlog(`[FULL REPROJECTION] refusing to write under retired Space ${spaceId} for plan ${planId}`);
+      return { outcome: "target-retired", spaceId };
+    }
 
     // syncedAt uses this SDK's own serverTimestamp() sentinel - the shared
     // derivation deliberately omits it, since the client and admin SDKs'
@@ -1347,6 +1452,19 @@ async function establishTargetProjection(uid, planId) {
     await updateDoc(executionRef, { status: "blocked", blockedReasons: ["source plan disappeared during reprojection"] });
     return { outcome: "blocked", planId, reason: "source plan disappeared during reprojection" };
   }
+  // Retirement guard, narrow race window: claimReclassification already
+  // rejects a retired target at claim time via validateTargetSpace - this
+  // only fires if the target Space was retired AFTER a successful claim
+  // but BEFORE reprojection ran. Same treatment as source-plan-missing:
+  // blocked, not silently marked "established" (the plan's canonicalSpaceId/
+  // areaName/areaScope fields above were already written by this point,
+  // but with zero shadow Project ever created under the retired target -
+  // leaving execution in "blocked" is what lets a retry (once the caller
+  // resolves to a real, non-retired target) pick this back up correctly).
+  if (reprojectResult.outcome === "target-retired") {
+    await updateDoc(executionRef, { status: "blocked", blockedReasons: ["target Space was retired during reprojection"] });
+    return { outcome: "blocked", planId, reason: "target Space was retired during reprojection" };
+  }
 
   await updateDoc(executionRef, { status: "target-established" });
   return { outcome: "established", planId, targetSpaceId: execution.targetSpaceId, reprojectResult };
@@ -1566,6 +1684,22 @@ async function reclassifyLegacyPlan(uid, planId, request) {
 // so a source Area with plans still pointing at it can never look
 // retired just because its target twin already exists.
 async function establishTargetArea(uid, oldRoomId, oldAreaId, targetRoomId) {
+  // Retirement guard (DeletionDesign.md Addendum/Phase C1): unlike a
+  // vanished SOURCE Area (below, tolerated as a benign race - defensive
+  // null return), a retired TARGET Room is a real caller error, not a
+  // benign race - claimReclassification's own validateTargetSpace check
+  // already protects the per-plan Room move (Phase 3), but Area migration
+  // (Phase 2) runs BEFORE that and would otherwise create a real twin Area
+  // document under a retired Space before anything else catches the
+  // problem. Thrown, not returned null - this must abort the whole
+  // mergeRoomIntoRoom/resolveAreaForSinglePlanMove call loudly, not
+  // silently degrade into clearing areaId on every plan that would have
+  // migrated.
+  const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", targetRoomId));
+  if (targetSpaceSnap.exists() && targetSpaceSnap.data().retired === true) {
+    throw new Error(`Cannot establish a target Area under retired Room ${targetRoomId}`);
+  }
+
   const oldAreaRef = doc(db, "users", uid, "spaces", oldRoomId, "areas", oldAreaId);
   const oldAreaSnap = await getDoc(oldAreaRef);
   if (!oldAreaSnap.exists()) return null; // defensive - Area vanished somehow, nothing to migrate
@@ -6247,13 +6381,59 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const handleMoveRoomPlaceholder = () => {
     Alert.alert("Coming soon", "Moving a room's visits to another room will be available in a future update.");
   };
-  const handleDeleteRoomPlaceholder = (room) => {
+  // Phase C1 (DeletionDesign.md Soft-Delete Revision): real soft delete,
+  // replacing the prior "Coming soon" placeholder. One atomic writeBatch
+  // (softDeleteRoom) - nearly instant, so no processing overlay is used
+  // here, matching the design's own "no meaningful async work to cover"
+  // conclusion. On success, the Room is immediately gone from My Rooms
+  // (existing !retired filter, no new filtering code) - navigate back
+  // there rather than leave the user on a Room Detail screen for a Room
+  // that no longer resolves.
+  const handleDeleteRoom = (room) => {
     Alert.alert(
       `Delete ${room.displayName}?`,
-      "This will permanently remove all organizing plans, photos, sessions, and history associated with this room.",
+      "This will remove this room and all its organizing history. You can restore it from Recently Deleted within 30 days.",
       [
         { text: "Cancel", style: "cancel" },
-        { text: "Delete", style: "destructive", onPress: () => Alert.alert("Coming soon", "Deleting a whole room will be available in a future update.") },
+        {
+          text: "Delete", style: "destructive", onPress: async () => {
+            try {
+              await softDeleteRoom(user.uid, room.id);
+              setRooms((prev) => prev.filter((r) => r.id !== room.id));
+              setRoomDetailRoomId(null);
+              setShowHistory(true);
+            } catch (e) {
+              Alert.alert("Couldn't delete", e.message);
+            }
+          },
+        },
+      ]
+    );
+  };
+  // Per-Area "Delete" action (Room Detail's own AREAS IN THIS ROOM rows).
+  // Single-document soft delete (softDeleteArea) followed by an explicit
+  // Room summary recompute (the Room's own visitCount/latestPhotoUrl must
+  // no longer count this Area's visits - see updateSpaceRoomSummary's own
+  // comment for why this needs a live query, not a local decrement).
+  // Stays on Room Detail afterward - only the deleted Area's own state is
+  // patched locally, so the rest of the screen doesn't need a full re-fetch.
+  const handleDeleteArea = (area) => {
+    Alert.alert(
+      `Delete ${area.displayName}?`,
+      "This will remove this area and its organizing history. You can restore it from Recently Deleted within 30 days.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete", style: "destructive", onPress: async () => {
+            try {
+              await softDeleteArea(user.uid, roomDetailRoomId, area.id);
+              await updateSpaceRoomSummary(user.uid, roomDetailRoomId);
+              setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: true } : a)));
+            } catch (e) {
+              Alert.alert("Couldn't delete", e.message);
+            }
+          },
+        },
       ]
     );
   };
@@ -6957,11 +7137,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       );
     }
 
+    // Phase C1 (DeletionDesign.md Soft-Delete Revision): a visit whose
+    // areaId points at a now-retired Area must not appear anywhere in
+    // Room Detail's own visit list - soft-delete only ever touches the
+    // Area document itself (plan/shadow data is untouched during the
+    // retention window), so without this filter a soft-deleted Area's
+    // visits would keep showing here even though the Area they belonged
+    // to has already disappeared from AREAS IN THIS ROOM above.
+    // roomDetailAreas is already loaded with every Area including retired
+    // ones (see its own loading effect) - reused here, not a new query.
+    const retiredAreaIdsInRoom = new Set(roomDetailAreas.filter((a) => a.retired).map((a) => a.id));
+    const visiblePlans = roomDetailPlans.filter((p) => !p.areaId || !retiredAreaIdsInRoom.has(p.areaId));
+
     // Room Detail Layout Revision: LAST SESSION shows exactly the most
     // recent visit; EARLIER ORGANIZING VISITS shows every visit except
     // it, so the same visit is never rendered in both places at once.
-    const mostRecent = roomDetailPlans[0] || null;
-    const earlierVisits = roomDetailPlans.slice(1);
+    const mostRecent = visiblePlans[0] || null;
+    const earlierVisits = visiblePlans.slice(1);
     // The CTA is now scoped to THIS specific visit (Last Session) only,
     // not a room-wide search for any plan with unfinished work anywhere
     // (that was the prior design) - a deliberate narrowing per this
@@ -7218,14 +7410,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                         <View style={{ flex: 1 }}>
                           <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
                           <Text style={s.historyOverview} numberOfLines={1}>{`${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}</Text>
-                          <TouchableOpacity
-                            onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
-                            accessibilityLabel={`Organize Again in ${area.displayName}`}
-                            accessibilityRole="button"
-                            style={{ marginTop: 4, alignSelf: "flex-start" }}
-                          >
-                            <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
-                          </TouchableOpacity>
+                          {/* Phase C1: per-Area "Delete" action, alongside
+                              "Organize Again" on the same line - both are
+                              short single-word/two-word links, matching
+                              this screen's own established pattern of
+                              quiet/destructive text links (Move/Delete
+                              Room below) rather than a menu. */}
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 16, marginTop: 4 }}>
+                            <TouchableOpacity
+                              onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
+                              accessibilityLabel={`Organize Again in ${area.displayName}`}
+                              accessibilityRole="button"
+                            >
+                              <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              onPress={() => handleDeleteArea(area)}
+                              accessibilityLabel={`Delete ${area.displayName}`}
+                              accessibilityRole="button"
+                            >
+                              <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: "#DC2626" }}>Delete</Text>
+                            </TouchableOpacity>
+                          </View>
                         </View>
                       </View>
                     );
@@ -7256,16 +7462,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
               {/* Room-level actions (Section 1) - quiet/destructive text
                   links at the bottom of content, replacing the removed
-                  three-dot overflow. Both still placement only: Move isn't
-                  wired to reclassifyLegacyPlan yet, and Delete's real
-                  confirmation dialog leads only to a "Coming soon"
-                  acknowledgement, never an actual write - real deletion is
-                  Phase C. */}
+                  three-dot overflow. Move remains placement only (not
+                  wired to reclassifyLegacyPlan). Delete is real as of
+                  Phase C1 - soft delete only (handleDeleteRoom), the
+                  30-day hard-purge sweep is a later phase. */}
               <TouchableOpacity onPress={handleMoveRoomPlaceholder} style={{ marginTop: 28, alignItems: "center", paddingVertical: 10 }} accessibilityLabel="Move to another Room" accessibilityRole="button">
                 <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }}>Move to another Room</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={() => handleDeleteRoomPlaceholder(room)}
+                onPress={() => handleDeleteRoom(room)}
                 style={{ marginTop: 4, alignItems: "center", paddingVertical: 14, borderTopWidth: 1, borderTopColor: "#E6E9EE" }}
                 accessibilityLabel="Delete Room"
                 accessibilityRole="button"
