@@ -6545,7 +6545,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               await new Promise((resolve) => setTimeout(resolve, 300));
               await softDeleteArea(user.uid, roomDetailRoomId, area.id);
               await updateSpaceRoomSummary(user.uid, roomDetailRoomId);
-              setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: true } : a)));
+              // deletedAt must be included here, not just retired - the
+              // Recently Deleted Areas filter (toMillisDeletedAt/
+              // recentlyDeletedAreas below) requires BOTH fields, and only
+              // recognizes a Firestore Timestamp (.toMillis()) or a string
+              // (Date.parse) - a bare `new Date()` object matches neither
+              // branch and would fall through to 0, which fails the filter
+              // exactly the same way omitting the field entirely did.
+              // toISOString() matches the string branch those helpers
+              // already handle. Firestore itself received the authoritative
+              // serverTimestamp() in softDeleteArea above; this is only the
+              // client-side optimistic patch standing in until the next
+              // full reload reads the real value back.
+              setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: true, deletedAt: new Date().toISOString() } : a)));
             } catch (e) {
               Alert.alert("Couldn't delete", e.message);
             }
@@ -7099,6 +7111,34 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
+  // Menu navigation bug class (fourth+ occurrence - see openSpaceResults'
+  // own comment above for the first three: goHome, openSpaceResults,
+  // openCompanionSession). Every top-level screen below is its own
+  // early-return `if (flag) return (...)`, checked in the SAME fixed
+  // source order on every render (showHistory, roomDetailRoomId, showFaq,
+  // showMergeReview, showSpaceInspector, showAccount, showPaywall, ...).
+  // A menu item that sets only its OWN target flag can be silently masked
+  // by whichever of the others was left true from earlier in the session -
+  // confirmed not every "open menu" header button across every screen
+  // resets its own flag before opening the menu, so this can't be an
+  // invariant the menu items rely on. Every destination below clears the
+  // full set unconditionally first, the same "clear everything you might
+  // be leaving, don't assume it's already clear" discipline as the three
+  // prior fixes - applied once here since, unlike those three, every menu
+  // item needs the exact same clear list and differs only in which flag
+  // ends up true.
+  const closeMenuAndGoTo = (setTarget) => {
+    setShowMenu(false);
+    setShowHistory(false);
+    setRoomDetailRoomId(null);
+    setShowFaq(false);
+    setShowMergeReview(false);
+    setShowSpaceInspector(false);
+    setShowAccount(false);
+    setShowPaywall(false);
+    setTarget(true);
+  };
+
   if (showMenu) {
     return (
       <SafeAreaView style={s.safe}>
@@ -7120,19 +7160,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
           {[
             { icon: Home, label: "Home", action: goHome },
-            { icon: Folder, label: "My Rooms", action: () => { setShowMenu(false); setShowHistory(true); } },
+            { icon: Folder, label: "My Rooms", action: () => closeMenuAndGoTo(setShowHistory) },
             // §12 Migration Part 3, Pass 2 - always reachable regardless of
             // banner state (MergeProposalDesign.md Section 3 / this pass's
             // "Menu access" requirement), not gated on pendingMergeCandidates.length.
-            { icon: Layers, label: "Review Duplicate Rooms", action: () => { setShowMenu(false); setShowMergeReview(true); } },
-            { icon: User, label: "Account", action: () => { setShowMenu(false); setShowAccount(true); } },
-            { icon: Star, label: "Upgrade to Pro", action: () => { setShowMenu(false); setShowPaywall(true); }, hide: isPro },
-            { icon: HelpCircle, label: "Help & FAQ", action: () => { setShowMenu(false); setShowFaq(true); } },
+            { icon: Layers, label: "Review Duplicate Rooms", action: () => closeMenuAndGoTo(setShowMergeReview) },
+            { icon: User, label: "Account", action: () => closeMenuAndGoTo(setShowAccount) },
+            { icon: Star, label: "Upgrade to Pro", action: () => closeMenuAndGoTo(setShowPaywall), hide: isPro },
+            { icon: HelpCircle, label: "Help & FAQ", action: () => closeMenuAndGoTo(setShowFaq) },
             { icon: Mail, label: "Contact Us", action: () => Linking.openURL("mailto:hello@uncluttrd.app") },
-            { icon: Wrench, label: "🔍 Space Inspector (dev)", action: () => { setShowMenu(false); setShowSpaceInspector(true); }, hide: !__DEV__ },
+            { icon: Wrench, label: "🔍 Space Inspector (dev)", action: () => closeMenuAndGoTo(setShowSpaceInspector), hide: !__DEV__ },
           ].filter(item => !item.hide).map((item, i) => (
             <TouchableOpacity key={i} style={s.menuItem} onPress={() => {
-              if (item.pro && !isPro) { setShowMenu(false); setShowPaywall(true); return; }
+              if (item.pro && !isPro) { closeMenuAndGoTo(setShowPaywall); return; }
               item.action();
             }}>
               <item.icon size={20} color={BRAND.navy} strokeWidth={2.25} />
