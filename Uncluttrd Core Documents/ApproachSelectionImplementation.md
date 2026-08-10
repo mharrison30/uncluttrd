@@ -62,4 +62,7 @@ Tests a-d, k, m, n, l were verified by direct code inspection (no RN simulator/d
 
 ## OTA
 
-Committed and pushed to the `staging` EAS Update branch. Update IDs recorded in the commit that follows this report.
+Committed (`4c06695`) and pushed to the `staging` EAS Update branch.
+
+- iOS update ID: `019feda6-7b70-75b8-bcdb-3dc27b8fb8f2`
+- Android update ID: `019feda6-7b70-731d-ac27-da6364d44a12`
