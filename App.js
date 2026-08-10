@@ -9925,7 +9925,17 @@ const s = StyleSheet.create({
   // same rounded corners as the card, instead of a square panel poking out
   // past them.
   areaSwipeContainer: { marginBottom: 10, borderRadius: 14, overflow: "hidden" },
-  areaSwipeDeleteAction: { flex: 1, width: 84, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center" },
+  // Fixed width ONLY, deliberately no flex - Swipeable measures this
+  // rendered action's own width (via onLayout) to determine both the
+  // "open" resting position AND the max swipe distance (overshootRight
+  // is false below, so it can never exceed this). `flex: 1` here was the
+  // original bug: flex's own flexBasis:0 wins over an explicit `width`
+  // on the row's main axis, so the button silently stretched to fill the
+  // ENTIRE row's width instead of staying a fixed 80px - producing a
+  // full-row slide with no way back, not the intended narrow reveal.
+  // Height needs no explicit value - the actions row's default
+  // alignItems:"stretch" already fills it to match the card's height.
+  areaSwipeDeleteAction: { width: 80, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center" },
   historyIcon: { width: 66, height: 66, backgroundColor: BRAND.greenLight, borderRadius: 16, alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden" },
   historySpace: { fontSize: 14, fontFamily: "Inter_700Bold", color: BRAND.ink },
   historyDate: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
