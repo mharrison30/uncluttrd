@@ -2255,6 +2255,40 @@ const TIERS = [
   { id: "premium", label: "Premium", range: "$200+", icon: Diamond, color: BRAND.purple, bg: BRAND.purpleLight, border: BRAND.purpleBorder },
 ];
 
+// Approach Selection Phase A (ApproachSelectionDesign.md Section 3): fixed,
+// non-AI-authored spending bands - the single source of truth for every
+// approach's displayed estimatedSpendRange. The AI only ever classifies
+// scopeSize; per the analyze() prompt's own explicit instruction it never
+// returns a dollar amount anywhere in its response - this table (via
+// applyDeterministicSpendRanges below) is what actually produces the
+// persisted/displayed value every time, deterministically, never the
+// model's own arithmetic.
+const SCOPE_SPEND_TABLE = {
+  "micro-area": { simple: "$0-$15", polished: "$15-$50", elevated: "$50-$150" },
+  "small-area": { simple: "$0-$25", polished: "$25-$75", elevated: "$75-$250" },
+  "room-section": { simple: "$0-$50", polished: "$50-$175", elevated: "$175-$500" },
+  "whole-room": { simple: "$0-$100", polished: "$100-$350", elevated: "$350-$1000" },
+  "large-room": { simple: "$0-$200", polished: "$200-$600", elevated: "$600-$2000" },
+};
+
+// Pure. Overwrites each approach's estimatedSpendRange in place from the
+// fixed table above, keyed by the AI's own scopeSize classification -
+// called once, right after parsing the AI response and before that object
+// is displayed (setResults) or saved (savePlanToHistory), so both always
+// see the same deterministic value. Falls back to "room-section" (a
+// middle-of-the-road default) when scopeSize is missing or doesn't match
+// one of the five known keys, so a malformed classification degrades to a
+// reasonable default instead of leaving estimatedSpendRange undefined.
+function applyDeterministicSpendRanges(parsed) {
+  const band = SCOPE_SPEND_TABLE[parsed.scopeSize] || SCOPE_SPEND_TABLE["room-section"];
+  ["simple", "polished", "elevated"].forEach((id) => {
+    if (parsed.approaches?.[id]) {
+      parsed.approaches[id].estimatedSpendRange = band[id];
+    }
+  });
+  return parsed;
+}
+
 const REFERRAL_SOURCES = [
   { id: "instagram", label: "Instagram" },
   { id: "facebook", label: "Facebook" },
@@ -3603,11 +3637,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
 
   // Initializes or resumes the Companion loop whenever a new plan's results arrive.
-  // A fresh analysis returns firstActionBatch as an array of plain strings (see
-  // the analyzePhoto prompt); a reopened saved plan returns the persisted
-  // currentBatch shape { batchIndex, suggestedAt, items: [{id, text, status}] }.
-  // Both are handled here so resuming a saved plan picks up exactly where it
-  // was left, not from scratch.
+  // A reopened saved plan returns the persisted currentBatch shape
+  // { batchIndex, suggestedAt, items: [{id, text, status}] } - handled by
+  // the first branch below either way, fresh or resumed, old-format or new
+  // (savePlanToHistory always writes a real currentBatch at save time now,
+  // old-format from firstActionBatch, new-format from the TEMPORARY
+  // simple.taskChecklist fallback - see savePlanToHistory's own comment).
+  // The second branch below only ever fires for a FRESH analysis, before
+  // its own save has round-tripped currentBatch back into `results` -
+  // Approach Selection Phase A (ApproachSelectionDesign.md Section 5,
+  // task instruction 7): reads approaches.simple.taskChecklist, not the
+  // old top-level firstActionBatch, which the new prompt no longer
+  // returns at all. TEMPORARY: deliberately does NOT set selectedApproach
+  // or write an approachHistory entry - the plan stays genuinely
+  // unselected, this exists purely so Companion has something to show
+  // before Phase B adds real approach-selection UI.
   useEffect(() => {
     if (!results) return;
     setUnresolvedReview(null);
@@ -3616,11 +3660,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setBatchItems(results.currentBatch.items);
       setCompanionStage("batch-active");
       // Only reached when reopening a saved plan (a fresh analysis composes
-      // batchItems from firstActionBatch below, then batch_shown fires from
-      // analyze() itself). This is a resumed view, not a freshly generated one.
+      // batchItems from the branch below instead, then batch_shown fires
+      // from analyze()/completeRoomConfirmation itself). This is a resumed
+      // view, not a freshly generated one.
       logEvent(getAnalytics(), "batch_shown", { planId: currentPlanId, batchIndex: results.currentBatch.batchIndex || 1 });
-    } else if (Array.isArray(results.firstActionBatch)) {
-      const items = results.firstActionBatch
+    } else if (Array.isArray(results.approaches?.simple?.taskChecklist)) {
+      const items = results.approaches.simple.taskChecklist
         .filter(t => typeof t === "string" && t.trim())
         .map(text => ({ id: makeItemId(), text, status: "pending" }));
       setCompanionBatchIndex(1);
@@ -4317,7 +4362,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         inheritedSpaceName = targetSpaceSnap.data().displayName || null;
       }
       const entry = {
-        schemaVersion: 1,
+        // Approach Selection Phase A: every plan saved from now on is the
+        // new approaches-based schema (bumped from 1) - old plans already
+        // saved keep schemaVersion 1 forever (no backfill,
+        // ApproachSelectionDesign.md Section 11), so this field alone
+        // (or, equivalently, tiers vs. approaches presence) is what every
+        // reader uses to pick the right rendering path.
+        schemaVersion: 2,
         shadowSourceVersion: 1,
         createdAt: new Date().toISOString(),
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
@@ -4382,13 +4433,40 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           : (plan.spaceName ? { spaceName: plan.spaceName } : {})),
         overview: plan.overview,
         itemsFound: plan.itemsFound,
-        tiers: plan.tiers,
+        // Approach Selection Phase A (ApproachSelectionDesign.md Sections
+        // 2/11): replaces tiers entirely for every plan saved from now on -
+        // no `tiers` key at all on a new-format plan, which is itself the
+        // schema-version discriminator every reader below keys off. problemsFound/
+        // scopeSize/approaches mirror the AI's own response shape 1:1 -
+        // each approach's estimatedSpendRange was already overwritten by
+        // applyDeterministicSpendRanges (analyze()'s own call, right after
+        // parsing) before this function ever sees `plan`, so what's stored
+        // here is never the AI's own dollar-string authorship, always the
+        // fixed scope x approach table's value.
+        problemsFound: plan.problemsFound,
+        scopeSize: plan.scopeSize,
+        approaches: plan.approaches,
+        // Genuinely null - Phase A never sets this, even though the
+        // TEMPORARY currentBatch fallback below reads simple.taskChecklist.
+        // Those two facts don't contradict each other: this field records
+        // the user's own explicit choice, which doesn't exist yet (Phase B
+        // adds the selection UI) - reading one approach's tasks as a
+        // stand-in for "something to show Companion" is not the same as
+        // the user having selected that approach.
+        selectedApproach: null,
         proTip: plan.proTip,
         vizImages: {},
-        currentBatch: Array.isArray(plan.firstActionBatch) && plan.firstActionBatch.length ? {
+        // TEMPORARY (Approach Selection Phase A only - see selectedApproach
+        // above, and ApproachSelectionDesign.md Section 5 / task
+        // instruction 7): simple.taskChecklist stands in for the old
+        // top-level firstActionBatch purely so Companion has something to
+        // show before Phase B adds real approach selection. Remove this
+        // fallback once Phase B seeds Companion from the user's own
+        // selectedApproach instead.
+        currentBatch: Array.isArray(plan.approaches?.simple?.taskChecklist) && plan.approaches.simple.taskChecklist.length ? {
           batchIndex: 1,
           suggestedAt: new Date().toISOString(),
-          items: plan.firstActionBatch
+          items: plan.approaches.simple.taskChecklist
             .filter(t => typeof t === "string" && t.trim())
             .map(text => ({ id: makeItemId(), text, status: "pending" })),
         } : null,
@@ -4797,7 +4875,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     } else {
       newPlanId = await savePlanToHistory(planWithArea);
     }
-    const validBatch = Array.isArray(parsedResult.firstActionBatch) && parsedResult.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+    // TEMPORARY (Approach Selection Phase A): checks the same
+    // simple.taskChecklist fallback the [results] effect and
+    // savePlanToHistory both use - see either's own comment.
+    const validBatch = Array.isArray(parsedResult.approaches?.simple?.taskChecklist) && parsedResult.approaches.simple.taskChecklist.filter(t => typeof t === "string" && t.trim()).length > 0;
     if (validBatch) {
       logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
     } else {
@@ -4973,7 +5054,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setResults(confirmedPlan);
     logEvent(getAnalytics(), "plan_completed");
 
-    const validBatch = Array.isArray(confirmedPlan.firstActionBatch) && confirmedPlan.firstActionBatch.filter(t => typeof t === "string" && t.trim()).length > 0;
+    // TEMPORARY (Approach Selection Phase A) - same simple.taskChecklist
+    // fallback as finalizeAnalysisResult's own identical check.
+    const validBatch = Array.isArray(confirmedPlan.approaches?.simple?.taskChecklist) && confirmedPlan.approaches.simple.taskChecklist.filter(t => typeof t === "string" && t.trim()).length > 0;
     if (validBatch) {
       logEvent(getAnalytics(), "batch_shown", { planId: newPlanId, batchIndex: 1 });
     } else {
@@ -5284,9 +5367,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // live state.
     const returningContext = organizeAgainContext;
     try {
-      const budgetNote = budget
-        ? `The user has a specific budget of $${budget}. Highlight which tier best fits their budget, but still show all three.`
-        : `Show all three tiers: Budget (under $50), Mid-Range ($50-$200), and Premium ($200+).`;
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1e): exactly
       // the two justified context items, nothing else - full past
       // overview/proTip text, session history, and completed items are
@@ -5357,7 +5437,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           const areaSnap = await getDoc(doc(db, "users", user.uid, "spaces", returningContext.spaceId, "areas", returningContext.areaId));
           const knownAreaName = areaSnap.exists() ? (areaSnap.data().displayName || null) : null;
           if (knownRoomName && knownAreaName) {
-            knownIdentityNote = `\n\nThe user has confirmed they are organizing "${knownAreaName}" in their "${knownRoomName}". Use these exact names in all generated text (overview, tasks, recommendations, product suggestions, pro tip) - never refer to this space by any other room or area name, even if the photo visually resembles a different kind of room. Do not reclassify or rename the Room or Area. Still analyze the actual photo content for clutter, tasks, and recommendations - this only affects naming, not the organizing analysis itself.`;
+            knownIdentityNote = `\n\nThe user has confirmed they are organizing "${knownAreaName}" in their "${knownRoomName}". Use these exact names in all generated text (overview, approach strategies, organizing guidance, task checklists, product recommendations, pro tip) - never refer to this space by any other room or area name, even if the photo visually resembles a different kind of room. Do not reclassify or rename the Room or Area. Still analyze the actual photo content for clutter, tasks, and recommendations - this only affects naming, not the organizing analysis itself.`;
           }
         } catch (identityLookupErr) {
           // Non-fatal - proceed without the grounding note rather than
@@ -5427,7 +5507,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // check as the last instruction before the JSON schema, closest to
       // where generation actually begins.
       const roomAreaInstruction = `Before returning your classification, answer three separate questions about this photo, in this exact order - do not let one contaminate another: (1) ORGANIZING TARGET - what is the primary thing or area the user appears to be asking Uncluttrd to organize in this photo? This is the organizing target: the specific thing they want help with, not a survey of everything visible in the frame. (2) PARENT ROOM - what room of the home is that organizing target located in? Use a short, common label (Living Room, Kitchen, Garage, Bedroom) for suggestedRoomName. (3) SCOPE - Before classifying areaScope, answer this question first: "Is there ONE primary thing or area that the user is asking Uncluttrd to organize in this photo?" If YES, the answer is sub-area, even if other furniture, walls, windows, or decorative items are visible in the background. Set suggestedAreaName to a short label for that organizing target. If NO - the photo genuinely depicts a general room with no single organizing focus and you cannot identify any one area the user is targeting - then the answer is whole-room and suggestedAreaName is null. Do NOT classify as whole-room merely because: multiple furniture types are visible; multiple furniture pieces are present; the photo captures several items across the room; you see decorative elements, plants, or windows alongside the main subject; the photo is not "tightly framed" on one fixture. Any of those can be true while the photo is still clearly ABOUT one organizing target. The question is always: what does the user want to organize? If you can name it, it's sub-area. The third possible classification is "ambiguous" (the room-level label itself commonly means either a fully independent room or a named zone within a larger room, depending on the specific home - for example Pantry, Closet, Mudroom, Laundry Area, or Home Office - and this one photo does not give you enough context to tell which this home means). When ambiguous, still provide your best suggestedRoomName as the standalone-room interpretation - the app will ask the user to confirm which it actually is. Never invent a numerical confidence score. For roomReason and areaReason, cite the specific visible evidence behind your classification (for example "multiple seating pieces and a TV console visible" or "photo is centered on a single shelving unit that is clearly the organizing target, with a couch and window only partially visible in the background") - never just restate the label itself as its own justification. SELF-CONSISTENCY CHECK (do this last, after you have drafted your overview and recommendations in your own reasoning): does your overview describe organizing ONE specific area, fixture, or piece of furniture? If yes, your areaScope MUST be "sub-area" and suggestedAreaName MUST name that area. Your overview and your classification must agree - they are describing the same photo, not answering different questions. If your overview says "your corner shelf" then areaScope cannot be "whole-room." Before returning your JSON, re-read your own overview field and your own areaScope field together and confirm they tell the same story.\n\n`;
-      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${budgetNote}\n\nIMPORTANT: For each tier, the three suggested products must collectively ADD UP to fall within that tier's price range. This is a total budget, not a per-item price. For the Budget tier, all three product prices combined must total under $50 (for example $15 + $20 + $12 = $47, NOT three items at ~$50 each). For Mid-Range, the three combined must total within $50-$200. For Premium, combined total should be $200 or more. Check your math before responding.\n\nAlso identify a balanced first working session's worth of doable-right-now steps for this space, independent of budget tier - a small checklist the user can work through in one sitting, not a single tiny step and not an exhaustive project plan. Size it qualitatively, not by a fixed count: don't return several trivial items that add up to almost nothing (e.g. five 30-second tasks), and don't disguise one overwhelming task as a single checklist item - prefer a genuine mix suited to what this specific space actually needs (this could be 2 substantial steps, 4 medium ones, or several small ones - let the photo decide). Never estimate or state how long any step will take. Before choosing each step, verify the specific problem you're describing is genuinely visible in this exact photo, not a common decluttering trope you're defaulting to. Don't suggest gathering cables, sorting a drawer or organizer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If no specific, genuinely visible problem can be identified, return a single item saying so honestly instead of defaulting to a trope - for example, "This space already looks well organized. Feel free to make it your own from here." Describe each step in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label.${priorContextNote}${knownIdentityNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"firstActionBatch":["one or two warm sentences describing one doable-right-now step","..."],"tiers":[{"id":"budget","label":"Budget","range":"Under $50","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"📦"},{"name":"product","price":"$X","searchQuery":"search","icon":"🗂️"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏷️"}]},{"id":"mid","label":"Mid-Range","range":"$50-$200","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"🗃️"},{"name":"product","price":"$X","searchQuery":"search","icon":"✨"},{"name":"product","price":"$X","searchQuery":"search","icon":"📋"}]},{"id":"premium","label":"Premium","range":"$200+","suggestions":["tip1","tip2","tip3","tip4"],"products":[{"name":"product","price":"$X","searchQuery":"search","icon":"💎"},{"name":"product","price":"$X","searchQuery":"search","icon":"🏡"},{"name":"product","price":"$X","searchQuery":"search","icon":"✦"}]}],"proTip":"one expert insight"}`;
+      // Approach Selection Phase A (ApproachSelectionDesign.md Sections
+      // 2/3): replaces the old per-tier budget-math + single checklist
+      // paragraph entirely. scopeClassificationInstruction/
+      // approachesInstruction below are the only new prompt content -
+      // priorPhotoPreamble, priorContextNote, knownIdentityNote, the
+      // em-dash rule, and roomAreaInstruction are all unchanged, exactly
+      // as before this phase (confirmed independent in the design doc's
+      // own Section 1 audit).
+      const scopeClassificationInstruction = `Before writing anything else, classify the SIZE of what is being organized in this photo into exactly one of five scope levels for scopeSize - this determines realistic spending, not the room's own name: micro-area (a single shelf, drawer, or small fixture), small-area (a desk, vanity, or counter section), room-section (an entertainment center, closet, or pantry), whole-room (a full kitchen, bedroom, or garage), or large-room (an open-plan living area or a full basement). Base this on what is actually visible and being organized, not the parent room's own name - a single drawer inside a kitchen is still micro-area, not whole-room.`;
+      const approachesInstruction = `Identify the genuine problems visible in this photo and list each one in problemsFound, with a short, stable, lowercase-hyphenated id (for example "visible-cords") and a one-sentence description grounded in exactly what is visible - never a generic clutter observation you cannot point to in this specific photo.\n\nThen generate THREE separate, complete organizing approaches for this exact space: "simple" (Keep It Simple - maximize improvement with minimal purchasing or change, emphasizing decluttering and reusing what the user already has), "polished" (Polished & Practical - targeted upgrades, a real balance of function, appearance, and cost), and "elevated" (Elevated Finish - prioritizes aesthetics, materials, and concealment for a fully finished result). Each approach must be a genuinely different, internally coherent strategy for the SAME photo, not the same plan with products added or removed and different adjectives - if all three would tell the user to do the same things in the same order, you have not done this correctly.\n\nFor each approach, write organizingGuidance (3-4 general tips in that approach's own spirit, independent of any specific product) and taskChecklist (3-6 doable-right-now tasks for a first working session under that approach, each described in one or two warm sentences, in the voice of a calm, encouraging professional organizer, not a task-list label). Every tip and task must be grounded in a problem genuinely visible in this exact photo, not a common decluttering trope you default to - do not suggest gathering cables, sorting a drawer, or grouping similar items unless you can point to a specific instance of that exact problem actually visible and unaddressed in this photo. If a specific approach genuinely has little left to do, it is correct for that approach's guidance and checklist to say so honestly rather than inventing busywork.\n\nFor each approach, separately decide whether any of ITS OWN problems would genuinely benefit from a purchase - many are solved by rearranging what is already there, especially under Keep It Simple. For each one that would, add ONE recommendation to that approach's own productRecommendations: productType (a product category, never a specific product name or brand - no real product catalog backs that specificity), reason (one sentence grounded in the specific problem, not a generic benefit), searchTerms (retailer-independent search words a person could type into any shopping search box), icon (choose exactly one of: cable, basket, bin, shelf, hook, label, drawer-organizer, hanger, bag, other), relatedProblemId (must match a real problemsFound id), and approachId (must match this approach's own id: simple, polished, or elevated). Return between 0 and 4 recommendations per approach, independently for each approach - Keep It Simple will often have zero, and that is a correct, complete answer, never a failure to fix. Never invent a recommendation just to fill a slot.\n\nFor each approach, also write visualizationDirection: one descriptive sentence (not a full image-generation prompt, just the creative direction) describing what that approach's finished result should look like for this specific space - distinct enough between the three approaches that someone reading all three, without labels, could tell which is which.\n\nReference spending bands, by scope and approach, for your own calibration only - do not return any dollar amount anywhere in your response, only scopeSize; the app determines the actual displayed spending range from these same fixed bands:\nmicro-area: Keep It Simple $0-$15, Polished & Practical $15-$50, Elevated Finish $50-$150.\nsmall-area: Keep It Simple $0-$25, Polished & Practical $25-$75, Elevated Finish $75-$250.\nroom-section: Keep It Simple $0-$50, Polished & Practical $50-$175, Elevated Finish $175-$500.\nwhole-room: Keep It Simple $0-$100, Polished & Practical $100-$350, Elevated Finish $350-$1000.\nlarge-room: Keep It Simple $0-$200, Polished & Practical $200-$600, Elevated Finish $600-$2000.\nUse the row matching your own scopeSize classification to keep each approach's organizingGuidance, taskChecklist, and productRecommendations realistic for that spending level - Keep It Simple's own recommendations, if any, should stay cheap and minimal even within a large-room band; Elevated Finish's should feel like a genuine investment even within a micro-area band.\n\nAlso write one proTip: general organizing wisdom for this type of space, not tied to any single approach.`;
+      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${scopeClassificationInstruction}\n\n${approachesInstruction}${priorContextNote}${knownIdentityNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":["3-6 specific items or clutter types you can actually see in the photo"],"problemsFound":[{"id":"short-hyphenated-id","description":"one sentence grounded in what is visible"}],"scopeSize":"micro-area, small-area, room-section, whole-room, or large-room","approaches":{"simple":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"cable, basket, bin, shelf, hook, label, drawer-organizer, hanger, bag, or other","relatedProblemId":"matching problemsFound id","approachId":"simple"}],"visualizationDirection":"one descriptive sentence"},"polished":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"icon id","relatedProblemId":"matching problemsFound id","approachId":"polished"}],"visualizationDirection":"one descriptive sentence"},"elevated":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"icon id","relatedProblemId":"matching problemsFound id","approachId":"elevated"}],"visualizationDirection":"one descriptive sentence"}},"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -5509,7 +5599,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // explicitly, in savePlanToHistory) - this is a local display
       // convenience on the transient in-memory object, same value either way.
       parsed.spaceType = parsed.suggestedRoomName;
-      dlog(`[COMPANION DEBUG 3] parsed.firstActionBatch: ${JSON.stringify(parsed.firstActionBatch)} | isArray: ${Array.isArray(parsed.firstActionBatch)}`);
+      // Approach Selection Phase A (ApproachSelectionDesign.md Section 3):
+      // overwrites each approach's estimatedSpendRange from the fixed
+      // scope x approach table, keyed by the AI's own scopeSize
+      // classification - never trusts any dollar figure the model might
+      // have written itself (the prompt asks it not to write one at all;
+      // this is the actual enforcement, not just the prompt's own good
+      // behavior). Applied here, before setResults/finalizeAnalysisResult
+      // below, so both the in-memory display and the saved plan document
+      // see the identical deterministic value.
+      applyDeterministicSpendRanges(parsed);
+      dlog(`[COMPANION DEBUG 3] parsed.scopeSize: ${parsed.scopeSize} | approaches: ${JSON.stringify(Object.keys(parsed.approaches || {}))} | simple.taskChecklist: ${JSON.stringify(parsed.approaches?.simple?.taskChecklist)} | isArray: ${Array.isArray(parsed.approaches?.simple?.taskChecklist)}`);
       // Room-First Identity (Implementation Phase A, Constraint 2):
       // roomReason/areaReason are evaluation-only - logged here, to this
       // file's own dev-only debug buffer (debugShareLog, never Firestore),
@@ -9000,6 +9100,49 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </View>
             );
           })}
+          {/* TEMPORARY (Approach Selection Phase A only -
+              ApproachSelectionDesign.md Section 4 is the REAL Results
+              redesign, not built yet - task instruction 6). Plain
+              dev/inspection rendering so the new schema is actually
+              visible on a real device during Phase A testing - not
+              styled, not final, not reachable by a real user doing
+              anything differently than before (no selection, no "Start
+              This Plan", nothing tappable here routes anywhere). Only
+              renders for a new-format plan (results.approaches present);
+              old-format plans keep rendering the unmodified tier cards
+              above, completely untouched. */}
+          {results.approaches && (
+            <View style={{ marginTop: 20, padding: 14, borderRadius: 10, borderWidth: 2, borderColor: "#DC2626", borderStyle: "dashed", backgroundColor: "#FEF2F2" }}>
+              <Text style={{ fontSize: 12, fontFamily: "Inter_700Bold", color: "#DC2626", marginBottom: 10 }}>
+                DEV ONLY - Approach Selection Phase A (not final UI)
+              </Text>
+              <Text style={{ fontSize: 12, color: "#64748B", marginBottom: 12 }}>scopeSize: {results.scopeSize || "(missing)"}</Text>
+              {["simple", "polished", "elevated"].map((id) => {
+                const a = results.approaches?.[id];
+                if (!a) return <Text key={id} style={{ color: "#DC2626", marginBottom: 8 }}>{id}: MISSING</Text>;
+                return (
+                  <View key={id} style={{ marginBottom: 16, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: "#FCA5A5" }}>
+                    <Text style={{ fontSize: 14, fontFamily: "Inter_700Bold", color: "#0F2A52" }}>{id} - {a.estimatedSpendRange}</Text>
+                    <Text style={{ fontSize: 13, color: "#334155", marginTop: 4 }}>{a.strategyDescription}</Text>
+                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>ORGANIZING GUIDANCE</Text>
+                    {(a.organizingGuidance || []).map((g, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• {g}</Text>)}
+                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>TASK CHECKLIST</Text>
+                    {(a.taskChecklist || []).map((t, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>{i + 1}. {t}</Text>)}
+                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>PRODUCT RECOMMENDATIONS ({(a.productRecommendations || []).length})</Text>
+                    {(a.productRecommendations || []).length === 0 ? (
+                      <Text style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic" }}>(none - valid outcome)</Text>
+                    ) : (a.productRecommendations || []).map((p, i) => (
+                      <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• [{p.icon}] {p.productType} - {p.reason} (problem: {p.relatedProblemId}, approach: {p.approachId})</Text>
+                    ))}
+                    <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 8 }}>VISUALIZATION DIRECTION</Text>
+                    <Text style={{ fontSize: 12, color: "#334155" }}>{a.visualizationDirection}</Text>
+                  </View>
+                );
+              })}
+              <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color: "#64748B", marginTop: 4 }}>PROBLEMS FOUND</Text>
+              {(results.problemsFound || []).map((p, i) => <Text key={i} style={{ fontSize: 12, color: "#334155" }}>• [{p.id}] {p.description}</Text>)}
+            </View>
+          )}
           {renderPhotoZoomModal()}
 
           {results.proTip && (

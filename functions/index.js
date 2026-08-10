@@ -200,16 +200,25 @@ exports.analyzePhoto = onCall(
       const message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
         // Bumped from 1500 (2026-08-08, JSON parse fragility
-        // investigation): the response is a single JSON object carrying
-        // overview, itemsFound, three full tiers (suggestions + products
-        // each), room/area classification + reasoning fields, and the
-        // checklist - 1500 left too little headroom, and a response cut
-        // off mid-generation still returns HTTP 200 with partial text (no
+        // investigation), then from 4000 to 6000 (Approach Selection Phase
+        // A, ApproachSelectionDesign.md Sections 2/3): the response is a
+        // single JSON object now carrying THREE full approaches
+        // (strategyDescription, organizingGuidance, taskChecklist,
+        // productRecommendations, visualizationDirection each) plus
+        // problemsFound, scopeSize, and the existing room/area
+        // classification + reasoning fields - meaningfully larger than the
+        // old three-tier schema this replaces. A response cut off
+        // mid-generation still returns HTTP 200 with partial text (no
         // server-side JSON validation happens here), surfacing only later
-        // as a client-side JSON.parse failure. 4000 is comfortably below
-        // claude-sonnet-4-5's standard (non-beta) 8192 output-token cap,
-        // so no extended-output beta header is needed.
-        max_tokens: 4000,
+        // as a client-side JSON.parse failure - the same fragility that
+        // originally motivated the 1500->4000 bump, now recurring at the
+        // new schema's larger size. 6000 is comfortably below
+        // claude-sonnet-4-5's standard (non-beta) 8192 output-token cap, so
+        // no extended-output beta header is needed. Verified empirically
+        // against a real photo as part of this same implementation pass -
+        // stop_reason: "end_turn", not "max_tokens" (see the existing
+        // stop_reason/looksLikeValidJson logging just below).
+        max_tokens: 6000,
         messages: [
           {
             role: "user",
