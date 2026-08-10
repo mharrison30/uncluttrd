@@ -381,6 +381,14 @@ async function syncPlanToSpaceGraphAdmin(db, uid, planId) {
     // 1:1: both reads happen before any write, as every transaction
     // requires.
     const [spaceSnap, projectSnap] = await Promise.all([tx.get(spaceRef), tx.get(projectRef)]);
+
+    // Retirement guard (DeletionDesign.md Addendum/Phase C1) - mirrors
+    // App.js's syncPlanToSpaceGraph 1:1.
+    if (spaceSnap.exists && spaceSnap.data().retired === true) {
+      console.log(`[SPACE SHADOW SYNC ADMIN] refusing to write under retired Space ${spaceId} for plan ${planId}`);
+      return { outcome: "target-retired", spaceId };
+    }
+
     const existingVersion = projectSnap.exists && typeof projectSnap.data().sourceVersion === "number" ? projectSnap.data().sourceVersion : -1;
     if (existingVersion > planVersion) {
       return { outcome: "no-op", reason: "existing shadow already at or ahead of this plan version", existingVersion, planVersion };
