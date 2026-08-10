@@ -1164,6 +1164,229 @@ async function hardDeleteRoomAdmin(db, uid, roomId) {
   return { outcome: "hard-deleted", areaCount: areaIds.length, deletedWholeRoomPlanCount, affectedCandidateIds, roomId };
 }
 
+/**
+ * hardDeleteAccountAdmin(db, uid) - Phase C5 (DeletionImplementation.md).
+ * The final, top-level orchestration: deletes EVERYTHING for a uid,
+ * bypassing soft-delete and retention entirely - an account deletion has
+ * no retention window (DeletionDesign.md's own "Soft-Delete Revision" §4:
+ * "there's no My Rooms left to show a Recently Deleted section in").
+ * Reuses the Phase C3 engine (hardDeleteRoomAdmin/hardDeleteAreaAdmin/
+ * deletePlanAdmin/deleteStoragePrefixesAdmin) for every actual deletion -
+ * this function only orchestrates discovery/ordering/retry-safety around
+ * calling them, exactly like Phase C4's runExpiredDeletionSweep one level
+ * down.
+ *
+ * uid alone is sufficient identity - never assumes users/{uid} exists.
+ * Firestore subcollections are never physically dependent on their parent
+ * document existing, so every query below works identically for a genuine
+ * "parentless" account (plans with no profile doc) - the real production
+ * case this phase exists to close.
+ *
+ * Identity-last, content-gated: the same "parent-last with a gate"
+ * principle Phase C3's Invariant 2 established for a single Room/Area,
+ * applied one level up to the whole account. The users/{uid} profile doc
+ * and the Firebase Auth account are removed ONLY after every content
+ * phase (1 and 2) reports zero failures - if anything failed, this
+ * function returns `{outcome: "content-incomplete", ...}` BEFORE touching
+ * either, so uid remains a valid, rediscoverable retry point. A partial
+ * failure can never strand content with no identity left to find it by.
+ *
+ * Restartable/idempotent by construction, not a stored checkpoint (the
+ * same Restartability Principle this whole file already commits to
+ * elsewhere): every phase re-derives "what's left" from a live query on
+ * every call. Re-running against an already-fully-deleted uid is a
+ * genuine no-op - every discovery query returns empty, and Phase 3's own
+ * profile-doc-missing / Auth-account-missing cases are both already-
+ * handled, non-error outcomes (the AUTH-LAST RETRY case: if content is
+ * gone but a prior run's Auth deletion itself failed, re-running finds
+ * zero content work left and retries just that one step).
+ */
+async function hardDeleteAccountAdmin(db, uid) {
+  const userRef = db.collection("users").doc(uid);
+  const bucket = admin.storage().bucket();
+  const summary = {
+    rooms: { discovered: 0, deleted: 0, failed: 0 },
+    orphanPlans: { discovered: 0, deleted: 0, failed: 0 },
+    orphanSpaces: { discovered: 0, deleted: 0, failed: 0 },
+    orphanAreas: { discovered: 0, deleted: 0, failed: 0 },
+    otherSubcollections: { collectionsProcessed: 0, documentsDeleted: 0, failed: 0 },
+    storage: { failed: false },
+    profileDocDeleted: false,
+    authDeleted: false,
+  };
+
+  // ---- Phase 1: every known Room, retired or not. Soft-deleted Rooms
+  // still inside their 30-day retention window, and merge/reclassification
+  // tombstones, are BOTH included and BOTH permanently removed here -
+  // account deletion bypasses the soft-delete/retention path entirely
+  // (this phase's own explicit "BYPASS SOFT DELETE" rule; the user wants
+  // everything gone, not retained for a restore that can no longer
+  // happen once the account itself is gone).
+  const spacesSnap = await userRef.collection("spaces").get();
+  for (const spaceDoc of spacesSnap.docs) {
+    summary.rooms.discovered++;
+    try {
+      const result = await hardDeleteRoomAdmin(db, uid, spaceDoc.id);
+      if (result.outcome === "hard-deleted" || result.outcome === "already-deleted") summary.rooms.deleted++;
+      else { summary.rooms.failed++; console.error(`[hardDeleteAccountAdmin] Room ${spaceDoc.id} (uid=${uid}) outcome=${result.outcome}: ${JSON.stringify(result)}`); }
+    } catch (e) {
+      summary.rooms.failed++;
+      console.error(`[hardDeleteAccountAdmin] Room ${spaceDoc.id} (uid=${uid}) threw: ${e.message}`);
+    }
+  }
+
+  // ---- Phase 2: uid-scoped orphan sweep - anything not reachable
+  // through the Room graph (legacy data shapes, data created before the
+  // current graph structure, or anything Phase 1 above failed to reach).
+
+  // (a) Any plans not already cleaned up as part of a Room above - an
+  // orphan with no matching Space/Project at all, the exact production
+  // shape this phase exists to close. users/{uid}/plans is the ONLY place
+  // a plan document has ever lived in this codebase's entire write path
+  // (verified directly, not assumed - every savePlanToHistory{Admin} call
+  // site writes there and nowhere else). A plain uid-scoped subcollection
+  // query already catches every real orphan case; a collectionGroup("plans")
+  // scan across every OTHER user's plans too would cost real read volume
+  // for zero additional correctness in this schema - deliberately not
+  // used here, unlike (c) below where a collection-group query is
+  // genuinely necessary. Also correctly finds a parentless user's plans
+  // regardless - Firestore subcollection queries never require the parent
+  // document to exist.
+  const remainingPlansSnap = await userRef.collection("plans").get();
+  for (const planDoc of remainingPlansSnap.docs) {
+    summary.orphanPlans.discovered++;
+    try {
+      await deletePlanAdmin(db, uid, planDoc.id, { manageParentSpace: false });
+      summary.orphanPlans.deleted++;
+    } catch (e) {
+      summary.orphanPlans.failed++;
+      console.error(`[hardDeleteAccountAdmin] orphan plan ${planDoc.id} (uid=${uid}) failed: ${e.message}`);
+    }
+  }
+
+  // (b) Any Spaces Phase 1 missed or failed on - the identical query,
+  // re-run; naturally empty in the common (fully-successful Phase 1) case.
+  const remainingSpacesSnap = await userRef.collection("spaces").get();
+  for (const spaceDoc of remainingSpacesSnap.docs) {
+    summary.orphanSpaces.discovered++;
+    try {
+      const result = await hardDeleteRoomAdmin(db, uid, spaceDoc.id);
+      if (result.outcome === "hard-deleted" || result.outcome === "already-deleted") summary.orphanSpaces.deleted++;
+      else summary.orphanSpaces.failed++;
+    } catch (e) {
+      summary.orphanSpaces.failed++;
+      console.error(`[hardDeleteAccountAdmin] orphan Space ${spaceDoc.id} (uid=${uid}) failed: ${e.message}`);
+    }
+  }
+
+  // (c) Any Areas with no reachable parent Space at all - Phase 1 and (b)
+  // above both iterate Spaces first, so an Area whose OWN parent Space is
+  // somehow already gone (a genuine orphan) would never be visited by
+  // either. Needs collectionGroup here (unlike (a) above) since Areas
+  // don't have a single-level direct subcollection off users/{uid} to
+  // query directly - scoped to this uid's own subtree via a document-path
+  // range query (the standard Firestore technique for bounding a
+  // collection-group query to one ancestor's descendants), not a
+  // filtered full-project scan across every other user's Areas.
+  const areasPathStart = `users/${uid}/spaces/\u0000`;
+  const areasPathEnd = `users/${uid}/spaces/\uf8ff`;
+  const remainingAreasSnap = await db.collectionGroup("areas")
+    .where(admin.firestore.FieldPath.documentId(), ">=", areasPathStart)
+    .where(admin.firestore.FieldPath.documentId(), "<", areasPathEnd)
+    .get();
+  for (const areaDoc of remainingAreasSnap.docs) {
+    summary.orphanAreas.discovered++;
+    const roomId = areaDoc.ref.parent.parent.id;
+    try {
+      const result = await hardDeleteAreaAdmin(db, uid, roomId, areaDoc.id);
+      if (result.outcome === "hard-deleted" || result.outcome === "already-deleted") summary.orphanAreas.deleted++;
+      else summary.orphanAreas.failed++;
+    } catch (e) {
+      summary.orphanAreas.failed++;
+      console.error(`[hardDeleteAccountAdmin] orphan Area ${areaDoc.id} (room=${roomId}, uid=${uid}) failed: ${e.message}`);
+    }
+  }
+
+  // (d) Every OTHER direct subcollection under users/{uid} - mergeCandidates,
+  // reclassificationExecutions, mergeExecutions, analysisIdempotency,
+  // revenueCatWebhookEvents (all confirmed real, existing subcollections
+  // by direct code search - not a guess), and anything a future phase
+  // adds. Generalized via listCollections() rather than a hardcoded name
+  // list, deliberately: this phase's own test (a) requires "zero
+  // documents in ANY subcollection," and a hardcoded list is exactly the
+  // kind of thing that silently rots the next time a phase adds a new
+  // one. "plans" and "spaces" are excluded here - already handled above
+  // with their own real recursive cleanup; a flat per-document delete
+  // here would leave a Space's own projects/areas/sessions/batches behind.
+  try {
+    const allCollections = await userRef.listCollections();
+    for (const coll of allCollections) {
+      if (coll.id === "plans" || coll.id === "spaces") continue;
+      summary.otherSubcollections.collectionsProcessed++;
+      const snap = await coll.get();
+      for (const doc of snap.docs) {
+        try {
+          await doc.ref.delete();
+          summary.otherSubcollections.documentsDeleted++;
+        } catch (e) {
+          summary.otherSubcollections.failed++;
+          console.error(`[hardDeleteAccountAdmin] ${coll.id}/${doc.id} (uid=${uid}) failed: ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    summary.otherSubcollections.failed++;
+    console.error(`[hardDeleteAccountAdmin] listCollections (uid=${uid}) failed: ${e.message}`);
+  }
+
+  // (e) Storage: plans/{uid}/ and viz/{uid}/, a defensive backstop beyond
+  // the per-plan cleanup already performed above - catches anything left
+  // with a real Storage object but no Firestore doc left to drive
+  // per-plan cleanup. Reuses the exact Phase C3 recursive-cleanup
+  // primitive, not a second Storage walk.
+  try {
+    await deleteStoragePrefixesAdmin(bucket, [`plans/${uid}`, `viz/${uid}`]);
+  } catch (e) {
+    summary.storage.failed = true;
+    console.error(`[hardDeleteAccountAdmin] Storage cleanup (uid=${uid}) failed: ${e.message}`);
+  }
+
+  const contentCleanupFailed = summary.rooms.failed > 0 || summary.orphanPlans.failed > 0 ||
+    summary.orphanSpaces.failed > 0 || summary.orphanAreas.failed > 0 ||
+    summary.otherSubcollections.failed > 0 || summary.storage.failed;
+
+  if (contentCleanupFailed) {
+    console.error(`[hardDeleteAccountAdmin] uid=${uid} content cleanup incomplete - profile doc and Auth account NOT touched. summary=${JSON.stringify(summary)}`);
+    return { outcome: "content-incomplete", ...summary };
+  }
+
+  // ---- Phase 3: identity, last - only reached once every content phase
+  // above reports zero failures. ----
+  const userSnap = await userRef.get();
+  if (userSnap.exists) {
+    await userRef.delete();
+    summary.profileDocDeleted = true;
+  }
+
+  try {
+    await admin.auth().deleteUser(uid);
+    summary.authDeleted = true;
+  } catch (e) {
+    if (e.code === "auth/user-not-found") {
+      // Already gone - a prior run's Auth deletion already succeeded (the
+      // AUTH-LAST RETRY case), or this uid never had a real Auth account.
+      // Not a failure.
+      summary.authDeleted = true;
+    } else {
+      console.error(`[hardDeleteAccountAdmin] uid=${uid} Auth deletion failed: ${e.message}`);
+      return { outcome: "auth-delete-failed", ...summary };
+    }
+  }
+
+  console.log(`[hardDeleteAccountAdmin] uid=${uid} COMPLETE. summary=${JSON.stringify(summary)}`);
+  return { outcome: "hard-deleted", ...summary };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const projectId = args.project || "cluttrd-3e335";
@@ -1266,5 +1489,6 @@ if (require.main === module) {
     carryForwardUnresolvedItemsAdmin, updateSpaceRoomSummaryAdmin, backfillRoomSummariesAdmin, deletePlanAdmin,
     updateAreaSummaryAdmin, createAreaForPlanAdmin, renameAreaAdmin,
     deleteStoragePrefixesAdmin, snapshotAffectedMergeCandidates, hardDeleteAreaAdmin, hardDeleteRoomAdmin,
+    hardDeleteAccountAdmin,
   };
 }

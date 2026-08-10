@@ -15,7 +15,7 @@ const admin = require("firebase-admin");
 // ./shared here are generated copies, kept in sync automatically by
 // scripts/prepareFunctionsDeploy.js (see that script's own header for the
 // full reasoning; it runs as this functions codebase's predeploy hook).
-const { hardDeleteAreaAdmin, hardDeleteRoomAdmin } = require("./scripts/runSpaceMigration");
+const { hardDeleteAreaAdmin, hardDeleteRoomAdmin, hardDeleteAccountAdmin } = require("./scripts/runSpaceMigration");
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -1070,3 +1070,50 @@ exports.cleanupExpiredDeletions = onSchedule(
 // DeletionDesign.md's own explicit reasoning for why this needs to exist
 // as a directly-callable export in the first place.
 exports.runExpiredDeletionSweep = runExpiredDeletionSweep;
+
+// --- Phase C5: server-side account deletion (DeletionImplementation.md) ---
+// The ONLY entry point Delete Account is allowed to use, client-side - the
+// client calls this callable and does nothing else itself (no direct
+// Firestore/Storage/Auth SDK calls of its own for deletion anymore). uid
+// is taken exclusively from request.auth.uid, the ID token Firebase
+// Callable Functions already verifies server-side - never a client-
+// supplied parameter, so there is no way for an authenticated caller to
+// ever trigger this against any account but their own. All the actual
+// work is scripts/runSpaceMigration.js's hardDeleteAccountAdmin (required
+// above) - this wrapper only enforces auth and translates its result into
+// either a plain success or an HttpsError the client's own retry UI can
+// act on.
+//
+// timeoutSeconds/maxInstances: an account with many Rooms/photos can take
+// a while (real per-Room, per-plan, per-Storage-prefix work, not a single
+// fast write) - generateVisualization's own 300s precedent, reused here
+// for the same "genuinely slow, not stuck" reasoning. maxInstances kept
+// low (this is a rare, destructive, one-per-user-ever operation, not a
+// hot path - no reason to allow high concurrency).
+exports.hardDeleteAccount = onCall(
+  { maxInstances: 5, timeoutSeconds: 300 },
+  async (request) => {
+    if (!request.auth?.uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in to delete your account.");
+    }
+    const uid = request.auth.uid;
+    let result;
+    try {
+      result = await hardDeleteAccountAdmin(db, uid);
+    } catch (e) {
+      console.error(`[hardDeleteAccount] uid=${uid} threw: ${e.message}`);
+      throw new HttpsError("internal", "Something went wrong deleting your account. Please try again.");
+    }
+    if (result.outcome !== "hard-deleted") {
+      // "content-incomplete" or "auth-delete-failed" - hardDeleteAccountAdmin's
+      // own content-gate already guarantees nothing was left half-done
+      // (the profile doc/Auth account are only ever touched once every
+      // content phase reports zero failures), so a retry is always safe -
+      // report failure so the client shows its own error+retry UI rather
+      // than a false "success."
+      console.error(`[hardDeleteAccount] uid=${uid} incomplete: outcome=${result.outcome}`);
+      throw new HttpsError("internal", "Account deletion didn't fully complete. Please try again.");
+    }
+    return { outcome: result.outcome };
+  }
+);

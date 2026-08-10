@@ -19,7 +19,7 @@ import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_7
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, deleteUser, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
+import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
@@ -6720,6 +6720,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   };
 
+  // Phase C5 (DeletionImplementation.md): all actual deletion work now
+  // happens server-side, via the hardDeleteAccount callable - Admin-SDK
+  // orchestration that reuses the proven Phase C3 hard-delete engine and
+  // handles every resource this client-side version never touched
+  // (shadow Projects/Sessions/Batches, mergeCandidates,
+  // reclassificationExecutions, orphaned data with no matching Room at
+  // all). The client's only remaining jobs: confirm the user really wants
+  // this and really is who they say they are (password reauthentication,
+  // unchanged - still the right client-side gate even though the server
+  // now does the work, since it proves the person holding this signed-in
+  // session actually knows the account's password), call the server
+  // function, and only THEN sign out / clear local state - never before
+  // the server confirms completion.
   const handleConfirmDelete = async () => {
     if (!deletePassword) {
       setDeleteError("Please enter your password.");
@@ -6730,53 +6743,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     try {
       const currentUser = auth.currentUser;
       if (!currentUser) return;
-      const uid = currentUser.uid;
 
       // Re-authenticate
       const credential = EmailAuthProvider.credential(currentUser.email, deletePassword);
       await reauthenticateWithCredential(currentUser, credential);
 
-      // Delete Firestore data WHILE USER IS STILL AUTHENTICATED
-      // Security rules require auth.uid == userId, so cleanup must happen before deleteUser()
-      // Critical: if this fails for any reason, stop and surface the error.
-      // Do not proceed to delete Auth if Firestore cleanup fails.
-      const { collection, getDocs, deleteDoc, doc } = await import("firebase/firestore");
-      const plansSnap = await getDocs(collection(db, "users", uid, "plans"));
-      await Promise.all(plansSnap.docs.map(d => deleteDoc(d.ref)));
-      await deleteDoc(doc(db, "users", uid));
+      // The entire deletion (Firestore, Storage, Auth) happens here,
+      // server-side. uid is never sent - hardDeleteAccount reads it from
+      // the verified ID token (request.auth.uid), so this call can only
+      // ever delete the signed-in caller's own account. The server's own
+      // content-gate (hardDeleteAccountAdmin) guarantees this either
+      // fully succeeds or leaves nothing half-done - a caught error here
+      // means it's genuinely safe to retry, never a reason to fall back
+      // to any client-side cleanup of its own.
+      const hardDeleteAccountFn = httpsCallable(functions, "hardDeleteAccount");
+      await hardDeleteAccountFn();
 
-      // Delete Storage files WHILE USER IS STILL AUTHENTICATED
-      // Non-critical errors (object not found) are logged and skipped.
-      // Critical errors (permissions, network) stop the process.
-      const { listAll, deleteObject } = await import("firebase/storage");
-      const vizRef = storageRef(storage, `viz/${uid}`);
-      const vizList = await listAll(vizRef);
-      const allItems = [
-        ...vizList.items,
-        ...(await Promise.all(vizList.prefixes.map(async folder => {
-          const folderList = await listAll(folder);
-          return folderList.items;
-        }))).flat()
-      ];
-      await Promise.all(allItems.map(async item => {
-        try {
-          await deleteObject(item);
-        } catch (itemErr) {
-          // object/not-found is non-critical. File already gone, safe to continue
-          if (itemErr.code === "storage/object-not-found") {
-            console.log("Storage item already deleted:", item.fullPath);
-          } else {
-            // Any other storage error is critical. Rethrow to stop deletion
-            throw itemErr;
-          }
-        }
-      }));
-
-      // Delete Firebase Auth account LAST
-      // Firestore and Storage are clean. If this fails, user can try again.
-      await deleteUser(currentUser);
-
-      // Clear auth form fields and local storage
+      // Only now, after the server has confirmed the account is actually
+      // gone: sign out (the client's own local session doesn't know the
+      // server just deleted this Auth account server-side - it has to be
+      // told) and clear local state, same fields the pre-Phase-C5 version
+      // cleared (onAuthStateChanged's own sign-out branch already clears
+      // analysisCount/isPro, but not skipOnboarding or the login form's
+      // own fields - the just-deleted account's email shouldn't stay
+      // prefilled on the sign-in screen).
+      await signOut(auth);
       setEmail("");
       setPassword("");
       await AsyncStorage.removeItem("analysisCount");
@@ -6784,12 +6775,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       await AsyncStorage.removeItem("skipOnboarding");
 
       setShowDeleteModal(false);
+      setDeleteLoading(false);
 
     } catch (err) {
       setDeleteLoading(false);
       if (err.code === "auth/wrong-password" || err.code === "auth/invalid-credential") {
         setDeleteError("Incorrect password. Please try again.");
       } else {
+        // Covers both a reauthentication failure of some other kind and a
+        // hardDeleteAccount HttpsError - either way, the modal stays open
+        // with Retry available (re-pressing "Delete My Account" simply
+        // calls this same idempotent flow again).
         setDeleteError("Something went wrong. Please try again.");
       }
     }
@@ -8189,6 +8185,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   <Text style={{ color: "#64748B", fontSize: 15 }}>Cancel</Text>
                 </TouchableOpacity>
               </View>
+              {/* Phase C5: server-side deletion can genuinely take a while
+                  for an account with a lot of history - the existing
+                  ProcessingOverlay convention (every other multi-step save
+                  flow in this file already uses it) covers the whole modal
+                  while hardDeleteAccount is in flight, not just the
+                  button's own inline spinner. */}
+              {deleteLoading && <ProcessingOverlay text="Deleting your account..." />}
             </View>
           </Modal>
 
