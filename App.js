@@ -8,6 +8,14 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+// Area-row swipe-to-delete. gesture-handler 2.28 ships two Swipeable
+// implementations: the legacy Animated-API "Swipeable" (exported from the
+// package root) and "ReanimatedSwipeable" (its own subpath export, built
+// on Reanimated). The project already depends on react-native-reanimated
+// ~4.1.1 - ReanimatedSwipeable is the current, non-deprecated one and the
+// one that matches an already-Reanimated-using project, so it's used here
+// rather than the legacy component.
+import Swipeable from "react-native-gesture-handler/ReanimatedSwipeable";
 import * as ImagePicker from "expo-image-picker";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 import * as FileSystem from "expo-file-system/legacy";
@@ -17,7 +25,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2 } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
@@ -6505,21 +6513,36 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   };
   // Per-Area "Delete" action (Room Detail's own AREAS IN THIS ROOM rows).
+  // Reached only via swipe-left-then-tap-trash now (the visible "Delete"
+  // text link is retired) - swipeableMethods (from Swipeable's own
+  // renderRightActions render prop) is passed through so this same
+  // confirm/cancel flow can close that specific row's swipe panel at the
+  // right moment, regardless of which row's trash icon was tapped.
   // Single-document soft delete (softDeleteArea) followed by an explicit
   // Room summary recompute (the Room's own visitCount/latestPhotoUrl must
   // no longer count this Area's visits - see updateSpaceRoomSummary's own
   // comment for why this needs a live query, not a local decrement).
   // Stays on Room Detail afterward - only the deleted Area's own state is
   // patched locally, so the rest of the screen doesn't need a full re-fetch.
-  const handleDeleteArea = (area) => {
+  const handleDeleteArea = (area, swipeableMethods) => {
     Alert.alert(
       `Delete ${area.displayName}?`,
       "This will remove this area and its organizing history. You can restore it from Recently Deleted within 30 days.",
       [
-        { text: "Cancel", style: "cancel" },
+        // Cancel: close the swipe row back to its resting state, Area
+        // stays exactly as it was - no delete call at all.
+        { text: "Cancel", style: "cancel", onPress: () => swipeableMethods?.close() },
         {
           text: "Delete", style: "destructive", onPress: async () => {
+            // Close the swipe row FIRST, then give its own close animation
+            // a moment to actually finish before the Area disappears from
+            // roomDetailAreas (which is what makes the row vanish from the
+            // list). Removing it immediately would yank an still-open/
+            // still-animating row out from under itself - the exact visual
+            // jump this flow is meant to avoid.
+            swipeableMethods?.close();
             try {
+              await new Promise((resolve) => setTimeout(resolve, 300));
               await softDeleteArea(user.uid, roomDetailRoomId, area.id);
               await updateSpaceRoomSummary(user.uid, roomDetailRoomId);
               setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: true } : a)));
@@ -7571,45 +7594,54 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                       ? matchingPlans.reduce((latest, p) => (new Date(p.createdAt) > new Date(latest.createdAt) ? p : latest)).photoUrl
                       : null;
                     const resolvedPhotoUrl = area.latestPhotoUrl || fallbackPhotoUrl;
+                    // Swipe-to-delete replaces the old visible "Delete" text
+                    // link entirely - the only way to reach Area delete now
+                    // is swipe-left-then-tap-trash. renderRightActions'
+                    // own swipeableMethods (not a separate ref) is what
+                    // handleDeleteArea uses to close this exact row cleanly
+                    // on both confirm and cancel.
                     return (
-                      <View key={area.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
-                        {resolvedPhotoUrl ? (
-                          <Image source={{ uri: resolvedPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
-                        ) : (
-                          <View style={s.historyIcon}>
-                            <Text style={{ fontSize: 20 }}>🏠</Text>
-                          </View>
+                      <Swipeable
+                        key={area.id}
+                        containerStyle={s.areaSwipeContainer}
+                        overshootRight={false}
+                        rightThreshold={40}
+                        renderRightActions={(progress, translation, swipeableMethods) => (
+                          <TouchableOpacity
+                            style={s.areaSwipeDeleteAction}
+                            onPress={() => handleDeleteArea(area, swipeableMethods)}
+                            accessibilityLabel={`Delete ${area.displayName}`}
+                            accessibilityRole="button"
+                          >
+                            <Trash2 size={22} color="white" strokeWidth={2.25} />
+                          </TouchableOpacity>
                         )}
-                        {/* Item 2: name and "Organize Again" each on their
-                            own line (matching renderVisitRow's own fix) -
-                            no shared row width to truncate against. */}
-                        <View style={{ flex: 1 }}>
-                          <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
-                          <Text style={s.historyOverview} numberOfLines={1}>{`${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}</Text>
-                          {/* Phase C1: per-Area "Delete" action, alongside
-                              "Organize Again" on the same line - both are
-                              short single-word/two-word links, matching
-                              this screen's own established pattern of
-                              quiet/destructive text links (Move/Delete
-                              Room below) rather than a menu. */}
-                          <View style={{ flexDirection: "row", alignItems: "center", gap: 16, marginTop: 4 }}>
+                      >
+                        <View style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 0 }]}>
+                          {resolvedPhotoUrl ? (
+                            <Image source={{ uri: resolvedPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                          ) : (
+                            <View style={s.historyIcon}>
+                              <Text style={{ fontSize: 20 }}>🏠</Text>
+                            </View>
+                          )}
+                          {/* Item 2: name and "Organize Again" each on their
+                              own line (matching renderVisitRow's own fix) -
+                              no shared row width to truncate against. */}
+                          <View style={{ flex: 1 }}>
+                            <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
+                            <Text style={s.historyOverview} numberOfLines={1}>{`${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}</Text>
                             <TouchableOpacity
                               onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
                               accessibilityLabel={`Organize Again in ${area.displayName}`}
                               accessibilityRole="button"
+                              style={{ marginTop: 4, alignSelf: "flex-start" }}
                             >
                               <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
                             </TouchableOpacity>
-                            <TouchableOpacity
-                              onPress={() => handleDeleteArea(area)}
-                              accessibilityLabel={`Delete ${area.displayName}`}
-                              accessibilityRole="button"
-                            >
-                              <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: "#DC2626" }}>Delete</Text>
-                            </TouchableOpacity>
                           </View>
                         </View>
-                      </View>
+                      </Swipeable>
                     );
                   })}
                 </>
@@ -9644,16 +9676,23 @@ function AppRoot() {
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      {IS_STAGING && (
-        <SafeAreaView edges={["top"]} style={s.stagingBanner}>
-          <Text style={s.stagingBannerText}>STAGING</Text>
-        </SafeAreaView>
-      )}
-      <View style={{ flex: 1 }}>
-        <AppRoot />
-      </View>
-    </SafeAreaProvider>
+    // Required at the app root for react-native-gesture-handler's pan-
+    // gesture-based controls (Area row swipe-to-delete's Swipeable) to
+    // work reliably everywhere in the tree - previously only wrapped
+    // locally around the photo-zoom modal's own pinch-zoom gesture, which
+    // doesn't cover Room Detail.
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        {IS_STAGING && (
+          <SafeAreaView edges={["top"]} style={s.stagingBanner}>
+            <Text style={s.stagingBannerText}>STAGING</Text>
+          </SafeAreaView>
+        )}
+        <View style={{ flex: 1 }}>
+          <AppRoot />
+        </View>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
@@ -9879,6 +9918,14 @@ const s = StyleSheet.create({
   upgradeBtn: { backgroundColor: BRAND.green, margin: 12, borderRadius: 8, padding: 13, alignItems: "center" },
   upgradeBtnText: { color: "white", fontFamily: "Inter_700Bold", fontSize: 14 },
   historyItem: { flexDirection: "row", gap: 12, backgroundColor: BRAND.white, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: BRAND.stone, alignItems: "flex-start" },
+  // AREAS IN THIS ROOM swipe-to-delete. marginBottom/borderRadius live
+  // here (on the Swipeable's own outer container) rather than on the row
+  // content itself (historyItem's own marginBottom is zeroed out at that
+  // usage site) - overflow:"hidden" clips the revealed red action to the
+  // same rounded corners as the card, instead of a square panel poking out
+  // past them.
+  areaSwipeContainer: { marginBottom: 10, borderRadius: 14, overflow: "hidden" },
+  areaSwipeDeleteAction: { flex: 1, width: 84, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center" },
   historyIcon: { width: 66, height: 66, backgroundColor: BRAND.greenLight, borderRadius: 16, alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden" },
   historySpace: { fontSize: 14, fontFamily: "Inter_700Bold", color: BRAND.ink },
   historyDate: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
