@@ -4445,8 +4445,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       return finish("NO_MATCH", []);
     }
 
+    // Phase C1 (DeletionDesign.md item 5): resolveRecognitionCandidates
+    // itself is pure and plan-only - it has no way to know a candidate's
+    // canonicalSpaceId now belongs to a soft-deleted Room, since
+    // soft-delete deliberately never touches plans (only the Space/Area
+    // doc). Under the ORIGINAL hard-delete design this couldn't happen -
+    // a deleted Room's plans were gone too, so there was nothing left to
+    // match - but soft-delete's whole 30-day retention window means a
+    // deleted Room's plans stay fully live and would otherwise still
+    // surface here, proposing "is this your [Room you just deleted]?".
+    // Bounded to at most 3 reads (candidates are already capped at 3).
+    const excludeRetiredCandidates = async (candidates) => {
+      if (!candidates.length) return candidates;
+      const flags = await Promise.all(candidates.map((c) => getDoc(doc(db, "users", forUid, "spaces", c.canonicalSpaceId))));
+      return candidates.filter((c, i) => !(flags[i].exists() && flags[i].data().retired === true));
+    };
+
     const cachePlans = (historyList || []).map((h) => ({ id: h.id, data: h }));
-    const cacheCandidates = resolveRecognitionCandidates(freshLabel, cachePlans);
+    const cacheCandidatesRaw = resolveRecognitionCandidates(freshLabel, cachePlans);
+    const cacheCandidates = await excludeRetiredCandidates(cacheCandidatesRaw);
     diagnostics.cacheCandidateCount = cacheCandidates.length;
     if (cacheCandidates.length) return finish("MATCH_FOUND", cacheCandidates);
 
@@ -4465,7 +4482,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       [...byType.docs, ...byName.docs].forEach((d) => {
         if (!merged.has(d.id)) merged.set(d.id, { id: d.id, data: d.data() });
       });
-      const resolved = resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+      const resolvedRaw = resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+      const resolved = await excludeRetiredCandidates(resolvedRaw);
       return finish(resolved.length ? "MATCH_FOUND" : "NO_MATCH", resolved);
     } catch (e) {
       diagnostics.error = { name: e.name || null, message: e.message || String(e), code: e.code || null };

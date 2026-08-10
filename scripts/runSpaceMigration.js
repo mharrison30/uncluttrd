@@ -717,7 +717,19 @@ async function migratePlan(db, uid, planId, { dryRun }) {
 async function detectAndPersistMergeCandidatesForUser(db, uid) {
   const userRef = db.collection("users").doc(uid);
   const plansSnap = await userRef.collection("plans").get();
-  const plans = plansSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+  const allPlans = plansSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+
+  // Phase C1 (DeletionDesign.md item 5): detectMergeCandidates is pure and
+  // plan-only - it has no way to know a plan's canonical Space is
+  // soft-deleted, since soft-delete deliberately never touches plans.
+  // Exclude any plan whose canonical Space is currently retired (merge
+  // tombstone OR soft-delete - either way, not a real candidate for a NEW
+  // detection pass) before clustering, so a deleted Room's leftover plans
+  // can never surface a proposal to merge them into (or with) a Room the
+  // user just deleted.
+  const spacesSnap = await userRef.collection("spaces").get();
+  const retiredSpaceIds = new Set(spacesSnap.docs.filter((d) => d.data().retired).map((d) => d.id));
+  const plans = allPlans.filter((p) => !retiredSpaceIds.has(computeShadowIds(p.id, p.data).spaceId));
   const currentPlansById = {};
   plans.forEach((p) => { currentPlansById[p.id] = p.data; });
 
