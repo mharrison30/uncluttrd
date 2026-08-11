@@ -191,4 +191,7 @@ This table (and the full raw JSON for both sides, in `scratchpad/approach_test/d
 
 ## OTA
 
-Committed and pushed to the `staging` EAS Update branch — IDs recorded below once published.
+Committed (`8e78be6`) and pushed to the `staging` EAS Update branch.
+
+- iOS update ID: `019fee74-c1f3-7668-a60d-b54aab12161a`
+- Android update ID: `019fee74-c1f3-745c-8b70-ce5667198237`
