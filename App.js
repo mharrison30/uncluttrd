@@ -25,7 +25,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, Timestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
@@ -1904,6 +1904,166 @@ async function resolveAreaForSinglePlanMove(uid, planId, oldRoomId, oldAreaId, t
   return { action: "migrate", newAreaId };
 }
 
+// ---- moveAreaToRoom: Area Re-parenting Phase A (AreaReparentingDesign.md
+// §5) - the standalone "move this one Area, with every one of its own
+// plans, to a different Room" feature. Architecturally a scoped variant of
+// mergeRoomIntoRoom below, not a new orchestrator - same building blocks
+// (establishTargetArea, reclassifyLegacyPlan, updateAreaSummary,
+// updateSpaceRoomSummary), same phase shape, just selecting plans by
+// areaId instead of by canonicalSpaceId, and with exactly one Area to
+// migrate instead of N. Where mergeRoomIntoRoom's Phase 1 has to special-
+// case the Room's own founding self-plan (doc id === roomId, which never
+// changes), that case cannot occur here - a founding whole-Room visit
+// always has areaId: null, so it can never match the areaId-scoped query
+// below in the first place; only real durable-Area member plans can. ----
+async function moveAreaToRoom(uid, sourceRoomId, sourceAreaId, targetRoomId) {
+  const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", targetRoomId));
+  if (!targetSpaceSnap.exists() || targetSpaceSnap.data().retired === true) {
+    return { outcome: "invalid-target", reason: "target Room does not exist or is retired" };
+  }
+  const targetRoomName = targetSpaceSnap.data().displayName || null;
+
+  const sourceAreaRef = doc(db, "users", uid, "spaces", sourceRoomId, "areas", sourceAreaId);
+  const sourceAreaSnap = await getDoc(sourceAreaRef);
+  if (!sourceAreaSnap.exists()) {
+    return { outcome: "invalid-source", reason: "source Area does not exist" };
+  }
+  // Idempotency short-circuit: re-running this function after a prior full
+  // completion must be a genuine no-op (test l), not just "no duplicates
+  // created but every phase still runs and re-stamps retiredAt" the way
+  // mergeRoomIntoRoom's own looser Phase 4-6 loop would. A retired source
+  // Area with a migrationTargetAreaId already means every phase below has
+  // already happened - return the same completed shape immediately without
+  // touching Firestore again.
+  const sourceAreaData = sourceAreaSnap.data();
+  if (sourceAreaData.retired === true) {
+    if (sourceAreaData.migrationTargetAreaId) {
+      return { outcome: "already-completed", sourceRoomId, sourceAreaId, targetRoomId, newAreaId: sourceAreaData.migrationTargetAreaId };
+    }
+    return { outcome: "invalid-source", reason: "source Area is already retired for an unrelated reason" };
+  }
+
+  // ---- Phase 1: snapshot every plan currently referencing this Area,
+  // before any of them move. Unlike mergeRoomIntoRoom's Room-scoped
+  // snapshot, no "already moved on a prior attempt" filter is needed here -
+  // reclassifyLegacyPlan (Phase 3, below) is independently idempotent per
+  // plan regardless of which Room a snapshotted plan currently sits in, so
+  // re-including a plan that partially moved on an earlier interrupted
+  // attempt (canonicalSpaceId already repointed, areaId not yet repointed)
+  // is exactly the case that must be re-processed to finish the repoint. ----
+  const memberPlansSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("areaId", "==", sourceAreaId)));
+  const planSnapshots = memberPlansSnap.docs.map((d) => ({
+    planId: d.id,
+    areaName: d.data().areaName ?? null,
+    areaScope: d.data().areaScope ?? "whole-room",
+  }));
+  // Captured before anything moves, for Phase 5a's source-Room repair
+  // below: it must only undo a retirement THIS move caused, never
+  // resurrect a Room the user had already soft-deleted beforehand.
+  const sourceSpaceBeforeSnap = await getDoc(doc(db, "users", uid, "spaces", sourceRoomId));
+  const sourceRoomWasRetiredBeforeMove = sourceSpaceBeforeSnap.exists() && sourceSpaceBeforeSnap.data().retired === true;
+
+  // ---- Phase 2: establish the target twin. Idempotent via
+  // migrationTargetAreaId persisted on the source Area doc - safe to call
+  // again after a crash between this phase and any later one. ----
+  const newAreaId = await establishTargetArea(uid, sourceRoomId, sourceAreaId, targetRoomId);
+  if (!newAreaId) {
+    return { outcome: "failed", reason: "could not establish target Area" };
+  }
+
+  // ---- Phase 3: move every plan, then repoint its areaId at the new
+  // twin. Sequential, not Promise.all - same reasoning mergeRoomIntoRoom's
+  // own Phase 3 gives (App.js comment above it): each plan's cleanup step
+  // should see an accurate, already-updated sibling count from whichever
+  // plan moved immediately before it. ----
+  const results = [];
+  for (const snap of planSnapshots) {
+    const result = await reclassifyLegacyPlan(uid, snap.planId, {
+      targetSpaceId: targetRoomId,
+      requestedRoomName: targetRoomName,
+      requestedAreaName: snap.areaName,
+      requestedAreaScope: snap.areaScope,
+    });
+    results.push({ planId: snap.planId, result });
+
+    if (result.outcome === "completed") {
+      await updateDoc(doc(db, "users", uid, "plans", snap.planId), { areaId: newAreaId, shadowSourceVersion: increment(1) })
+        .catch((e) => dlog(`[AREA MOVE] areaId repoint failed for plan ${snap.planId}: ${e.message}`));
+      await syncPlanToSpaceGraph(uid, snap.planId).catch((e) => dlog(`[AREA MOVE] shadow resync failed for plan ${snap.planId}: ${e.message}`));
+    }
+  }
+  const failed = results.filter((r) => r.result.outcome !== "completed");
+
+  // ---- Phase 4 (verify) + Phase 5 (recompute both Room summaries and the
+  // target Area summary) + Phase 6 (retire the source Area, only now, only
+  // if verification found zero remaining references - a source Area with
+  // any plan still pointing at it, e.g. one plan in this batch failed
+  // Phase 3, is never retired). ----
+  const remainingSnap = await getDocs(query(collection(db, "users", uid, "plans"), where("areaId", "==", sourceAreaId)));
+  const stillReferenced = remainingSnap.size > 0;
+
+  // ---- Phase 5a: an Area move must NEVER retire the source Room, even
+  // when the move empties it (AreaReparentingDesign.md §4: "an empty Room
+  // is a valid physical Room the user wants to keep"). This is not
+  // automatic - it needs an explicit repair, because reclassifyLegacyPlan's
+  // own Phase 4 (cleanUpOldSpace) tombstones a source Space as soon as its
+  // LAST Project leaves, and it cannot distinguish "the whole Room was
+  // merged away" (where that tombstone is correct) from "one Area moved
+  // out and happened to be the Room's only content" (where it is not).
+  // Rather than modify that proven, Room-merge-scoped state machine - the
+  // discipline §8 explicitly calls for - this undoes the one side effect
+  // that is wrong for THIS caller, and only when this call actually caused
+  // it: sourceRoomWasRetiredBeforeMove is captured in Phase 1, so a Room
+  // the user had already soft-deleted before starting stays deleted.
+  // Clears the full reclassification-tombstone field set (not just
+  // `retired`), otherwise a live Room would keep a dangling redirectTo
+  // pointing at the target Room - exactly the stale-reference class of bug
+  // the tombstone convention exists to avoid.
+  let sourceRoomRestored = false;
+  if (!sourceRoomWasRetiredBeforeMove) {
+    const sourceSpaceRef = doc(db, "users", uid, "spaces", sourceRoomId);
+    const sourceSpaceAfter = await getDoc(sourceSpaceRef);
+    if (sourceSpaceAfter.exists() && sourceSpaceAfter.data().retired === true) {
+      await updateDoc(sourceSpaceRef, {
+        retired: false,
+        redirectTo: deleteField(),
+        retiredAt: deleteField(),
+        reclassificationExecutionId: deleteField(),
+      });
+      sourceRoomRestored = true;
+    }
+  }
+
+  await updateAreaSummary(uid, targetRoomId, newAreaId);
+  await updateSpaceRoomSummary(uid, targetRoomId);
+  await updateSpaceRoomSummary(uid, sourceRoomId);
+
+  let retired = false;
+  if (!stillReferenced) {
+    await updateDoc(sourceAreaRef, { retired: true, redirectTo: newAreaId, retiredAt: serverTimestamp() });
+    retired = true;
+    // The source Area's own retirement is what makes its (now zero) visits
+    // stop counting toward the source Room summary - updateSpaceRoomSummary
+    // reads retiredAreaIds fresh, so the recompute above ran one write too
+    // early to see it. Re-run it now that the tombstone exists.
+    await updateSpaceRoomSummary(uid, sourceRoomId);
+  }
+
+  // ---- Phase 7: mark complete (merge-candidate reconciliation already
+  // happened per-plan inside each reclassifyLegacyPlan call above, via its
+  // own Phase 6 - nothing about an Area move changes any plan's display
+  // name or, once Phase 3 completes, its canonicalSpaceId relative to what
+  // that reconciliation already watches for, so no separate reconciliation
+  // step is needed here - see AreaReparentingDesign.md §8/§1f). ----
+  return {
+    outcome: failed.length === 0 ? "completed" : "partial",
+    sourceRoomId, sourceAreaId, targetRoomId, newAreaId,
+    movedCount: results.length - failed.length, totalCount: results.length,
+    results, failed, retired, stillReferencedCount: remainingSnap.size,
+    sourceRoomRestored,
+  };
+}
+
 // ---- mergeRoomIntoRoom: the full-Room-merge case (design doc §2),
 // corrected 7-phase sequence. Phase numbering matches the design report
 // 1:1 for traceability. ----
@@ -3325,6 +3485,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [renameDuplicateDialog, setRenameDuplicateDialog] = useState(null);
   const [mergeRoomsSaving, setMergeRoomsSaving] = useState(false);
   const [mergeRoomsError, setMergeRoomsError] = useState(null);
+  // Area Re-parenting Phase A (AreaReparentingDesign.md §9): which Area's
+  // overflow ("...") action sheet is currently open, or null. Distinct
+  // from renamePlanTarget - this only decides which action sheet shows;
+  // tapping Rename inside it still hands off to the existing
+  // openAreaRenameSheet -> renamePlanTarget flow unchanged.
+  const [areaActionsFor, setAreaActionsFor] = useState(null);
+  // The reusable Room Picker (§9/§10) is shared by Area-move and
+  // Room-level move - roomPickerFor's own shape says which flow a
+  // selection resolves to: { kind: "area", area, sourceRoomId } or
+  // { kind: "room", room }. null means the picker is closed.
+  const [roomPickerFor, setRoomPickerFor] = useState(null);
+  // Set once a target Room is picked, before the user has confirmed -
+  // drives the confirmation dialog. { kind, area?, room?, sourceRoomId?, targetRoom }.
+  const [moveConfirmTarget, setMoveConfirmTarget] = useState(null);
+  const [moveSaving, setMoveSaving] = useState(false);
+  const [moveError, setMoveError] = useState(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deletePassword, setDeletePassword] = useState("");
   const [deleteError, setDeleteError] = useState("");
@@ -6842,15 +7018,278 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionEnteredFromResults(false);
     setRoomDetailRoomId(roomId);
   };
-  // Room Detail UX Revision, Section 1: Room-level actions, placed as
-  // quiet/destructive text links at the bottom of Room Detail's own
-  // content (see the Room Detail render block) - not behind a three-dot
-  // menu. Both remain placement only this pass: Move is not wired to
-  // reclassifyLegacyPlan yet, and Delete's confirmation is real (exact
-  // copy specified) but the actual deletion is Phase C - confirming today
-  // only leads to a "Coming soon" acknowledgement, never a real write.
-  const handleMoveRoomPlaceholder = () => {
-    Alert.alert("Coming soon", "Moving a room's visits to another room will be available in a future update.");
+  // Area Re-parenting Phase A (AreaReparentingDesign.md §9/§10): the
+  // reusable Room Picker's own entry points. Room-level "Move to another
+  // Room" was a placeholder until now - closes that gap by opening the
+  // SAME picker/confirmation/processing components Area-move uses, scoped
+  // to { kind: "room" } instead of { kind: "area" }. roomPickerFor's own
+  // shape is what onRoomPickerSelectForMove/confirmMove below branch on.
+  const openAreaMovePicker = (area) => {
+    setAreaActionsFor(null);
+    setMoveError(null);
+    setRoomPickerFor({ kind: "area", area, sourceRoomId: roomDetailRoomId });
+  };
+  const openRoomMovePicker = (room) => {
+    setMoveError(null);
+    setRoomPickerFor({ kind: "room", room });
+  };
+  const closeRoomPicker = () => setRoomPickerFor(null);
+
+  // Picking a Room never moves anything directly - it resolves to a
+  // confirmation step first, matching the destructive/consequential-action
+  // discipline every other move/delete flow in this file already follows
+  // (rename-duplicate's own "Move plans to X" is a second, explicit tap,
+  // never a same-tap action).
+  const onRoomPickerSelectForMove = (targetRoom) => {
+    const ctx = roomPickerFor;
+    setRoomPickerFor(null);
+    if (!ctx) return;
+    setMoveConfirmTarget({ ...ctx, targetRoom });
+  };
+
+  const closeMoveConfirm = () => {
+    if (moveSaving) return;
+    setMoveConfirmTarget(null);
+    setMoveError(null);
+  };
+
+  // The actual execution step, shared by both flows - branches only on
+  // moveConfirmTarget.kind to call moveAreaToRoom vs. the existing
+  // mergeRoomIntoRoom, then patches local state and navigates to the
+  // target Room's Room Detail. roomDetailPlans/roomDetailAreas are both
+  // keyed on roomDetailRoomId (see their own effects) - changing that one
+  // id is enough to load the target Room's now-current data, no separate
+  // refetch call needed.
+  const confirmMove = async () => {
+    if (!moveConfirmTarget) return;
+    setMoveSaving(true);
+    setMoveError(null);
+    try {
+      if (moveConfirmTarget.kind === "area") {
+        const { area, sourceRoomId, targetRoom } = moveConfirmTarget;
+        const result = await moveAreaToRoom(user.uid, sourceRoomId, area.id, targetRoom.id);
+        // "already-completed" is moveAreaToRoom's own idempotency
+        // short-circuit (a prior run of this exact move finished) - a
+        // success for the user's purposes, not an error: the Area really
+        // is under the target Room, which is all the confirmation
+        // promised. Only genuine failures fall through to the throw.
+        if (result.outcome !== "completed" && result.outcome !== "already-completed") {
+          throw new Error(result.reason || `${result.movedCount ?? 0}/${result.totalCount ?? 0} visits moved - one or more failed. Please try again.`);
+        }
+        const [freshSource, freshTarget] = await Promise.all([
+          getDoc(doc(db, "users", user.uid, "spaces", sourceRoomId)),
+          getDoc(doc(db, "users", user.uid, "spaces", targetRoom.id)),
+        ]);
+        setRooms((prev) => prev.map((r) => {
+          if (r.id === sourceRoomId && freshSource.exists()) return { id: r.id, ...freshSource.data() };
+          if (r.id === targetRoom.id && freshTarget.exists()) return { id: r.id, ...freshTarget.data() };
+          return r;
+        }));
+        setMoveConfirmTarget(null);
+        setShowHistory(false);
+        setRoomDetailRoomId(targetRoom.id);
+      } else {
+        const { room, targetRoom } = moveConfirmTarget;
+        const result = await mergeRoomIntoRoom(user.uid, room.id, targetRoom.id);
+        if (result.outcome !== "completed") {
+          throw new Error(`${result.movedCount}/${result.totalCount} visits moved - one or more failed. Please try again.`);
+        }
+        // A full Room-level merge moves every plan out, which retires the
+        // source Room itself (reclassifyLegacyPlan's own cleanUpOldSpace,
+        // once its last Project is gone) - same post-merge state patch
+        // handleMovePlansIntoExisting already applies for the identical
+        // outcome via the rename-duplicate path.
+        setRooms((prev) => prev.filter((r) => r.id !== room.id));
+        setMoveConfirmTarget(null);
+        setShowHistory(false);
+        setRoomDetailRoomId(targetRoom.id);
+      }
+    } catch (e) {
+      setMoveError(e.message || "Something went wrong moving this. Please try again.");
+    } finally {
+      setMoveSaving(false);
+    }
+  };
+
+  // ---- Area overflow ("...") action sheet (AreaReparentingDesign.md §9).
+  // Rename and Delete are the EXISTING flows, only relocated into this
+  // sheet - openAreaRenameSheet and handleDeleteArea are called unchanged,
+  // so swipe-left-to-delete keeps working alongside this menu rather than
+  // being replaced by it (two entry points, one implementation). Delete is
+  // invoked with no swipeableMethods argument, which handleDeleteArea
+  // already tolerates (every use is optional-chained) - there is no open
+  // swipe row to close when the action came from here. ----
+  const renderAreaActionsSheet = () => (
+    <Modal visible={!!areaActionsFor} animationType="slide" transparent onRequestClose={() => setAreaActionsFor(null)}>
+      <View style={s.renameSheetBackdrop}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => setAreaActionsFor(null)} accessibilityLabel="Close" accessibilityRole="button" />
+        <View style={s.renameSheetCard}>
+          <Text style={s.renameSheetTitle} numberOfLines={1}>{areaActionsFor?.displayName || "Area"}</Text>
+          <TouchableOpacity
+            style={s.areaActionRow}
+            onPress={() => { const a = areaActionsFor; setAreaActionsFor(null); openAreaRenameSheet(a); }}
+            accessibilityLabel="Rename Area"
+            accessibilityRole="button"
+          >
+            <Pencil size={18} color="#334155" strokeWidth={2.25} />
+            <Text style={s.areaActionText}>Rename Area</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={s.areaActionRow}
+            onPress={() => openAreaMovePicker(areaActionsFor)}
+            accessibilityLabel="Move to another Room"
+            accessibilityRole="button"
+          >
+            <Layers size={18} color="#334155" strokeWidth={2.25} />
+            <Text style={s.areaActionText}>Move to another Room</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.areaActionRow, { borderBottomWidth: 0 }]}
+            onPress={() => { const a = areaActionsFor; setAreaActionsFor(null); handleDeleteArea(a); }}
+            accessibilityLabel="Delete Area"
+            accessibilityRole="button"
+          >
+            <Trash2 size={18} color="#DC2626" strokeWidth={2.25} />
+            <Text style={[s.areaActionText, { color: "#DC2626" }]}>Delete Area</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 16 }]} onPress={() => setAreaActionsFor(null)}>
+            <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // ---- The reusable Room Picker (AreaReparentingDesign.md §9/§10). Built
+  // deliberately standalone rather than extracted from the Room-First-
+  // Identity confirmation flow's own picker (§10: that one is tightly
+  // coupled to roomConfirmation/recognitionPendingRef and unwinding it
+  // buys nothing) - it takes its whole input from `rooms`, which loadRooms
+  // already filters to non-retired, and its whole output from one
+  // callback. That genericity is what lets Area-move and Room-level move
+  // share it verbatim, branching only on roomPickerFor.kind.
+  //
+  // Exclusion rule: never offer the Room the thing already lives in. For
+  // an Area that's its current parent Room; for a Room-level move it's the
+  // Room itself (moving a Room into itself is Case A, a guaranteed no-op).
+  const roomPickerExcludedId = roomPickerFor?.kind === "area" ? roomPickerFor.sourceRoomId : roomPickerFor?.room?.id;
+  const roomPickerOptions = rooms.filter((r) => r.id !== roomPickerExcludedId && r.retired !== true);
+  const renderRoomPicker = () => (
+    <Modal visible={!!roomPickerFor} animationType="slide" transparent onRequestClose={closeRoomPicker}>
+      <View style={s.renameSheetBackdrop}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRoomPicker} accessibilityLabel="Close" accessibilityRole="button" />
+        <View style={[s.renameSheetCard, { maxHeight: "80%" }]}>
+          <Text style={s.renameSheetTitle}>
+            {roomPickerFor?.kind === "area"
+              ? `Move "${roomPickerFor?.area?.displayName || "this Area"}" to...`
+              : `Move "${roomPickerFor?.room?.displayName || "this Room"}" into...`}
+          </Text>
+          {roomPickerOptions.length === 0 ? (
+            <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>
+              You don't have another Room to move this into yet. Organize a different room first, then try again.
+            </Text>
+          ) : (
+            <ScrollView style={{ marginBottom: 4 }} keyboardShouldPersistTaps="handled">
+              {roomPickerOptions.map((r) => {
+                const RoomIcon = getRoomTypeIcon(r.displayName);
+                return (
+                  <TouchableOpacity
+                    key={r.id}
+                    style={[s.historyItem, { marginBottom: 8 }]}
+                    onPress={() => onRoomPickerSelectForMove(r)}
+                    accessibilityLabel={`Move to ${r.displayName}`}
+                    accessibilityRole="button"
+                  >
+                    <View style={s.historyIcon}>
+                      <RoomIcon size={26} color={BRAND.green} strokeWidth={2.25} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.historySpace} numberOfLines={1}>{r.displayName}</Text>
+                      <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>
+                        {`${r.visitCount ?? 0} visit${(r.visitCount ?? 0) === 1 ? "" : "s"}`}
+                      </Text>
+                    </View>
+                    <ChevronRight size={18} color="#94A3B8" strokeWidth={2.25} />
+                  </TouchableOpacity>
+                );
+              })}
+              {/* Phase B (deferred): creating a Room during a move needs a
+                  genuinely new "found a Room with no plan" code path -
+                  AreaReparentingDesign.md §3b confirms no createRoom()
+                  helper exists anywhere today. Shown-but-disabled rather
+                  than hidden, so the capability is discoverable and its
+                  absence is explained rather than silently missing. */}
+              <View style={[s.historyItem, { marginBottom: 0, opacity: 0.5, backgroundColor: "#F8F9FA" }]}>
+                <View style={[s.historyIcon, { backgroundColor: "#E2E8F0" }]}>
+                  <Plus size={26} color="#94A3B8" strokeWidth={2.25} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.historySpace, { color: "#94A3B8" }]} numberOfLines={1}>Create a new Room...</Text>
+                  <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>Coming soon</Text>
+                </View>
+              </View>
+            </ScrollView>
+          )}
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 12 }]} onPress={closeRoomPicker}>
+            <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // ---- Move confirmation + processing overlay (§9). The overlay is a
+  // real requirement here, not decoration: an Area move runs N sequential
+  // reclassifyLegacyPlan calls, each itself a 7-phase state machine, so
+  // multi-second latency is expected and must be visibly covered. While
+  // moveSaving is true every dismissal path is disabled (backdrop tap,
+  // Cancel, onRequestClose all early-return via closeMoveConfirm) - a
+  // half-finished move must never be left running behind a dismissed
+  // dialog, even though the operation itself would survive it. ----
+  const renderMoveConfirm = () => {
+    const isArea = moveConfirmTarget?.kind === "area";
+    const subjectName = isArea ? moveConfirmTarget?.area?.displayName : moveConfirmTarget?.room?.displayName;
+    const targetName = moveConfirmTarget?.targetRoom?.displayName;
+    return (
+      <Modal visible={!!moveConfirmTarget} animationType="fade" transparent onRequestClose={closeMoveConfirm}>
+        <View style={s.renameSheetBackdrop}>
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeMoveConfirm} accessibilityLabel="Close" accessibilityRole="button" />
+          <View style={s.renameSheetCard}>
+            <Text style={s.renameSheetTitle}>{`Move ${subjectName || "this"} to ${targetName || "that Room"}?`}</Text>
+            <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>
+              {isArea
+                ? "All visits, photos, and history will move with it."
+                : "All of this Room's visits, photos, and history will move into that Room, and this Room will be merged away."}
+            </Text>
+            {moveError && (
+              <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+                <Text style={{ fontSize: 13, color: "#B91C1C" }}>{moveError}</Text>
+              </View>
+            )}
+            {moveSaving ? (
+              <View style={{ alignItems: "center", paddingVertical: 18 }}>
+                <ActivityIndicator size="large" color={BRAND.green} />
+                <Text style={{ fontSize: 14, color: "#64748B", marginTop: 12 }}>Moving...</Text>
+              </View>
+            ) : (
+              <View style={{ flexDirection: "row", gap: 10 }}>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={closeMoveConfirm}>
+                  <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.startOverBtn, { flex: 1, marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]}
+                  onPress={confirmMove}
+                  accessibilityLabel="Confirm move"
+                  accessibilityRole="button"
+                >
+                  <Text style={[s.startOverText, { color: "white" }]}>Move</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
+    );
   };
   // Phase C1 (DeletionDesign.md Soft-Delete Revision): real soft delete,
   // replacing the prior "Coming soon" placeholder. One atomic writeBatch
@@ -8036,18 +8475,36 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                           )}
                           {/* Item 2: name and "Organize Again" each on their
                               own line (matching renderVisitRow's own fix) -
-                              no shared row width to truncate against. */}
+                              no shared row width to truncate against.
+                              Area Re-parenting Phase A (§9): the "..."
+                              overflow control shares the Organize Again
+                              line, pushed to the far right by a spacer, so
+                              Organize Again keeps the primary-action slot
+                              and Rename/Move/Delete all live behind one
+                              secondary control instead of competing with
+                              it. */}
                           <View style={{ flex: 1 }}>
                             <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
                             <Text style={s.historyOverview} numberOfLines={1}>{`${area.visitCount ?? 0} visit${area.visitCount === 1 ? "" : "s"}`}</Text>
-                            <TouchableOpacity
-                              onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
-                              accessibilityLabel={`Organize Again in ${area.displayName}`}
-                              accessibilityRole="button"
-                              style={{ marginTop: 4, alignSelf: "flex-start" }}
-                            >
-                              <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
-                            </TouchableOpacity>
+                            <View style={{ flexDirection: "row", alignItems: "center", marginTop: 4 }}>
+                              <TouchableOpacity
+                                onPress={() => startOrganizeAgain(mostRecent || { id: room.id }, area.id)}
+                                accessibilityLabel={`Organize Again in ${area.displayName}`}
+                                accessibilityRole="button"
+                                style={{ paddingVertical: 6, paddingRight: 12 }}
+                              >
+                                <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Organize Again</Text>
+                              </TouchableOpacity>
+                              <View style={{ flex: 1 }} />
+                              <TouchableOpacity
+                                onPress={() => setAreaActionsFor(area)}
+                                style={s.areaOverflowBtn}
+                                accessibilityLabel={`More options for ${area.displayName}`}
+                                accessibilityRole="button"
+                              >
+                                <MoreHorizontal size={20} color="#94A3B8" strokeWidth={2.25} />
+                              </TouchableOpacity>
+                            </View>
                           </View>
                         </View>
                       </Swipeable>
@@ -8105,11 +8562,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
               {/* Room-level actions (Section 1) - quiet/destructive text
                   links at the bottom of content, replacing the removed
-                  three-dot overflow. Move remains placement only (not
-                  wired to reclassifyLegacyPlan). Delete is real as of
-                  Phase C1 - soft delete only (handleDeleteRoom), the
-                  30-day hard-purge sweep is a later phase. */}
-              <TouchableOpacity onPress={handleMoveRoomPlaceholder} style={{ marginTop: 28, alignItems: "center", paddingVertical: 10 }} accessibilityLabel="Move to another Room" accessibilityRole="button">
+                  three-dot overflow. Move is real as of Area Re-parenting
+                  Phase A - wired to mergeRoomIntoRoom via the same Room
+                  Picker Area-move uses. Delete is real as of Phase C1 -
+                  soft delete only (handleDeleteRoom), the 30-day hard-purge
+                  sweep is a later phase. */}
+              <TouchableOpacity onPress={() => openRoomMovePicker(room)} style={{ marginTop: 28, alignItems: "center", paddingVertical: 10 }} accessibilityLabel="Move to another Room" accessibilityRole="button">
                 <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }}>Move to another Room</Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -8125,6 +8583,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         </ScrollView>
         {renderRenameSheet()}
         {renderPhotoZoomModal()}
+        {/* Area Re-parenting Phase A (§9/§10): all three live only on Room
+            Detail, which is the sole screen that can start either move -
+            the Area overflow sheet (per-Area) and the Room Picker +
+            confirmation, which the Area flow and the Room-level "Move to
+            another Room" link at the bottom of this same screen share. */}
+        {renderAreaActionsSheet()}
+        {renderRoomPicker()}
+        {renderMoveConfirm()}
       </SafeAreaView>
     );
   }
@@ -10457,6 +10923,16 @@ const s = StyleSheet.create({
   // Height needs no explicit value - the actions row's default
   // alignItems:"stretch" already fills it to match the card's height.
   areaSwipeDeleteAction: { width: 80, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center" },
+  // Area Re-parenting Phase A (AreaReparentingDesign.md §9): the "..."
+  // overflow control on an Area row, and the rows inside the action sheet
+  // it opens. The control is deliberately a fixed 44x44 hit target (the
+  // platform minimum) sitting to the RIGHT of the row's own content, so
+  // it never competes with "Organize Again" for the primary-action slot -
+  // §9's governing point: a move is rarer and more consequential than
+  // starting a visit, and must not read as a second same-tier action.
+  areaOverflowBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  areaActionRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: "#E6E9EE" },
+  areaActionText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: "#334155" },
   historyIcon: { width: 66, height: 66, backgroundColor: BRAND.greenLight, borderRadius: 16, alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden" },
   historySpace: { fontSize: 14, fontFamily: "Inter_700Bold", color: BRAND.ink },
   historyDate: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
