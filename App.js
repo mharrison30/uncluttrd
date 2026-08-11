@@ -25,7 +25,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, Timestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
@@ -2571,7 +2571,20 @@ function shortProductNoun(productType) {
   return words.join(" ").toLowerCase();
 }
 
+// The icon vocabulary is enforced at the prompt level (analyze()'s own
+// productInstruction lists these exact keys) - keep the two in sync, and
+// keep every name here verified against the installed lucide-react-native
+// version before adding it. An unavailable name imports as undefined and
+// crashes at render, which is how "Shelf" was lost earlier (see
+// ROOM_TYPE_ICON_RULES' own note).
+//
+// The ten decor/styling keys below were added alongside the AI prompt
+// refinement that lets an approach recommend art, lighting, textiles and
+// display objects, not just organizing hardware. Without them every such
+// recommendation fell through to `other` and rendered the same generic
+// Package icon, which made the expanded product rows unreadable.
 const PRODUCT_CATEGORY_ICONS = {
+  // organizing hardware (original vocabulary, unchanged)
   cable: Cable,
   basket: ShoppingBasket,
   bin: Box,
@@ -2581,10 +2594,65 @@ const PRODUCT_CATEGORY_ICONS = {
   "drawer-organizer": Archive,
   hanger: Shirt,
   bag: ShoppingBag,
+  // decor / styling / finishing
+  art: Frame,
+  lighting: Lightbulb,
+  textile: Layers,
+  plant: Leaf,
+  tray: Utensils,
+  barware: Wine,
+  glassware: GlassWater,
+  decor: Sparkles,
+  storage: Boxes,
+  furniture: Armchair,
   other: Package,
 };
 function getProductCategoryIcon(iconKey) {
   return PRODUCT_CATEGORY_ICONS[iconKey] || Package;
+}
+// Derived, never hand-written: analyze()'s productInstruction interpolates
+// this so the vocabulary the AI is told to choose from is definitionally
+// the vocabulary this file can render. Adding a key to the map above is
+// the only edit needed to teach the prompt a new category.
+const PRODUCT_ICON_VOCAB = Object.keys(PRODUCT_CATEGORY_ICONS).join(", ");
+
+// Product Grounding schema (2026-08-11): a recommendation may cite zero or
+// more problemsFound ids AND/OR a free-text `grounding` observation, which
+// replaces the old single mandatory `relatedProblemId`. Plans saved before
+// this change carry the singular field; this is the one place that
+// difference is flattened, exactly as normalizeItemsFound does for the
+// itemsFound shape change. Pure and tolerant - a malformed entry degrades
+// to an empty id list rather than throwing.
+//
+// The three valid states the prompt enforces:
+//   ids non-empty, grounding null  -> solves one or more named problems
+//   ids empty,     grounding set   -> optional enhancement, evidence cited
+//   ids empty,     grounding null  -> INVALID (ungrounded filler)
+// The invalid state is not filtered out here: rendering it as a bare
+// reason line is more honest than silently dropping a recommendation the
+// model actually returned, and `isUngrounded` lets a future validation
+// pass surface it rather than hiding it.
+function normalizeProductRecommendation(rec) {
+  if (!rec || typeof rec !== "object") return null;
+  const ids = Array.isArray(rec.relatedProblemIds)
+    ? rec.relatedProblemIds.filter((id) => typeof id === "string" && id.trim())
+    : (typeof rec.relatedProblemId === "string" && rec.relatedProblemId.trim() ? [rec.relatedProblemId.trim()] : []);
+  const grounding = typeof rec.grounding === "string" && rec.grounding.trim() ? rec.grounding.trim() : null;
+  return { ...rec, relatedProblemIds: ids, grounding, isUngrounded: ids.length === 0 && !grounding };
+}
+// The line rendered under a product's name. Per the schema above:
+// grounding wins when present (it IS the reason for an optional
+// enhancement), otherwise the linked problems' own descriptions explain
+// what the product is for. `reason` is the fallback - it is still written
+// by the AI and is all an older plan has.
+function resolveRecommendationReason(rec, problemsFound) {
+  if (rec.grounding) return rec.grounding;
+  if (rec.relatedProblemIds?.length) {
+    const byId = new Map((problemsFound || []).filter((p) => p && p.id).map((p) => [p.id, p.description]));
+    const linked = rec.relatedProblemIds.map((id) => byId.get(id)).filter(Boolean);
+    if (linked.length) return linked.join(" ");
+  }
+  return rec.reason || "";
 }
 
 const REFERRAL_SOURCES = [
@@ -5963,7 +6031,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // spending bands right after it. Ambition/scope now leads; spending
       // bands (below) are kept only as the AI's own internal calibration
       // reference, never the primary differentiation mechanic.
-      const visionApproachesInstruction = `Then generate THREE separate, complete organizing approaches for this exact space, and make them differ in AMBITION AND VISION, not just spending. "simple" (Keep It Simple) solves the immediate organization problems using what the user already owns, rearranging, decluttering, consolidating. It may also resolve a completion opportunity, but ONLY when doing so costs essentially nothing and uses something already visible in the room (for example, relocating a piece of decor that is already somewhere in the photo onto a blank wall) - it must never invent a discretionary purchase just to make the room feel more finished. The goal of Simple is: this space works better tomorrow with minimal effort. "polished" (Polished & Practical) solves the organization problems AND begins addressing the one or two biggest completion opportunities, with targeted purchases that genuinely upgrade function and appearance. The goal of Polished is: this space feels intentional and put together. "elevated" (Elevated Finish) is a full transformation vision: address every organization problem AND every genuine completion opportunity you identified, proposing whatever combination of wall art, accent or task lighting, furniture repositioning or upgrades, professional installation, concealed storage, and material coordination the space actually calls for. The goal of Elevated is: this space looks and feels designed, like a professional organizer's finished project, not just decluttered with nicer bins. Each approach must propose a DIFFERENT SCOPE of transformation, not the same tasks at different price points - Simple solves immediate problems, Polished improves the room's feel, Elevated reimagines what the space could be. If your three checklists would read almost the same with the adjectives stripped out, you have not done this correctly - go back and make Elevated genuinely bigger in scope, not merely pricier, and make sure Simple is not quietly doing Polished's job.`;
+      // Evidence-constrained interventions (Prompt Refinement, 2026-08-11).
+      // Controlled testing against two real staging photos showed the rule
+      // reaching taskChecklist but leaking in organizingGuidance ("Install
+      // proper accent lighting in the niche" alongside a correctly
+      // conditional task in the SAME approach) - so the all-fields sentence
+      // below names every field explicitly rather than stating the rule
+      // once and listing fields afterward.
+      const evidenceConstraintInstruction = `EVIDENCE-CONSTRAINED INTERVENTIONS: never present installation, construction, electrical, plumbing, mounting that depends on unknown structure, or any other infrastructure-dependent work as achievable, unless the necessary infrastructure is VISIBLE in this photo or otherwise confirmed to you. "Install a pendant light" requires a visible ceiling fixture, junction box, or existing outlet at that location. A table lamp requires a visible outlet within reach of where you are placing it.\n\nEvidence-constrained intervention rules apply to ALL generated fields, including strategyDescription, keyChanges, organizingGuidance, taskChecklist, productRecommendations, and visualizationDirection. When required infrastructure or physical conditions cannot be confirmed from the image or known context, the recommendation must be omitted or explicitly conditional. There is no field in which an unconfirmed infrastructure-dependent action may be stated as an instruction. Writing "If an outlet is available in or near the niche, install a picture light" in taskChecklist while writing "Install proper accent lighting in the niche" in organizingGuidance is a failure, because the second sentence states as achievable exactly what the first correctly flagged as unknown.\n\nConditional phrasing names the unknown out loud: "If an outlet is available near the credenza, a small lamp could add ambient light" is acceptable in any field. Instructional phrasing that assumes the unknown is resolved - "Introduce a table lamp on the credenza", "Add accent lighting to the niche", "Install proper accent lighting" - is not acceptable in any field, including guidance and strategy text, unless the required outlet, fixture, or mounting evidence is actually visible. An idea stated conditionally in one field must never appear unconditionally in another.\n\nBattery-powered and adhesive options that need no power source and no structural mounting are unconditional and may be recommended normally; a plug-in option is unconditional only if you can see the outlet it needs. This rule outranks every instruction below about ambition and breadth: an approach is never allowed to reach for a bigger vision by assuming infrastructure it cannot see.`;
+      const visionApproachesInstruction = `Then generate THREE separate, complete organizing approaches for this exact space, and make them differ in AMBITION AND VISION, not just spending.\n\nThe question you are answering for every approach is "how could this space be better?", not merely "what needs organizing?". A room that is not particularly cluttered still has real transformation potential through styling, completion, and finishing, and it is your job to find it. Equally, a room whose primary problem genuinely IS clutter and disorganization must be met with real organizing work first - never let the "how could this space be better?" framing pull you toward styling and decor while obvious functional disorder goes unaddressed. Solve what is actually wrong with the space in front of you.\n\n"simple" (Keep It Simple) means LOW INTERVENTION, not merely removing things. It must leave the room looking and working noticeably better, using what the user already owns: rearranging, decluttering, consolidating, regrouping, and restyling existing items into intentional arrangements. "Clear the table and wipe the surface" is not a transformation. "Clear the table, make the credenza feel like an intentional bar or display using what is already there, and give the blank wall and niche a more finished treatment by relocating decor that already exists elsewhere in the room" IS a transformation, even at zero cost. Simple should not invent discretionary purchases, but it must still actively improve the space, not just subtract from it. The goal of Simple is: this space works better AND looks noticeably better tomorrow, with minimal effort and essentially no spending.\n\n"polished" (Polished & Practical) solves the organization problems AND finishes the space with targeted purchases that genuinely upgrade function and appearance. The goal of Polished is: this space feels intentional and put together.\n\n"elevated" (Elevated Finish) is a full transformation vision: address every organization problem AND every genuine completion opportunity you identified, proposing whatever combination of storage systems, wall art, accent or task lighting, furniture repositioning or upgrades, concealed storage, and material coordination the space actually calls for, subject always to the evidence-constrained interventions rule above. The goal of Elevated is: this space looks and feels designed, like a professional organizer's finished project, not just decluttered with nicer bins.\n\nCOMPLETION OPPORTUNITIES INFLUENCE ALL THREE APPROACHES. Blank walls, unused niches, awkward empty areas, and unfinished displays are addressed at every approach level when they are visually significant, differing by ambition rather than being deferred entirely to the expensive approach: Simple resolves them at zero or near-zero cost by rearranging, regrouping, and restyling what is already in the room; Polished resolves them with targeted purchases that finish the space; Elevated resolves them as part of a comprehensive transformation. An approach that simply ignores a significant blank wall or empty niche has not done its job at its own level.\n\nEach approach must propose a DIFFERENT SCOPE of transformation, not the same tasks at different price points - Simple solves immediate problems and makes the room feel more finished with what is there, Polished improves the room's feel with targeted additions, Elevated reimagines what the space could be. If your three checklists would read almost the same with the adjectives stripped out, you have not done this correctly - go back and make Elevated genuinely bigger in scope, not merely pricier, and make sure Simple is not quietly doing Polished's job.`;
       // Section 5: explicit behavioral-difference requirement, not just
       // "grounded in a visible problem" (which the old prompt already
       // said and which alone still produced three reworded copies of the
@@ -5973,7 +6049,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // organizing products (art/lighting/furniture/services now
       // explicitly allowed) - a direct consequence of opportunities
       // existing as their own recommendable category now.
-      const productInstruction = `For each approach, separately decide whether any of ITS OWN problems or opportunities would genuinely benefit from a purchase - many organization problems are solved by rearranging what is already there, especially under Keep It Simple, and it is correct for Keep It Simple to have zero recommendations when nothing genuinely needs buying. Conversely, do not withhold a recommendation from Keep It Simple only because it is the cheap tier - a single inexpensive item that solves a real, visible problem (a $5 set of cable ties, a $10 tray) is a completely legitimate Simple recommendation. Elevated's recommendations are not limited to organizing products - when its own opportunities call for it, recommend art, lighting fixtures, display objects, furniture accessories, or installation services, exactly as the opportunities it is addressing require. For each recommendation, write productType (a product or service category, never a specific product name or brand), reason (one sentence tied to a specific problemsFound or opportunity id, not a generic benefit), searchTerms (retailer-independent search words), icon (choose exactly one of: cable, basket, bin, shelf, hook, label, drawer-organizer, hanger, bag, other), relatedProblemId (must match a real problemsFound id, of either type), and approachId. Return between 0 and 4 recommendations per approach, independently for each approach. Never invent a recommendation just to fill a slot, and never recommend a product tied to an object you were not confident about identifying.`;
+      // Product Grounding schema (2026-08-11). Two prior controlled tests
+      // both produced the same failure under a single mandatory
+      // relatedProblemId: an area rug whose own reason cited hard flooring
+      // was pointed first at "blank-wall", then at "credenza-top-styling",
+      // because the schema left nowhere honest to put a legitimate
+      // recommendation that solves no NAMED problem. Prose fixes did not
+      // help - the schema was the constraint, so the schema changed. The
+      // empty-ids + grounding state is the honest third answer.
+      const productInstruction = `TASK CHECKLIST AND PRODUCT RECOMMENDATIONS ARE SEPARATE DOMAINS. A product does not need a corresponding chore. "Wall art" can appear in productRecommendations even when "hang wall art" is not in that approach's taskChecklist - the user decides whether to act on a recommendation, and a recommendation is an option you are offering, not a task you are assigning.\n\nEVERY RECOMMENDATION MUST BE GROUNDED, IN EXACTLY ONE OF THREE WAYS. Each recommendation carries relatedProblemIds (an array of problemsFound ids) and grounding (a sentence of visible evidence, or null):\n(a) PROBLEM-SOLVING: relatedProblemIds lists one id, grounding is null. The product directly addresses that identified problem or opportunity.\n(b) MULTI-PROBLEM: relatedProblemIds lists two or more ids, grounding is null. The product genuinely serves several identified issues at once, and you list every one it serves rather than picking one arbitrarily.\n(c) OPTIONAL ENHANCEMENT: relatedProblemIds is an empty array and grounding is a sentence citing the specific visible evidence that supports the recommendation. Use this when a product would genuinely improve the space but does not solve any problem you named - for example an area rug where the visible hard flooring leaves the dining zone unanchored, when "unanchored flooring" is not one of your problemsFound entries. This is the honest answer, not a lesser one: not every good recommendation maps to a problem.\n\nHARD RULES ON GROUNDING: every id you put in relatedProblemIds must actually exist in your own problemsFound - never invent an id, and never point a product at a problem it does not genuinely address just to avoid leaving the array empty. An empty relatedProblemIds is permitted ONLY together with a non-null grounding that cites visible evidence. A recommendation with both an empty relatedProblemIds and a null grounding is invalid and must not be returned at all - that is ungrounded filler. If you find yourself reaching for a loosely-related id, that is the signal to use state (c) instead, or to drop the recommendation.\n\nFor each approach, separately decide which of ITS OWN problems or opportunities would genuinely benefit from a purchase. Products and decor do NOT have to be strictly required to complete an organizing task: they can be useful additions that advance that approach's transformation wherever the visible space provides legitimate opportunities. Generate the useful product and decor categories supported by the observed opportunities. Prefer breadth when multiple legitimate opportunities exist, but never create a recommendation to reach a target count. Two well-grounded recommendations are better than four where the last two are reaching.\n\nMatch the recommendations to what the space actually needs. A space whose real problem is clutter and disorder needs organizing products (baskets, bins, drawer organizers, cable management, filing and paper storage, labels); do not substitute decor for organizing hardware in a space that plainly needs organizing. A space that is already functional but visually unfinished is where styling, art, textiles, and display objects belong.\n\nMany organization problems are solved by rearranging what is already there, especially under Keep It Simple, and it is correct for Keep It Simple to have zero recommendations when nothing genuinely needs buying. Conversely, do not withhold a recommendation from Keep It Simple only because it is the cheap tier - a single inexpensive item that solves a real, visible problem (a $5 set of cable ties, a $10 tray) is a completely legitimate Simple recommendation.\n\nFor each recommendation, write productType (a product or service category, never a specific product name or brand), reason (one sentence explaining what the product does for this space), searchTerms (retailer-independent search words), icon (choose the single closest match from: ${PRODUCT_ICON_VOCAB}), relatedProblemIds, grounding, and approachId. Choose the most specific icon that fits - only use "other" when genuinely nothing in the list applies. Never return more than 6 recommendations for one approach, never invent a recommendation just to fill a slot, and never recommend a product tied to an object you were not confident about identifying.`;
       // Section 8: the only genuinely new OUTPUT field this redesign adds
       // (itemsFound/problemsFound are reshaped, not new) - short outcome
       // phrases for the collapsed approach card's denser "Key changes"
@@ -5989,9 +6073,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // Section 9: every explicit prohibition, compiled into one closing
       // block - same position roomAreaInstruction's own rules already
       // occupy, right before the "never use em dashes"/JSON-contract tail.
-      const prohibitionsInstruction = `Do not violate any of the following: never state a guess as a fact; never build a task, tip, or recommendation around an object you marked uncertain except by its own neutral physical description; never let an uncertain identification become a confident noun anywhere later in your response; never generate three approaches that are the same plan at three price points; never ignore a genuine blank wall, unused niche, or missing light source; never claim an opportunity exists on a surface that already has something intentional on it, or where being blank is appropriate; never recommend a product without a reason tied to a specific problemsFound or opportunity id; never pad recommendations to fill a quota; never insist a space needs more than it does - zero opportunities and zero recommendations are both valid, correct answers when the evidence genuinely supports them.`;
-      const approachesInstruction = `${identificationInstruction}\n\n${certaintyFirewallInstruction}\n\n${opportunitiesInstruction}\n\n${visionApproachesInstruction}\n\n${taskDifferentiationInstruction}\n\n${productInstruction}\n\n${keyChangesInstruction}\n\n${vizAndSpendInstruction}\n\n${prohibitionsInstruction}`;
-      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${scopeClassificationInstruction}\n\n${approachesInstruction}${priorContextNote}${knownIdentityNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":[{"description":"specific item, or neutral physical description if uncertain","certainty":"confirmed or uncertain"}],"problemsFound":[{"id":"short-hyphenated-id","type":"organization or opportunity","description":"one sentence grounded in what is visible"}],"scopeSize":"micro-area, small-area, room-section, whole-room, or large-room","approaches":{"simple":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"cable, basket, bin, shelf, hook, label, drawer-organizer, hanger, bag, or other","relatedProblemId":"matching problemsFound id","approachId":"simple"}],"visualizationDirection":"one descriptive sentence"},"polished":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"icon id","relatedProblemId":"matching problemsFound id","approachId":"polished"}],"visualizationDirection":"one descriptive sentence"},"elevated":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"icon id","relatedProblemId":"matching problemsFound id","approachId":"elevated"}],"visualizationDirection":"one descriptive sentence"}},"proTip":"one expert insight"}`;
+      const prohibitionsInstruction = `Do not violate any of the following: never state a guess as a fact; never build a task, tip, or recommendation around an object you marked uncertain except by its own neutral physical description; never let an uncertain identification become a confident noun anywhere later in your response; never generate three approaches that are the same plan at three price points; never ignore a genuine blank wall, unused niche, or missing light source; never let styling or decor displace real organizing work in a space whose primary problem is clutter or disorder; never leave a visually significant completion opportunity entirely unaddressed by Keep It Simple on the grounds that it costs money to fix, when a zero-cost rearrangement would partly address it; never treat a room that is not especially cluttered as having no transformation potential; never state an infrastructure-dependent action as achievable in ANY field without visible evidence, and never use instructional phrasing in one field for an idea you correctly made conditional in another; never put an id in relatedProblemIds that does not exist in problemsFound or that the product does not genuinely address; never return a recommendation with both an empty relatedProblemIds and a null grounding; never claim an opportunity exists on a surface that already has something intentional on it, or where being blank is appropriate; never pad recommendations to fill a quota; never insist a space needs more than it does - zero opportunities and zero recommendations are both valid, correct answers when the evidence genuinely supports them.`;
+      const approachesInstruction = `${identificationInstruction}\n\n${certaintyFirewallInstruction}\n\n${opportunitiesInstruction}\n\n${evidenceConstraintInstruction}\n\n${visionApproachesInstruction}\n\n${taskDifferentiationInstruction}\n\n${productInstruction}\n\n${keyChangesInstruction}\n\n${vizAndSpendInstruction}\n\n${prohibitionsInstruction}`;
+      const prompt = `${priorPhotoPreamble}You are a warm expert home organizer. Analyze ${priorPhotoBase64 ? "today's" : "this"} photo of a space.\n\n${scopeClassificationInstruction}\n\n${approachesInstruction}${priorContextNote}${knownIdentityNote}\n\nNever use em dashes (—) anywhere in your response; use a comma, period, or parentheses instead.\n\n${roomAreaInstruction}Return ONLY valid JSON, nothing else (no markdown, no backticks).\n\n{"suggestedRoomName":"short label, e.g. Living Room","suggestedAreaName":"short label for the specific zone/fixture shown, or null if whole-room","areaScope":"whole-room, sub-area, or ambiguous","roomReason":"one short phrase citing specific visible evidence for the room classification","areaReason":"one short phrase justifying the areaScope classification, citing what is or isn't visible","overview":"2 warm sentences","itemsFound":[{"description":"specific item, or neutral physical description if uncertain","certainty":"confirmed or uncertain"}],"problemsFound":[{"id":"short-hyphenated-id","type":"organization or opportunity","description":"one sentence grounded in what is visible"}],"scopeSize":"micro-area, small-area, room-section, whole-room, or large-room","approaches":{"simple":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"one key from the icon list above","relatedProblemIds":["matching problemsFound id, or empty array if grounding is used"],"grounding":"visible evidence sentence, or null","approachId":"simple"}],"visualizationDirection":"one descriptive sentence"},"polished":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"one key from the icon list above","relatedProblemIds":["matching problemsFound id, or empty array if grounding is used"],"grounding":"visible evidence sentence, or null","approachId":"polished"}],"visualizationDirection":"one descriptive sentence"},"elevated":{"strategyDescription":"1-2 sentences","organizingGuidance":["tip1","tip2","tip3"],"taskChecklist":["step1","step2","step3"],"keyChanges":["phrase1","phrase2","phrase3"],"productRecommendations":[{"productType":"category","reason":"one sentence","searchTerms":"search phrase","icon":"one key from the icon list above","relatedProblemIds":["matching problemsFound id, or empty array if grounding is used"],"grounding":"visible evidence sentence, or null","approachId":"elevated"}],"visualizationDirection":"one descriptive sentence"}},"proTip":"one expert insight"}`;
 
       // Check base64 size - if too large, warn user
       const sizeKB = Math.round((photo.base64.length * 3 / 4) / 1024);
@@ -9991,8 +10075,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 // group with kind: "service" without any change to the
                 // card layout below - only a new branch in the per-item
                 // renderer, same pattern as the existing "product" branch.
+                // Product Grounding schema: normalized once here so every
+                // consumer below (the collapsed additions preview and the
+                // expanded product rows alike) sees relatedProblemIds as an
+                // array and grounding as string-or-null, whether the plan
+                // was written before or after the schema change.
                 const recommendationGroups = [
-                  { kind: "product", items: a.productRecommendations || [] },
+                  { kind: "product", items: (a.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean) },
                 ].filter(g => g.items.length > 0);
                 return (
                   <View key={id} style={[s.approachCard, { borderColor: expanded ? meta.color : BRAND.stone }, expanded && { borderWidth: 2 }]}>
@@ -10107,7 +10196,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                   </View>
                                   <View style={{ flex: 1 }}>
                                     <Text style={s.prodName}>{item.productType}</Text>
-                                    <Text style={s.approachProdReason}>{item.reason}</Text>
+                                    {/* Product Grounding schema: an optional
+                                        enhancement explains itself with its
+                                        own grounding evidence; a
+                                        problem-solving recommendation
+                                        explains itself with the problem(s)
+                                        it is linked to. `reason` remains the
+                                        fallback and is all a pre-schema plan
+                                        has. See resolveRecommendationReason. */}
+                                    <Text style={s.approachProdReason}>{resolveRecommendationReason(item, results.problemsFound)}</Text>
                                   </View>
                                   {/* Results Polish item 4: "Shop options"
                                       overpromised - what actually happens is
