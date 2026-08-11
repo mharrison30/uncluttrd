@@ -152,6 +152,10 @@ Verified against **every** `productType` string in staging, plus the spec's own 
 
 Metro production export clean. Nothing else changed: collapsed cards, expand/collapse browsing, and "Start with [Approach] →" are exactly as shipped.
 
+Committed (`8cfeeb5`) and pushed to the `staging` EAS Update branch:
+- iOS update ID: `019ff14e-f5da-7367-beed-ff16604fc229` (group `65781a9a-b3f4-497f-9477-10767137c163`)
+- Android update ID: `019ff14e-f5da-7366-b405-9d6bbcfd9d4c` (group `84d15f92-bbb5-403b-a661-5a378797ab5e`)
+
 ---
 
 ## 7. Known / deferred
