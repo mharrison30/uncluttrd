@@ -641,6 +641,200 @@ async function restoreArea(uid, roomId, areaId) {
   return { outcome: "restored" };
 }
 
+// ---- Session Recovery (SessionRecoveryDesign.md §6) ----
+// The first and only way to create a Space with no founding plan, closing
+// the gap AreaReparentingDesign.md §3b identified. Every other Space in
+// this system came into existence as a side effect of a plan being
+// projected; a Room created here has zero visits until a session is
+// classified into it, which computeRoomSummaryFields' own zero-visits
+// branch and Room Detail's empty-state rendering already handle (both
+// verified - see the design doc §6).
+//
+// The projection provenance fields (sourcePlanId, sourceVersion,
+// shadowSchemaVersion) are deliberately omitted rather than faked: they
+// describe a founding projection that did not happen, and
+// shared/spaceMigration.js's own field-ownership comment records that
+// nothing ever reads them back. createdWithoutPlan is a breadcrumb for
+// anyone later wondering why those fields are absent on this one Space.
+async function createRoomSpace(uid, displayName) {
+  const name = (displayName || "").trim();
+  if (!name) return { outcome: "invalid-name" };
+  const ref = await addDoc(collection(db, "users", uid, "spaces"), {
+    displayName: name,
+    createdAt: new Date().toISOString(),
+    retired: false,
+    visitCount: 0,
+    lastOrganizedAt: null,
+    latestPhotoUrl: null,
+    latestAreaName: null,
+    latestAreaScope: null,
+    createdWithoutPlan: true,
+  });
+  return { outcome: "created", roomId: ref.id };
+}
+
+// ---- Plan soft delete / restore (SessionRecoveryDesign.md §5) ----
+// New primitive: plans previously had only deletePlan, which is an
+// irreversible hard delete of the document AND its Storage objects. A
+// session surfaced in Needs Review needs the same 30-day, restorable
+// deletion Rooms and Areas already have, so this mirrors softDeleteRoom/
+// softDeleteArea's retired+deletedAt shape one level down.
+//
+// deleteProjectSubtree, not deleteSpaceShadowGraph: the latter deletes the
+// parent Space once no sibling Projects remain, which would destroy a real
+// Room because one of its sessions was deleted. Removing only the Project
+// is what makes summaries fall to the correct counts while leaving the
+// Room, the plan document, and every Storage object intact - which is what
+// makes restore a true restore rather than a re-creation.
+async function softDeletePlan(uid, planId) {
+  const planRef = doc(db, "users", uid, "plans", planId);
+  const snap = await getDoc(planRef);
+  if (!snap.exists()) return { outcome: "missing" };
+  const plan = snap.data();
+  if (plan.retired === true) return { outcome: "already-deleted" };
+  const spaceId = computeShadowIds(planId, plan).spaceId;
+  const areaId = plan.areaId || null;
+
+  await updateDoc(planRef, { retired: true, deletedAt: serverTimestamp() });
+  // Guarded on the Space actually existing, the same way restorePlan below
+  // is. An unresolved orphan's computed spaceId points at no document, so
+  // the teardown and both summary recomputes have nothing to act on -
+  // running them anyway is a wasted round trip that logs a NOT_FOUND and
+  // reads, in the log, exactly like a real failure.
+  const spaceSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId));
+  if (spaceSnap.exists()) {
+    await deleteProjectSubtree(uid, spaceId, planId).catch((e) => dlog(`[PLAN SOFT DELETE] project teardown failed for ${planId}: ${e.message}`));
+    await updateSpaceRoomSummary(uid, spaceId);
+    if (areaId) await updateAreaSummary(uid, spaceId, areaId);
+  }
+  return { outcome: "soft-deleted", spaceId, areaId, hadSpace: spaceSnap.exists() };
+}
+
+// The mirror image. forceFullReprojection rebuilds the Project subtree
+// from the plan document, which is still fully intact - the shadow is
+// derived, never authored, so nothing about the session's completed work
+// had to be preserved separately for this to work.
+async function restorePlan(uid, planId) {
+  const planRef = doc(db, "users", uid, "plans", planId);
+  const snap = await getDoc(planRef);
+  if (!snap.exists()) return { outcome: "missing" };
+  const plan = snap.data();
+  if (plan.retired !== true) return { outcome: "already-restored" };
+  const spaceId = computeShadowIds(planId, plan).spaceId;
+  const areaId = plan.areaId || null;
+
+  await updateDoc(planRef, { retired: false, deletedAt: deleteField(), shadowSourceVersion: increment(1) });
+  // Only reproject when the plan actually has a Space to project into - an
+  // unresolved orphan has none, and forceFullReprojection would create a
+  // junk Space at its phantom id. It regains its shadow when classified.
+  const spaceSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId));
+  if (spaceSnap.exists()) {
+    await forceFullReprojection(uid, planId).catch((e) => dlog(`[PLAN RESTORE] reprojection failed for ${planId}: ${e.message}`));
+    await updateSpaceRoomSummary(uid, spaceId);
+    if (areaId) await updateAreaSummary(uid, spaceId, areaId);
+  }
+  return { outcome: "restored", spaceId, areaId, reprojected: spaceSnap.exists() };
+}
+
+// ---- classifySession (SessionRecoveryDesign.md §4) ----
+// Gives one unresolved session a home. Branches on whether a SOURCE Space
+// actually exists, which is the whole reason this is not simply a call to
+// reclassifyLegacyPlan: 12 of the 14 unresolved sessions are orphans whose
+// computed spaceId points at no document, and claimReclassification would
+// capture that phantom id as oldSpaceId, after which cleanUpOldSpace's
+// setDoc(..., {merge:true}) tombstone write would CREATE a junk retired
+// Space per classified session (setDoc-with-merge creates a missing doc).
+// The reclassification machine exists to move a plan BETWEEN two Spaces;
+// an orphan has no Space to move from, so there is nothing for it to do.
+// newAreaName is the "create a new Area" case: the Area document cannot
+// exist yet (createAreaForPlan reads the plan's photo and writes into the
+// TARGET Room, so the plan has to land there first), but areaName and
+// areaScope must still be written as part of THIS move - otherwise the
+// reclassification/reprojection projects the session as whole-room and a
+// later areaId write leaves Project.areaScope permanently disagreeing with
+// the plan. When it is set, the areaId + sessionScope write is deferred to
+// createAreaForPlan, which already performs exactly that pair atomically.
+async function classifySession(uid, planId, { targetRoomId, targetAreaId = null, newAreaName = null }) {
+  const planRef = doc(db, "users", uid, "plans", planId);
+  const planSnap = await getDoc(planRef);
+  if (!planSnap.exists()) return { outcome: "plan-missing" };
+  const plan = planSnap.data();
+
+  const targetSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", targetRoomId));
+  if (!targetSpaceSnap.exists() || targetSpaceSnap.data().retired === true) {
+    return { outcome: "invalid-target", reason: "target Room does not exist or is retired" };
+  }
+  const targetRoomName = targetSpaceSnap.data().displayName || null;
+
+  const sourceSpaceId = computeShadowIds(planId, plan).spaceId;
+  const sourceSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", sourceSpaceId));
+  const sourceExists = sourceSpaceSnap.exists();
+  const sourceWasRetired = sourceExists && sourceSpaceSnap.data().retired === true;
+  const areaScope = (targetAreaId || newAreaName) ? "sub-area" : "whole-room";
+  const areaName = newAreaName ?? plan.areaName ?? null;
+
+  if (sourceExists && sourceSpaceId !== targetRoomId) {
+    // A genuine move between two real Spaces - reclassifyLegacyPlan owns
+    // the shadow create/delete, summary maintenance, and merge-candidate
+    // reconciliation, exactly as it does for Room merge and Area move.
+    const result = await reclassifyLegacyPlan(uid, planId, {
+      targetSpaceId: targetRoomId,
+      requestedRoomName: targetRoomName,
+      requestedAreaName: areaName,
+      requestedAreaScope: areaScope,
+    });
+    if (result.outcome !== "completed") return { outcome: "failed", reason: "reclassification did not complete", detail: result };
+  } else {
+    // Orphan, or already under the target: assign directly and project.
+    await updateDoc(planRef, {
+      canonicalSpaceId: targetRoomId,
+      spaceName: targetRoomName,
+      areaName,
+      areaScope,
+      shadowSourceVersion: increment(1),
+    });
+    const reprojected = await forceFullReprojection(uid, planId);
+    if (reprojected.outcome === "source-plan-missing" || reprojected.outcome === "target-retired") {
+      return { outcome: "failed", reason: `reprojection failed: ${reprojected.outcome}` };
+    }
+  }
+
+  // areaId and sessionScope always travel together (see createAreaForPlan),
+  // and the resync is what carries areaId onto the shadow Project - a
+  // plan-only write leaves Project.areaId stale, which would keep the
+  // Area's own summary at zero visits forever.
+  // Skipped entirely when an Area is about to be created: writing
+  // sessionScope "room" here and "area" a moment later would make the plan
+  // briefly observable in a state that contradicts its own areaScope.
+  if (!newAreaName) {
+    await updateDoc(planRef, { areaId: targetAreaId, sessionScope: targetAreaId ? "area" : "room", shadowSourceVersion: increment(1) });
+    await syncPlanToSpaceGraph(uid, planId).catch((e) => dlog(`[CLASSIFY] shadow resync failed for ${planId}: ${e.message}`));
+  }
+
+  // Source-Room retirement repair, identical in intent to moveAreaToRoom's
+  // Phase 5a: cleanUpOldSpace tombstones a source Space as soon as its last
+  // Project leaves, and cannot tell "the Room was emptied by a correction"
+  // from "the whole Room was merged away". An emptied Room is a Room the
+  // user keeps. Guarded on the pre-move snapshot so a Room the user had
+  // already deleted stays deleted.
+  let sourceRoomRestored = false;
+  if (sourceExists && !sourceWasRetired && sourceSpaceId !== targetRoomId) {
+    const after = await getDoc(doc(db, "users", uid, "spaces", sourceSpaceId));
+    if (after.exists() && after.data().retired === true) {
+      await updateDoc(doc(db, "users", uid, "spaces", sourceSpaceId), {
+        retired: false, redirectTo: deleteField(), retiredAt: deleteField(), reclassificationExecutionId: deleteField(),
+      });
+      sourceRoomRestored = true;
+    }
+  }
+
+  await updateSpaceRoomSummary(uid, targetRoomId);
+  if (targetAreaId) await updateAreaSummary(uid, targetRoomId, targetAreaId);
+  if (sourceExists && sourceSpaceId !== targetRoomId) await updateSpaceRoomSummary(uid, sourceSpaceId);
+
+  return { outcome: "completed", planId, targetRoomId, targetAreaId, path: sourceExists && sourceSpaceId !== targetRoomId ? "reclassified" : "direct", sourceRoomRestored };
+}
+
 async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
   try {
     const shadow = buildShadowDocs({ planId, entry, photoUrl });
@@ -3670,6 +3864,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // second query. Only Rooms with a real deletedAt (user soft-delete, not
   // a bare merge tombstone) within the last 30 days.
   const [recentlyDeletedRooms, setRecentlyDeletedRooms] = useState([]);
+  // ---- Session Recovery (SessionRecoveryDesign.md) ----
+  // Everything below is a TEMPORARY migration surface. When the last
+  // unresolved session is classified (and the last soft-deleted one is
+  // restored or ages out), the entry point stops rendering and this screen
+  // becomes unreachable. Nothing here is a domain object.
+  const [unresolvedSessions, setUnresolvedSessions] = useState([]);
+  const [deletedSessions, setDeletedSessions] = useState([]);
+  const [showNeedsReview, setShowNeedsReview] = useState(false);
+  // The session currently being classified, plus where in the flow we are.
+  // step: "options" | "room" | "area" | "new-room" | "new-area"
+  const [classifyFor, setClassifyFor] = useState(null);
+  const [classifyStep, setClassifyStep] = useState(null);
+  const [classifyRoom, setClassifyRoom] = useState(null); // chosen target Room while picking an Area
+  const [classifyAreas, setClassifyAreas] = useState([]);
+  const [classifyName, setClassifyName] = useState("");
+  const [classifySaving, setClassifySaving] = useState(false);
+  const [classifyError, setClassifyError] = useState(null);
+  const [recoveryReloadKey, setRecoveryReloadKey] = useState(0);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
   // Room Detail screen (My Rooms -> True Room Grouping, Phase B) - replaces
   // the old single-plan Space Detail as the primary destination from My
@@ -4583,7 +4795,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         console.log("Loading history for user:", user.uid);
         const q = query(collection(db, "users", user.uid, "plans"), orderBy("createdAt", "desc"), limit(20));
         const snapshot = await getDocs(q);
-        const plans = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        // Session Recovery: plans gained a soft-deleted state, so every
+        // plans consumer now has to exclude retired ones. Filtered in
+        // memory rather than with a where clause - this query already
+        // carries orderBy + limit, and adding an inequality would need a
+        // composite index for no behavioral gain at this scale.
+        const plans = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })).filter(p => p.retired !== true);
         console.log("Loaded", plans.length, "plans from Firestore");
         setHistory(plans);
       } catch (e) {
@@ -4633,6 +4850,39 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     loadRooms();
   }, [isPro]);
 
+  // ---- Session Recovery: the recovery query (SessionRecoveryDesign.md §7).
+  // The uncapped uid-scoped subcollection query, deliberately NOT the
+  // collectionGroup form: Firestore rules here are user-scoped, so a
+  // client-side collection-group read would span other users' plans and be
+  // denied. It is uncapped on purpose - the 20-plan History cache is
+  // exactly what made these sessions invisible in the first place.
+  // Re-runs on recoveryReloadKey after every classify/delete/restore.
+  useEffect(() => {
+    let cancelled = false;
+    const loadUnresolved = async () => {
+      try {
+        const snap = await getDocs(query(collection(db, "users", user.uid, "plans"), where("sessionScope", "==", "unresolved")));
+        const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const toMillis = (t) => (t && typeof t.toMillis === "function" ? t.toMillis() : (typeof t === "string" ? Date.parse(t) : 0));
+        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+        const byCreated = (a, b) => String(b.createdAt).localeCompare(String(a.createdAt));
+        if (cancelled) return;
+        setUnresolvedSessions(all.filter((p) => p.retired !== true).sort(byCreated));
+        // Soft-deleted unresolved sessions keep sessionScope "unresolved",
+        // so the same query finds them - they are split out here rather
+        // than by a second query.
+        setDeletedSessions(all
+          .filter((p) => p.retired === true && p.deletedAt && (Date.now() - toMillis(p.deletedAt)) <= THIRTY_DAYS_MS)
+          .sort((a, b) => toMillis(b.deletedAt) - toMillis(a.deletedAt)));
+      } catch (e) {
+        dlog(`[RECOVERY] unresolved session query failed: ${e.message}`);
+        if (!cancelled) { setUnresolvedSessions([]); setDeletedSessions([]); }
+      }
+    };
+    loadUnresolved();
+    return () => { cancelled = true; };
+  }, [isPro, recoveryReloadKey]);
+
   // My Rooms -> True Room Grouping, Phase B: Room Detail's own plan list.
   // Verified against real staging data (merged + reclassified cases,
   // Phase B scoping pass Section 1) that a Room's full plan membership is
@@ -4657,8 +4907,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           getDoc(doc(db, "users", user.uid, "plans", roomDetailRoomId)),
         ]);
         const byId = new Map();
-        byCanonicalSnap.docs.forEach((d) => byId.set(d.id, { id: d.id, ...d.data() }));
-        if (selfSnap.exists()) byId.set(selfSnap.id, { id: selfSnap.id, ...selfSnap.data() });
+        // Session Recovery: exclude soft-deleted sessions from both halves
+        // of the OR-query - a deleted session must not appear in its
+        // Room's history while it sits in the 30-day retention window.
+        byCanonicalSnap.docs.forEach((d) => { const p = { id: d.id, ...d.data() }; if (p.retired !== true) byId.set(d.id, p); });
+        if (selfSnap.exists() && selfSnap.data().retired !== true) byId.set(selfSnap.id, { id: selfSnap.id, ...selfSnap.data() });
         const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
         const plans = [...byId.values()].sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
         if (!cancelled) setRoomDetailPlans(plans);
@@ -5110,7 +5363,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // plan (no canonicalSpaceId, no live Space at all) discoverable via
       // its own historical label, exactly as before this fix.
       const merged = new Map();
-      const addPlan = (id, data) => { if (!merged.has(id)) merged.set(id, { id, data }); };
+      // Session Recovery: a soft-deleted session must never found a
+      // recognition match - it is invisible everywhere else in the app for
+      // its retention window, and proposing "is this your X?" from a plan
+      // the user just deleted would be a confusing resurrection.
+      const addPlan = (id, data) => { if (!merged.has(id) && data?.retired !== true) merged.set(id, { id, data }); };
       spaceIdentityPlans.forEach((p) => addPlan(p.id, p.data));
       byType.docs.forEach((d) => addPlan(d.id, d.data()));
       byName.docs.forEach((d) => addPlan(d.id, d.data()));
@@ -7200,7 +7457,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setMoveError(null);
     setRoomPickerFor({ kind: "room", room });
   };
-  const closeRoomPicker = () => setRoomPickerFor(null);
+  // Cancelling out of the picker means something different for a session:
+  // the picker is step 2 of a flow whose step 1 (the options sheet) is
+  // still open underneath, so Cancel goes BACK rather than abandoning the
+  // whole classification. For the two move flows it stays a plain close.
+  const closeRoomPicker = () => {
+    if (roomPickerFor?.kind === "session") {
+      setRoomPickerFor(null);
+      setClassifyStep("options");
+      return;
+    }
+    setRoomPickerFor(null);
+  };
 
   // Picking a Room never moves anything directly - it resolves to a
   // confirmation step first, matching the destructive/consequential-action
@@ -7211,6 +7479,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     const ctx = roomPickerFor;
     setRoomPickerFor(null);
     if (!ctx) return;
+    // Session classification has no separate confirmation step, and that
+    // is deliberate: it is a repair, not a destructive move. Nothing is
+    // merged or retired, the session simply lands where the user says it
+    // belongs, and getting it wrong is fixable by classifying again.
+    if (ctx.kind === "session") {
+      if (ctx.mode === "whole") runClassify(targetRoom.id, null);
+      else enterAreaStep(targetRoom);
+      return;
+    }
     setMoveConfirmTarget({ ...ctx, targetRoom });
   };
 
@@ -7277,6 +7554,296 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setMoveSaving(false);
     }
   };
+
+  // ---- Session Recovery: classification flow (SessionRecoveryDesign.md §4)
+  // classifyStep encodes both where we are AND what a Room selection means,
+  // so no separate "mode" state can drift out of sync with it:
+  //   options | pick-room-whole | pick-room-area | pick-area | name-room | name-area
+  const refreshRecovery = () => setRecoveryReloadKey((k) => k + 1);
+  const openClassify = (plan) => {
+    setClassifyFor(plan);
+    setClassifyStep("options");
+    setClassifyRoom(null);
+    setClassifyAreas([]);
+    setClassifyName("");
+    setClassifyError(null);
+  };
+  const closeClassify = () => {
+    if (classifySaving) return;
+    setClassifyFor(null);
+    setClassifyStep(null);
+    setClassifyRoom(null);
+    setClassifyAreas([]);
+    setClassifyName("");
+    setClassifyError(null);
+    setRoomPickerFor(null);
+  };
+  // Areas are definitionally Room-owned, so this is a plain subcollection
+  // read with none of roomDetailPlans' OR-query complexity.
+  const enterAreaStep = async (room) => {
+    setClassifyRoom(room);
+    setClassifyStep("pick-area");
+    try {
+      const snap = await getDocs(collection(db, "users", user.uid, "spaces", room.id, "areas"));
+      setClassifyAreas(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((a) => !a.retired));
+    } catch (e) {
+      dlog(`[RECOVERY] area load failed for room ${room.id}: ${e.message}`);
+      setClassifyAreas([]);
+    }
+  };
+  // The single commit point for options 1, 2 and 3. Everything upstream
+  // only decides which (Room, Area) pair to pass, so a session classified
+  // as whole-Room and one classified into an Area travel identical code.
+  const runClassify = async (targetRoomId, targetAreaId, newAreaName = null) => {
+    if (!classifyFor || classifySaving) return;
+    setClassifySaving(true);
+    setClassifyError(null);
+    try {
+      const result = await classifySession(user.uid, classifyFor.id, { targetRoomId, targetAreaId, newAreaName });
+      if (result.outcome !== "completed") throw new Error(result.reason || "Couldn't file this session. Please try again.");
+      // Create-a-new-Area runs AFTER the move, deliberately: createAreaForPlan
+      // creates the Area under the target Room and reads the plan's OWN
+      // photoUrl for originalPhotoUrl, so the plan must already be under
+      // that Room for its shadow Project to land with the right areaId.
+      if (newAreaName) {
+        const created = await createAreaForPlan(user.uid, targetRoomId, classifyFor.id, newAreaName);
+        if (!created) throw new Error("The session moved, but the new Area couldn't be created. Try assigning it to an Area again.");
+        await updateSpaceRoomSummary(user.uid, targetRoomId);
+      }
+      const freshRoom = await getDoc(doc(db, "users", user.uid, "spaces", targetRoomId));
+      if (freshRoom.exists()) {
+        setRooms((prev) => {
+          const next = { id: targetRoomId, ...freshRoom.data() };
+          return prev.some((r) => r.id === targetRoomId) ? prev.map((r) => (r.id === targetRoomId ? next : r)) : [next, ...prev];
+        });
+      }
+      logEvent(getAnalytics(), "session_classified", { planId: classifyFor.id, scope: (targetAreaId || newAreaName) ? "area" : "room" });
+      setClassifySaving(false);
+      closeClassify();
+      refreshRecovery();
+      return;
+    } catch (e) {
+      setClassifyError(e.message || "Something went wrong. Please try again.");
+    }
+    setClassifySaving(false);
+  };
+  const submitNewRoomName = async () => {
+    const trimmed = classifyName.trim();
+    if (!trimmed || classifySaving) return;
+    setClassifySaving(true);
+    setClassifyError(null);
+    try {
+      const created = await createRoomSpace(user.uid, trimmed);
+      if (created.outcome !== "created") throw new Error("Couldn't create that Room. Please try again.");
+      const snap = await getDoc(doc(db, "users", user.uid, "spaces", created.roomId));
+      const room = { id: created.roomId, ...snap.data() };
+      setRooms((prev) => [room, ...prev]);
+      setClassifyName("");
+      // Straight into the Area step for the new Room. Its first entry is
+      // "Whole Room", so this covers both "new Room, whole-room session"
+      // and "new Room, then an Area inside it" without a second pass -
+      // which is what §3 option 3's "or continue to Area selection within
+      // the new Room" asks for.
+      await enterAreaStep(room);
+    } catch (e) {
+      setClassifyError(e.message || "Couldn't create that Room. Please try again.");
+    } finally {
+      setClassifySaving(false);
+    }
+  };
+  const handleDeleteSession = (plan) => {
+    Alert.alert(
+      "Delete this session?",
+      "This will remove this session and its organizing history. You can restore it from Recently Deleted within 30 days.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete", style: "destructive", onPress: async () => {
+            try {
+              closeClassify();
+              await softDeletePlan(user.uid, plan.id);
+              refreshRecovery();
+            } catch (e) {
+              Alert.alert("Couldn't delete", e.message);
+            }
+          },
+        },
+      ]
+    );
+  };
+  const handleRestoreSession = async (plan) => {
+    try {
+      await restorePlan(user.uid, plan.id);
+      refreshRecovery();
+    } catch (e) {
+      Alert.alert("Couldn't restore", e.message);
+    }
+  };
+  // Completed / remaining counts, using the same unresolved definition
+  // ("carried" or "pending", never "skipped") that Room Detail's own
+  // visitStatusLabel and the Companion carry-forward already use.
+  const sessionWorkSummary = (plan) => {
+    const batches = [...(Array.isArray(plan.batchHistory) ? plan.batchHistory : []), ...(plan.currentBatch ? [plan.currentBatch] : [])];
+    const items = batches.flatMap((b) => b?.items || []);
+    return {
+      completed: items.filter((i) => i.status === "checked").length,
+      remaining: items.filter((i) => i.status === "carried" || i.status === "pending").length,
+    };
+  };
+
+  // ---- Area Picker (§4, option 2) ----
+  // Its first row is always "Whole Room", which is what lets one component
+  // serve "this session covers all of the Room I just picked" and "it
+  // belongs to one Area inside it", including right after creating a Room.
+  const renderAreaPicker = () => (
+    <Modal visible={classifyStep === "pick-area"} animationType="slide" transparent onRequestClose={closeClassify}>
+      <View style={s.renameSheetBackdrop}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeClassify} accessibilityLabel="Close" accessibilityRole="button" />
+        <View style={[s.renameSheetCard, { maxHeight: "80%" }]}>
+          <Text style={s.renameSheetTitle} numberOfLines={2}>{`Where in ${classifyRoom?.displayName || "this Room"}?`}</Text>
+          {classifyError && (
+            <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+              <Text style={{ fontSize: 13, color: "#B91C1C" }}>{classifyError}</Text>
+            </View>
+          )}
+          {classifySaving ? (
+            <View style={{ alignItems: "center", paddingVertical: 22 }}>
+              <ActivityIndicator size="large" color={BRAND.green} />
+              <Text style={{ fontSize: 14, color: "#64748B", marginTop: 12 }}>Filing this session...</Text>
+            </View>
+          ) : (
+            <ScrollView keyboardShouldPersistTaps="handled">
+              <TouchableOpacity
+                style={[s.historyItem, { marginBottom: 8 }]}
+                onPress={() => runClassify(classifyRoom.id, null)}
+                accessibilityLabel="This session covers the whole Room"
+                accessibilityRole="button"
+              >
+                <View style={s.historyIcon}><Home size={26} color={BRAND.green} strokeWidth={2.25} /></View>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.historySpace}>Whole Room</Text>
+                  <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>This session covered the room overall</Text>
+                </View>
+              </TouchableOpacity>
+              {classifyAreas.map((area) => (
+                <TouchableOpacity
+                  key={area.id}
+                  style={[s.historyItem, { marginBottom: 8 }]}
+                  onPress={() => runClassify(classifyRoom.id, area.id)}
+                  accessibilityLabel={`File under ${area.displayName}`}
+                  accessibilityRole="button"
+                >
+                  {area.latestPhotoUrl || area.originalPhotoUrl ? (
+                    <Image source={{ uri: area.latestPhotoUrl || area.originalPhotoUrl }} style={s.historyIcon} resizeMode="cover" />
+                  ) : (
+                    <View style={s.historyIcon}><Layers size={26} color={BRAND.green} strokeWidth={2.25} /></View>
+                  )}
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.historySpace} numberOfLines={1}>{area.displayName}</Text>
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{`${area.visitCount ?? 0} visit${(area.visitCount ?? 0) === 1 ? "" : "s"}`}</Text>
+                  </View>
+                  <ChevronRight size={18} color="#94A3B8" strokeWidth={2.25} />
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity
+                style={[s.historyItem, { marginBottom: 0 }]}
+                onPress={() => { setClassifyName(""); setClassifyStep("name-area"); }}
+                accessibilityLabel="Create a new Area"
+                accessibilityRole="button"
+              >
+                <View style={[s.historyIcon, { backgroundColor: BRAND.offWhite }]}><Plus size={26} color={BRAND.green} strokeWidth={2.25} /></View>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.historySpace}>Create a new Area...</Text>
+                  <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>Uses this session's own photo</Text>
+                </View>
+              </TouchableOpacity>
+            </ScrollView>
+          )}
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 12 }]} onPress={closeClassify} disabled={classifySaving}>
+            <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // ---- Name entry, shared by "new Room" and "new Area" ----
+  const renderClassifyNameSheet = () => {
+    const isRoom = classifyStep === "name-room";
+    return (
+      <Modal visible={classifyStep === "name-room" || classifyStep === "name-area"} animationType="slide" transparent onRequestClose={closeClassify}>
+        <View style={s.renameSheetBackdrop}>
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeClassify} accessibilityLabel="Close" accessibilityRole="button" />
+          <View style={s.renameSheetCard}>
+            <Text style={s.renameSheetTitle}>{isRoom ? "Name this Room" : "Name this Area"}</Text>
+            <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 14 }}>
+              {isRoom
+                ? "A new Room will be created, then you can choose where in it this session belongs."
+                : `A new Area will be created in ${classifyRoom?.displayName || "this Room"}, using this session's own photo.`}
+            </Text>
+            <TextInput
+              style={s.renameSheetInput}
+              value={classifyName}
+              onChangeText={setClassifyName}
+              maxLength={50}
+              placeholder={isRoom ? "e.g. Kitchen" : "e.g. Corner Shelf"}
+              placeholderTextColor="#94A3B8"
+              autoFocus
+              editable={!classifySaving}
+            />
+            {classifyError && (
+              <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+                <Text style={{ fontSize: 13, color: "#B91C1C" }}>{classifyError}</Text>
+              </View>
+            )}
+            <View style={{ flexDirection: "row", gap: 10 }}>
+              <TouchableOpacity style={[s.mergeSecondaryBtn, { flex: 1 }]} onPress={closeClassify} disabled={classifySaving}>
+                <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.startOverBtn, { flex: 1, marginTop: 0, backgroundColor: (classifyName.trim() && !classifySaving) ? BRAND.green : "#CBD5E1", borderWidth: 0 }]}
+                onPress={() => (isRoom ? submitNewRoomName() : runClassify(classifyRoom.id, null, classifyName.trim()))}
+                disabled={!classifyName.trim() || classifySaving}
+              >
+                <Text style={[s.startOverText, { color: "white" }]}>{classifySaving ? "Saving..." : (isRoom ? "Create Room" : "Create Area")}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // ---- The four classification options (§3) ----
+  const renderClassifyOptions = () => (
+    <Modal visible={classifyStep === "options"} animationType="slide" transparent onRequestClose={closeClassify}>
+      <View style={s.renameSheetBackdrop}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeClassify} accessibilityLabel="Close" accessibilityRole="button" />
+        <View style={s.renameSheetCard}>
+          <Text style={s.renameSheetTitle}>Where does this session belong?</Text>
+          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-whole"); setRoomPickerFor({ kind: "session", mode: "whole" }); }} accessibilityRole="button" accessibilityLabel="This is a whole-Room session">
+            <Home size={18} color="#334155" strokeWidth={2.25} />
+            <Text style={s.areaActionText}>This is a whole-Room session</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-area"); setRoomPickerFor({ kind: "session", mode: "area" }); }} accessibilityRole="button" accessibilityLabel="This belongs to an Area">
+            <Layers size={18} color="#334155" strokeWidth={2.25} />
+            <Text style={s.areaActionText}>This belongs to an Area</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyName(""); setClassifyStep("name-room"); }} accessibilityRole="button" accessibilityLabel="Create a new Room for this">
+            <Plus size={18} color="#334155" strokeWidth={2.25} />
+            <Text style={s.areaActionText}>Create a new Room for this</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[s.areaActionRow, { borderBottomWidth: 0 }]} onPress={() => handleDeleteSession(classifyFor)} accessibilityRole="button" accessibilityLabel="Delete this session">
+            <Trash2 size={18} color="#DC2626" strokeWidth={2.25} />
+            <Text style={[s.areaActionText, { color: "#DC2626" }]}>Delete this session</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 16 }]} onPress={closeClassify}>
+            <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
 
   // ---- Area overflow ("...") action sheet (AreaReparentingDesign.md §9).
   // Rename and Delete are the EXISTING flows, only relocated into this
@@ -7347,11 +7914,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRoomPicker} accessibilityLabel="Close" accessibilityRole="button" />
         <View style={[s.renameSheetCard, { maxHeight: "80%" }]}>
           <Text style={s.renameSheetTitle}>
-            {roomPickerFor?.kind === "area"
+            {roomPickerFor?.kind === "session"
+              ? "Which Room?"
+              : roomPickerFor?.kind === "area"
               ? `Move "${roomPickerFor?.area?.displayName || "this Area"}" to...`
               : `Move "${roomPickerFor?.room?.displayName || "this Room"}" into...`}
           </Text>
-          {roomPickerOptions.length === 0 ? (
+          {roomPickerOptions.length === 0 && roomPickerFor?.kind !== "session" ? (
             <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>
               You don't have another Room to move this into yet. Organize a different room first, then try again.
             </Text>
@@ -7380,21 +7949,40 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   </TouchableOpacity>
                 );
               })}
-              {/* Phase B (deferred): creating a Room during a move needs a
-                  genuinely new "found a Room with no plan" code path -
-                  AreaReparentingDesign.md §3b confirms no createRoom()
-                  helper exists anywhere today. Shown-but-disabled rather
-                  than hidden, so the capability is discoverable and its
-                  absence is explained rather than silently missing. */}
-              <View style={[s.historyItem, { marginBottom: 0, opacity: 0.5, backgroundColor: "#F8F9FA" }]}>
-                <View style={[s.historyIcon, { backgroundColor: "#E2E8F0" }]}>
-                  <Plus size={26} color="#94A3B8" strokeWidth={2.25} />
+              {/* Session Recovery supplies the "create a Room with no plan"
+                  path the two move flows still lack (createRoomSpace), so
+                  the row is live for kind: "session" and stays shown-but-
+                  disabled for Area/Room moves - Phase B territory there.
+                  Disabled rather than hidden so the capability is
+                  discoverable and its absence explained, not just missing. */}
+              {roomPickerFor?.kind === "session" ? (
+                <TouchableOpacity
+                  style={[s.historyItem, { marginBottom: 0 }]}
+                  onPress={() => { setRoomPickerFor(null); setClassifyName(""); setClassifyStep("name-room"); }}
+                  accessibilityLabel="Create a new Room"
+                  accessibilityRole="button"
+                >
+                  <View style={[s.historyIcon, { backgroundColor: BRAND.offWhite }]}>
+                    <Plus size={26} color={BRAND.green} strokeWidth={2.25} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.historySpace} numberOfLines={1}>Create a new Room...</Text>
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>
+                      {roomPickerOptions.length === 0 ? "You don't have any Rooms yet" : "Name it and file this session into it"}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              ) : (
+                <View style={[s.historyItem, { marginBottom: 0, opacity: 0.5, backgroundColor: "#F8F9FA" }]}>
+                  <View style={[s.historyIcon, { backgroundColor: "#E2E8F0" }]}>
+                    <Plus size={26} color="#94A3B8" strokeWidth={2.25} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.historySpace, { color: "#94A3B8" }]} numberOfLines={1}>Create a new Room...</Text>
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>Coming soon</Text>
+                  </View>
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[s.historySpace, { color: "#94A3B8" }]} numberOfLines={1}>Create a new Room...</Text>
-                  <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>Coming soon</Text>
-                </View>
-              </View>
+              )}
             </ScrollView>
           )}
           <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 12 }]} onPress={closeRoomPicker}>
@@ -7618,6 +8206,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     const onBackPress = () => {
       if (showPaywall) { setShowPaywall(false); setPaywallSource("general_paywall"); return true; }
       if (showMenu) { setShowMenu(false); return true; }
+      // Needs Review sits ON TOP of My Rooms (showHistory stays true
+      // underneath), so it must be checked before it - otherwise back
+      // would close My Rooms out from under an open recovery flow. Its
+      // own modals unwind one step at a time, same as every other
+      // multi-step sheet in this handler.
+      if (showNeedsReview) {
+        if (classifySaving) return true;
+        if (classifyStep === "name-room" || classifyStep === "name-area" || classifyStep === "pick-area") { setClassifyStep("options"); return true; }
+        if (roomPickerFor?.kind === "session") { closeRoomPicker(); return true; }
+        if (classifyStep) { closeClassify(); return true; }
+        setShowNeedsReview(false);
+        return true;
+      }
       if (showHistory) { setShowHistory(false); setShowMenu(true); return true; }
       if (showFaq) { setShowFaq(false); setShowMenu(true); return true; }
       if (showAccount) { setShowAccount(false); setShowMenu(true); return true; }
@@ -7688,7 +8289,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
     const subscription = BackHandler.addEventListener("hardwareBackPress", onBackPress);
     return () => subscription.remove();
-  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, roomDetailRoomId, roomConfirmation, results, showCompanion, unresolvedReview, resultsCameFromRoomDetail]);
+  }, [showPaywall, showMenu, showHistory, showFaq, showAccount, showSpaceInspector, showMergeReview, roomDetailRoomId, roomConfirmation, results, showCompanion, unresolvedReview, resultsCameFromRoomDetail, showNeedsReview, classifyStep, classifySaving, roomPickerFor]);
 
   const handleSignOut = () => {
     setShowMenu(false);
@@ -8169,6 +8770,148 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   }
 
+  // NEEDS REVIEW SCREEN (SessionRecoveryDesign.md §2-§3). A temporary
+  // migration surface: it is reachable only from the My Rooms entry row,
+  // which itself only exists while there is something to review, so once
+  // every legacy session is placed and the 30-day deletion window closes
+  // this whole screen becomes unreachable without any further change.
+  //
+  // Placed before the History screen's own early return because it is
+  // opened FROM My Rooms and showHistory stays true underneath - closing
+  // it therefore returns the user to exactly the scroll position they
+  // left, rather than to Home.
+  if (showNeedsReview) {
+    const formatSessionDate = (plan) => {
+      const iso = plan.createdAt || plan.lastOrganizedAt;
+      if (!iso) return "Date unknown";
+      const ms = typeof iso === "string" ? Date.parse(iso) : (iso?.toMillis ? iso.toMillis() : 0);
+      if (!ms) return "Date unknown";
+      return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    };
+    const formatSessionDeletedAgo = (deletedAt) => {
+      const ms = deletedAt && typeof deletedAt.toMillis === "function" ? deletedAt.toMillis() : (typeof deletedAt === "string" ? Date.parse(deletedAt) : 0);
+      const days = Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
+      if (days === 0) return "Deleted today";
+      if (days === 1) return "Deleted yesterday";
+      return `Deleted ${days} days ago`;
+    };
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="dark-content" />
+        <View style={[s.hdr, { alignItems: "flex-start" }]}>
+          <TouchableOpacity onPress={() => setShowNeedsReview(false)} style={s.hdrMark} accessibilityLabel="Back to My Rooms" accessibilityRole="button">
+            <ChevronLeft size={26} color="rgba(255,255,255,0.9)" strokeWidth={2.25} />
+          </TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
+            <Text style={s.hdrPageName}>Needs Review</Text>
+            <Text style={s.hdrTag}>
+              {unresolvedSessions.length} session{unresolvedSessions.length === 1 ? "" : "s"} to place
+            </Text>
+          </View>
+        </View>
+        <ScrollView contentContainerStyle={s.scrollContent}>
+          {/* Explains the situation once, at the top, rather than on every
+              card. These sessions predate Rooms and Areas - the user did
+              nothing wrong, and the copy says so plainly. */}
+          <View style={{ backgroundColor: "#FFFBEB", borderRadius: 12, borderWidth: 1, borderColor: "#FDE68A", padding: 14, marginBottom: 16 }}>
+            <Text style={{ fontSize: 14, color: "#92400E", lineHeight: 20 }}>
+              These sessions were saved before Uncluttrd organized things into Rooms and Areas, so we don't know where they belong. Tell us where each one goes, or delete the ones you don't need.
+            </Text>
+          </View>
+
+          {unresolvedSessions.length === 0 ? (
+            <View style={{ alignItems: "center", paddingVertical: 30 }}>
+              <Text style={{ fontSize: 40, marginBottom: 12 }}>✅</Text>
+              <Text style={[s.resTitle, { textAlign: "center", marginBottom: 8 }]}>All caught up</Text>
+              <Text style={[s.heroP, { textAlign: "center" }]}>Every session has a home now.</Text>
+            </View>
+          ) : (
+            unresolvedSessions.map((plan) => {
+              const work = sessionWorkSummary(plan);
+              return (
+                <TouchableOpacity
+                  key={plan.id}
+                  style={[s.historyItem, { alignItems: "flex-start" }]}
+                  onPress={() => openClassify(plan)}
+                  accessibilityLabel={`Place session from ${formatSessionDate(plan)}`}
+                  accessibilityRole="button"
+                >
+                  {plan.photoUrl ? (
+                    <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                  ) : (
+                    <View style={s.historyIcon}><HelpCircle size={26} color="#94A3B8" strokeWidth={2.25} /></View>
+                  )}
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.historySpace} numberOfLines={1}>{formatSessionDate(plan)}</Text>
+                    {/* Marked as the AI's ORIGINAL label, deliberately (§2).
+                        These strings are exactly why these sessions are
+                        unresolved: spaceType/areaName were free text the AI
+                        wrote per photo, never a link to anything, so the
+                        same physical corner carries a different label in
+                        every session. Presenting them unqualified would
+                        read as "this session already belongs somewhere",
+                        which is the belief the whole screen exists to
+                        correct. areaId is null here by definition. */}
+                    {(plan.areaName || plan.spaceName || plan.spaceType) ? (
+                      <>
+                        <Text style={{ fontSize: 11, color: "#94A3B8", marginTop: 6, letterSpacing: 0.4 }}>AI'S ORIGINAL LABEL</Text>
+                        <Text style={{ fontSize: 13, color: "#475569", marginTop: 1 }} numberOfLines={2}>
+                          {[plan.spaceName || plan.spaceType, plan.areaName].filter(Boolean).join(" · ")}
+                        </Text>
+                      </>
+                    ) : (
+                      <Text style={{ fontSize: 13, color: "#94A3B8", marginTop: 6 }}>No label recorded</Text>
+                    )}
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 6 }}>
+                      {work.completed + work.remaining === 0
+                        ? "No tasks recorded"
+                        : `${work.completed} task${work.completed === 1 ? "" : "s"} completed · ${work.remaining} remaining`}
+                    </Text>
+                    <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginTop: 8 }}>Choose where this belongs →</Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })
+          )}
+
+          {/* Recently Deleted sessions - same quiet styling and same
+              30-day window as My Rooms' own Recently Deleted section, and
+              deliberately here rather than there: a deleted session is a
+              recovery-flow artifact, and mixing it into the Rooms list
+              would put migration debris on a permanent screen. */}
+          {deletedSessions.length > 0 && (
+            <>
+              <Text style={[s.sectionLabel, { marginTop: 20 }]}>RECENTLY DELETED</Text>
+              {deletedSessions.map((plan) => (
+                <View key={plan.id} style={[s.historyItem, { backgroundColor: "#F8F9FA", alignItems: "center" }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 14, fontFamily: "Inter_600SemiBold", color: "#64748B" }} numberOfLines={1}>
+                      {plan.areaName || plan.spaceName || "Untitled session"}
+                    </Text>
+                    <Text style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{formatSessionDeletedAgo(plan.deletedAt)}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => handleRestoreSession(plan)}
+                    accessibilityLabel="Restore this session"
+                    accessibilityRole="button"
+                    style={{ paddingHorizontal: 12, paddingVertical: 8 }}
+                  >
+                    <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }}>Restore</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </>
+          )}
+        </ScrollView>
+        {renderClassifyOptions()}
+        {renderRoomPicker()}
+        {renderAreaPicker()}
+        {renderClassifyNameSheet()}
+      </SafeAreaView>
+    );
+  }
+
   // HISTORY SCREEN
   if (showHistory) {
     // Local, matches the existing Room Confirmation screen's own daysAgo
@@ -8251,6 +8994,42 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 </TouchableOpacity>
               );
             })
+          )}
+          {/* Session Recovery entry point (SessionRecoveryDesign.md §2).
+              One row, not 14 photo cards - these are legacy sessions the
+              hierarchy couldn't place, and putting them inline would make
+              a migration artifact the loudest thing on the user's own
+              Rooms screen. It stays visible while EITHER unresolved or
+              recently-deleted sessions exist (§1c): disappearing the
+              instant the last one is classified would strand every
+              soft-deleted session with no way back to Restore. */}
+          {(unresolvedSessions.length > 0 || deletedSessions.length > 0) && (
+            <>
+              <Text style={[s.sectionLabel, { marginTop: 20 }]}>NEEDS REVIEW</Text>
+              <TouchableOpacity
+                style={[s.historyItem, { backgroundColor: "#FFFBEB", borderWidth: 1, borderColor: "#FDE68A", alignItems: "flex-start" }]}
+                onPress={() => setShowNeedsReview(true)}
+                accessibilityLabel="Review sessions that need a home"
+                accessibilityRole="button"
+              >
+                <View style={[s.historyIcon, { backgroundColor: "#FEF3C7" }]}>
+                  <HelpCircle size={26} color="#B45309" strokeWidth={2.25} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.historySpace, { color: "#92400E" }]} numberOfLines={1}>
+                    {unresolvedSessions.length > 0
+                      ? `${unresolvedSessions.length} session${unresolvedSessions.length === 1 ? "" : "s"} need${unresolvedSessions.length === 1 ? "s" : ""} a home`
+                      : `${deletedSessions.length} recently deleted session${deletedSessions.length === 1 ? "" : "s"}`}
+                  </Text>
+                  <Text style={{ fontSize: 12, color: "#B45309", marginTop: 2, lineHeight: 17 }}>
+                    {unresolvedSessions.length > 0
+                      ? "Some earlier organizing sessions need to be assigned to a Room or Area."
+                      : "Restore a session you deleted, within 30 days."}
+                  </Text>
+                  <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: "#B45309", marginTop: 8 }}>Review sessions →</Text>
+                </View>
+              </TouchableOpacity>
+            </>
           )}
           {/* Phase C2: Recently Deleted - deliberately small (no fancy
               archive browser, per the task spec). Quiet/secondary styling
