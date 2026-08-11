@@ -62,9 +62,24 @@
  * mutation across a user's whole plan set; the default must not be able
  * to touch production by a typo'd flag.
  *
+ * ---- Redoing the grouping (--reset-backfilled) ----
+ * The grouping decision is otherwise PERMANENT: once plans carry an
+ * areaId they are no longer targets, so re-running with different
+ * grouping flags is a silent no-op, and collapsing two already-created
+ * Areas would be an Area merge, which this codebase has no tool for.
+ * --reset-backfilled reverses a previous run - resets its plans back to
+ * areaId: null and deletes the Area documents it created - so a backfill
+ * can be redone with different grouping. It only ever touches documents
+ * stamped `backfillSource: "legacy-areaName"`, so a user-authored Area
+ * can never be deleted by it, and it refuses any Area since drawn into a
+ * move or lineage reference. Optionally scoped to one name
+ * (--reset-backfilled="Corner Shelf") to avoid churning ids for Areas
+ * that are not being regrouped.
+ *
  * Usage:
  *   node scripts/backfillLegacyAreas.js --project=cluttrd-staging --uid=<uid> [--dry-run]
  *     [--credentials=<path to service account json>] [--group-case-insensitive]
+ *   node scripts/backfillLegacyAreas.js --project=cluttrd-staging --uid=<uid> --reset-backfilled[=<areaName>]
  */
 
 const admin = require("firebase-admin");
@@ -269,10 +284,80 @@ function groupSummary(group) {
   return { roomId: group.roomId, areaName: group.areaName, planCount: group.plans.length, planIds: group.plans.map((p) => p.planId) };
 }
 
+/**
+ * Reverses a previous backfill, so its grouping decision can be redone -
+ * e.g. re-running with --group-case-insensitive after seeing the
+ * near-duplicate report. Without this the grouping choice is permanent:
+ * once plans carry an areaId they stop being backfill targets, so a
+ * re-run with different grouping flags is a silent no-op, and collapsing
+ * two already-created Areas would be an Area MERGE, which this codebase
+ * deliberately has no tool for.
+ *
+ * Safety invariant: only ever touches Area documents stamped
+ * `backfillSource: "legacy-areaName"` - documents this script itself
+ * created. A user-authored Area can never be deleted by this path, no
+ * matter what name it shares with a backfilled one.
+ *
+ * Refuses to reverse an Area that has since been drawn into anything
+ * else - retired, mid-move (`migrationTargetAreaId`), or the target of
+ * another Area's `redirectTo`/`migrationTargetAreaId` lineage. Those are
+ * reported and skipped, never forced.
+ *
+ * `onlyDisplayName` (case-insensitive) scopes the reversal to one Area
+ * name, keeping the blast radius to just the Areas being regrouped
+ * instead of churning document ids for unrelated ones.
+ */
+async function resetBackfilledAreasAdmin(db, uid, { dryRun = false, onlyDisplayName = null } = {}) {
+  const userRef = db.collection("users").doc(uid);
+  const spacesSnap = await userRef.collection("spaces").get();
+
+  const allAreas = [];
+  for (const s of spacesSnap.docs) {
+    const areas = await userRef.collection("spaces").doc(s.id).collection("areas").get();
+    for (const a of areas.docs) allAreas.push({ roomId: s.id, roomName: s.data().displayName, id: a.id, ...a.data() });
+  }
+
+  const wanted = (a) => a.backfillSource === "legacy-areaName"
+    && (!onlyDisplayName || (a.displayName || "").toLowerCase().trim() === onlyDisplayName.toLowerCase().trim());
+
+  const reverted = [], skipped = [];
+  for (const area of allAreas.filter(wanted)) {
+    const blockers = [];
+    if (area.retired === true) blockers.push("Area is retired");
+    if (area.migrationTargetAreaId) blockers.push(`mid-move (migrationTargetAreaId=${area.migrationTargetAreaId})`);
+    const inbound = allAreas.filter((o) => o.redirectTo === area.id || o.migrationTargetAreaId === area.id);
+    if (inbound.length) blockers.push(`referenced by Area(s) ${inbound.map((o) => o.id).join(", ")}`);
+    if (blockers.length) {
+      skipped.push({ areaId: area.id, roomId: area.roomId, displayName: area.displayName, reason: blockers.join("; ") });
+      continue;
+    }
+
+    const plansSnap = await userRef.collection("plans").where("areaId", "==", area.id).get();
+    const planIds = plansSnap.docs.map((d) => d.id);
+    if (!dryRun) {
+      for (const planId of planIds) {
+        await userRef.collection("plans").doc(planId).update({
+          areaId: null,
+          shadowSourceVersion: admin.firestore.FieldValue.increment(1),
+        });
+        // Same reason the forward path re-syncs: the shadow Project keeps
+        // the old areaId otherwise, and a later backfill's summary would
+        // count visits against an Area document that no longer exists.
+        await syncPlanToSpaceGraphAdmin(db, uid, planId);
+      }
+      await userRef.collection("spaces").doc(area.roomId).collection("areas").doc(area.id).delete();
+      await updateSpaceRoomSummaryAdmin(db, uid, area.roomId);
+    }
+    reverted.push({ areaId: area.id, roomId: area.roomId, roomName: area.roomName, displayName: area.displayName, planIds });
+  }
+
+  return { uid, dryRun, onlyDisplayName, areasReverted: reverted.length, plansReset: reverted.reduce((n, r) => n + r.planIds.length, 0), reverted, skipped };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (!args.project || !args.uid) {
-    console.error("Usage: node scripts/backfillLegacyAreas.js --project=cluttrd-staging --uid=<uid> [--dry-run] [--credentials=<path>] [--group-case-insensitive]");
+    console.error("Usage: node scripts/backfillLegacyAreas.js --project=cluttrd-staging --uid=<uid> [--dry-run] [--credentials=<path>] [--group-case-insensitive] [--reset-backfilled[=<areaName>]]");
     process.exitCode = 1;
     return;
   }
@@ -289,6 +374,25 @@ async function main() {
   const db = admin.firestore();
 
   const dryRun = !!args["dry-run"];
+
+  // --reset-backfilled runs INSTEAD of a backfill, not alongside it: the
+  // two must be separate invocations so the reversal's own report can be
+  // read before deciding to re-backfill with different grouping.
+  if (args["reset-backfilled"]) {
+    const onlyDisplayName = args["reset-backfilled"] === true ? null : args["reset-backfilled"];
+    console.log(`\n=== Reverse Legacy Area Backfill${dryRun ? " (DRY RUN - no writes)" : ""} ===`);
+    console.log(`project: ${args.project}   uid: ${args.uid}`);
+    console.log(`scope: ${onlyDisplayName ? `Areas named "${onlyDisplayName}" (case-insensitive)` : "ALL backfill-created Areas"}\n`);
+    const rr = await resetBackfilledAreasAdmin(db, args.uid, { dryRun, onlyDisplayName });
+    console.log(`Areas reverted (deleted): ${rr.areasReverted}`);
+    console.log(`plans reset to areaId=null: ${rr.plansReset}`);
+    console.log(`Areas skipped: ${rr.skipped.length}\n`);
+    for (const x of rr.reverted) console.log(`  REVERT  "${x.displayName}" (${x.areaId}) in ${x.roomName} - plans reset: ${x.planIds.join(", ") || "(none)"}`);
+    for (const x of rr.skipped) console.log(`  SKIP    "${x.displayName}" (${x.areaId}) - ${x.reason}`);
+    console.log("");
+    return;
+  }
+
   console.log(`\n=== Legacy Area Backfill${dryRun ? " (DRY RUN - no writes)" : ""} ===`);
   console.log(`project: ${args.project}   uid: ${args.uid}\n`);
 
@@ -317,5 +421,5 @@ async function main() {
 if (require.main === module) {
   main().catch((e) => { console.error("Script crashed:", e); process.exitCode = 1; });
 } else {
-  module.exports = { backfillLegacyAreasAdmin, buildBackfillGroups, findNearDuplicates };
+  module.exports = { backfillLegacyAreasAdmin, resetBackfilledAreasAdmin, buildBackfillGroups, findNearDuplicates };
 }

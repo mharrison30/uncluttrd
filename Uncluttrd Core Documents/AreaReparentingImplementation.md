@@ -169,9 +169,13 @@ Per plan with a non-empty `areaName` and null `areaId`: resolve the canonical Ro
 
 **Safety:** refuses any project other than `cluttrd-staging` without an explicit `--i-understand-this-is-not-staging` flag.
 
-**Run — `cluttrd-staging`, uid `ZYe7h9hM25UB7Pk6YRbPysg2cGC3`:** 28 plans scanned, 7 already had an `areaId`, 16 had no `areaName`; **5 plans backfilled into 5 Areas**, 0 groups skipped. Second run: 0 groups, 0 created, 0 backfilled — no-op. Office went 0 → 1 Area row; Living Room 3 → 7. One near-duplicate reported and **not** acted on: `"Corner shelf"` and `"Corner Shelf"` in Living Room.
+**Redoing the grouping — `--reset-backfilled[=<areaName>]`.** The grouping choice is otherwise permanent: once plans carry an `areaId` they stop being targets, so re-running with different grouping flags is a *silent no-op*, and collapsing two already-created Areas would be an Area merge — which this codebase has no tool for. This flag reverses a prior run (plans back to `areaId: null`, its Area documents deleted) so the backfill can be redone. It only ever touches documents stamped `backfillSource: "legacy-areaName"`, so a user-authored Area can never be deleted by it, and it refuses any Area since drawn into a move or lineage reference. Optional name scoping keeps ids stable for Areas that aren't being regrouped.
 
-Grouping, crash-resume and idempotency were exercised separately against a throwaway staging uid, since every group in the real dataset happened to contain exactly one plan — 12/12 checks passed, including two plans sharing one Area document and `visitCount` recomputed to 2.
+**Run — `cluttrd-staging`, uid `ZYe7h9hM25UB7Pk6YRbPysg2cGC3`:** 28 plans scanned, 7 already had an `areaId`, 16 had no `areaName`; **5 plans backfilled into 5 Areas**, 0 groups skipped. Second run: no-op. One near-duplicate reported and not acted on: `"Corner shelf"` / `"Corner Shelf"` in Living Room.
+
+**Follow-up run — regrouped case-insensitively at the user's request.** `--reset-backfilled="Corner Shelf"` reversed exactly those two Areas (2 plans back to `areaId: null`), then `--group-case-insensitive` recreated them as **one** Area `W6RqWrQK5UCBAwMGWANT` named **"Corner Shelf"** — the oldest member plan's own spelling, which here is also title case. `visitCount: 2`, both plans and both shadow Projects pointing at it, `createdAt` from the older plan and `lastOrganizedAt` from the newer. `"Corner Shelf Display"` (pre-existing, 4 visits) was untouched, as were the three other backfilled Areas. Final state: Office 1 Area row, Living Room 6.
+
+Grouping, crash-resume and idempotency were exercised separately against a throwaway staging uid, since every group in the *first* real run happened to contain exactly one plan — 12/12 checks passed, including two plans sharing one Area document and `visitCount` recomputed to 2.
 
 ---
 
