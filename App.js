@@ -3935,7 +3935,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   useEffect(() => {
     if (!results) return;
     setUnresolvedReview(null);
-    setPreviewApproach(null);
+    // Approach Card Redesign (ApproachCardRedesign.md item 5): a plan the
+    // user has already committed to reopens with ITS OWN approach card
+    // expanded, so returning to Results shows the plan they chose rather
+    // than three equally-collapsed options they have to re-find. An
+    // uncommitted plan still opens with everything collapsed (null) - the
+    // comparison state. previewApproach remains ephemeral either way; this
+    // seeds the expanded card from already-persisted state, it never
+    // writes anything.
+    setPreviewApproach(results.selectedApproach || null);
     setStartingPlan(false);
     if (results.currentBatch?.items?.length) {
       setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
@@ -9789,6 +9797,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.resPhotoHint}>Tap photo to view full screen</Text>
             </TouchableOpacity>
           )}
+          {/* Approach Card Redesign, item 1: the overview card previously
+              had no heading at all, so the user met a wall of AI prose
+              before reaching the approach choices with no idea what it
+              was. Named rather than styled-away because the block is
+              genuinely useful - it just needed to say what it is. Applies
+              to old- and new-format plans alike; the overview itself is
+              schema-independent. */}
+          <Text style={s.resSectionHeading}>What we noticed</Text>
           <View style={s.overviewCard}>
             <Text style={s.overviewText}>{results.overview}</Text>
           </View>
@@ -9883,14 +9899,53 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               the currentBatch-driven "Let's Get Started" button below takes
               over instead). Old-format plans keep rendering the unmodified
               tier cards above, completely untouched. */}
-          {results.approaches && !batchItems.length && (
+          {results.approaches && (
             <View style={{ marginTop: 20 }}>
-              <Text style={s.sectionLabel}>HOW WOULD YOU LIKE TO APPROACH THIS?</Text>
+              {/* Item 5: once an approach is committed, the section stops
+                  asking a question and starts reporting an answer. The
+                  other cards stay present and expandable for reference -
+                  the user can still read what they didn't pick - but the
+                  heading no longer implies the decision is open. "Change
+                  approach" is a deliberate placeholder this phase; approach
+                  switching has real consequences for an in-flight
+                  Companion batch and is its own piece of work. */}
+              {results.selectedApproach ? (
+                <View style={s.approachChosenRow}>
+                  <Text style={s.approachChosenText} numberOfLines={1}>
+                    {`Your approach: ${APPROACH_META[results.selectedApproach]?.name || results.selectedApproach}`}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => Alert.alert("Coming soon", "Switching to a different approach will be available in a future update.")}
+                    accessibilityLabel="Change approach"
+                    accessibilityRole="button"
+                    style={{ paddingVertical: 4, paddingLeft: 10 }}
+                  >
+                    <Text style={s.approachChangeLink}>Change approach</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <Text style={s.sectionLabel}>HOW WOULD YOU LIKE TO APPROACH THIS?</Text>
+              )}
               {APPROACH_ORDER.map((id) => {
                 const a = results.approaches?.[id];
                 if (!a) return null;
                 const meta = APPROACH_META[id];
                 const expanded = previewApproach === id;
+                // Item 2: the collapsed card has to carry enough to compare
+                // all three WITHOUT expanding any of them - name, spend,
+                // strategy, keyChanges, and a product-type preview. The
+                // previous card showed only name/spend/strategy plus a bare
+                // chevron, which made expansion mandatory just to find out
+                // what an approach actually changed.
+                const keyChanges = (a.keyChanges || []).filter((k) => typeof k === "string" && k.trim()).slice(0, 4);
+                const products = a.productRecommendations || [];
+                // Product TYPES only, never a shop affordance - item 6 is
+                // explicit that shopping lives solely in the expanded
+                // card's full product rows. This line is informational.
+                const additionsPreview = products
+                  .map((p) => p.productType)
+                  .filter((t) => typeof t === "string" && t.trim())
+                  .join(" · ");
                 // Section 5 (future service-referral extensibility): an
                 // ordered list of recommendation groups, not a single
                 // hardcoded productRecommendations.map(...) call. Today
@@ -9904,10 +9959,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 ].filter(g => g.items.length > 0);
                 return (
                   <View key={id} style={[s.approachCard, { borderColor: expanded ? meta.color : BRAND.stone }, expanded && { borderWidth: 2 }]}>
+                    {/* Item 3: tapping is expand/collapse ONLY - never a
+                        selection, never a Firestore write. Toggling to null
+                        on a second tap is what makes "read it, close it,
+                        open the next one" work; setting a different id
+                        collapses the current card implicitly, since exactly
+                        one id can equal previewApproach at a time. */}
                     <TouchableOpacity
-                      onPress={() => setPreviewApproach(id)}
+                      onPress={() => setPreviewApproach((prev) => (prev === id ? null : id))}
                       activeOpacity={0.8}
-                      accessibilityLabel={`${meta.name}, estimated ${a.estimatedSpendRange}${expanded ? ", expanded" : ""}`}
+                      accessibilityLabel={`${meta.name}, estimated ${a.estimatedSpendRange}`}
+                      accessibilityState={{ expanded }}
                       accessibilityRole="button"
                     >
                       <View style={s.approachCardHead}>
@@ -9915,9 +9977,41 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                           <Text style={[s.approachPillText, { color: meta.color }]}>{meta.name}</Text>
                         </View>
                         <Text style={s.approachRange}>{a.estimatedSpendRange}</Text>
-                        <ChevronRight size={16} color={BRAND.mist} strokeWidth={2.25} />
                       </View>
                       <Text style={s.approachStrategy}>{a.strategyDescription}</Text>
+                      {keyChanges.length > 0 && (
+                        <View style={{ marginTop: 10 }}>
+                          {keyChanges.map((k, i) => (
+                            <View key={i} style={s.approachChangeRow}>
+                              <View style={[s.approachChangeDot, { backgroundColor: meta.color }]} />
+                              <Text style={s.approachChangeText}>{k}</Text>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                      {/* Item 2: omitted entirely when the approach
+                          recommends nothing - never an empty label. */}
+                      {!!additionsPreview && (
+                        <Text style={s.approachAdditions} numberOfLines={2}>
+                          <Text style={s.approachAdditionsLabel}>Suggested additions: </Text>
+                          {additionsPreview}
+                        </Text>
+                      )}
+                      {/* Replaces the bare chevron: a worded affordance
+                          that says what tapping does and which way it goes,
+                          rather than leaving a mystery arrow as the only
+                          clue that more content exists (item 2). */}
+                      <View style={s.approachToggleRow}>
+                        <Text style={[s.approachToggleText, { color: meta.color }]}>
+                          {expanded ? "Show less" : "See full details"}
+                        </Text>
+                        <ChevronRight
+                          size={14}
+                          color={meta.color}
+                          strokeWidth={2.5}
+                          style={{ transform: [{ rotate: expanded ? "-90deg" : "90deg" }] }}
+                        />
+                      </View>
                     </TouchableOpacity>
                     {expanded && (
                       <View style={s.approachExpanded}>
@@ -9961,22 +10055,37 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                             }))}
                           </>
                         )}
+                        {/* Item 4: THE single commitment action, and it
+                            lives inside the card it commits to. The old
+                            layout put one shared "Start This Plan →" below
+                            all three cards, which meant the button was
+                            frequently off-screen at the moment the user had
+                            just decided - and, being shared, it never named
+                            what it was starting. Naming the approach is
+                            what makes it unambiguous that expanding is
+                            browsing and this is the decision.
+                            Rendered only for a plan with nothing committed
+                            yet: after commitment the section is a record,
+                            not a chooser, and re-committing is "Change
+                            approach"'s job (a later phase). */}
+                        {!results.selectedApproach && (
+                          <TouchableOpacity
+                            style={[s.approachStartBtn, { backgroundColor: startingPlan ? BRAND.stone : BRAND.green }]}
+                            onPress={handleStartThisPlan}
+                            disabled={startingPlan}
+                            accessibilityLabel={`Start with ${meta.name}`}
+                            accessibilityRole="button"
+                          >
+                            <Text style={s.approachStartBtnText}>
+                              {startingPlan ? "Starting..." : `Start with ${meta.name} →`}
+                            </Text>
+                          </TouchableOpacity>
+                        )}
                       </View>
                     )}
                   </View>
                 );
               })}
-              {previewApproach && (
-                <TouchableOpacity
-                  style={[s.companionBtn, { marginTop: 8 }]}
-                  onPress={handleStartThisPlan}
-                  disabled={startingPlan}
-                  accessibilityLabel="Start this plan"
-                  accessibilityRole="button"
-                >
-                  <Text style={s.companionBtnText}>{startingPlan ? "Starting..." : "Start This Plan →"}</Text>
-                </TouchableOpacity>
-              )}
             </View>
           )}
           {renderPhotoZoomModal()}
@@ -10801,6 +10910,34 @@ const s = StyleSheet.create({
   approachExpanded: { marginTop: 4, paddingTop: 8, borderTopWidth: 1, borderTopColor: BRAND.offWhite },
   approachProdReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 1 },
   approachShopLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginLeft: 6 },
+  // ---- Approach Card Redesign (ApproachCardRedesign.md) ----
+  // Item 1: a quiet sentence-case heading, deliberately NOT s.sectionLabel's
+  // all-caps tracked style - that style marks machine-ish section dividers
+  // ("HOW WOULD YOU LIKE TO APPROACH THIS?"), and this is meant to read as
+  // the app talking, matching the overview prose it introduces.
+  resSectionHeading: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink, marginBottom: 8 },
+  // Item 2: keyChanges as scannable bullet phrases. Tight leading and a
+  // small dot rather than the heavier s.step/stepChk checkmark rows used
+  // in the expanded guidance - these are outcomes to skim, not tips to
+  // follow, and the collapsed card has to stay compact enough that all
+  // three fit without excessive scrolling (item 8).
+  approachChangeRow: { flexDirection: "row", alignItems: "flex-start", gap: 8, marginBottom: 5 },
+  approachChangeDot: { width: 5, height: 5, borderRadius: 3, marginTop: 7, flexShrink: 0 },
+  approachChangeText: { flex: 1, fontSize: 13, fontFamily: "Inter_500Medium", color: BRAND.ink, lineHeight: 19 },
+  approachAdditions: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 18, marginTop: 8 },
+  approachAdditionsLabel: { fontFamily: "Inter_600SemiBold", color: BRAND.mist },
+  // Replaces the bare chevron as the expansion affordance.
+  approachToggleRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 10 },
+  approachToggleText: { fontSize: 12, fontFamily: "Inter_600SemiBold" },
+  // Item 4/8: full-width WITHIN the card, green, prominent - the one
+  // commitment action, visually distinct from every expand/collapse and
+  // shop affordance around it.
+  approachStartBtn: { borderRadius: 12, paddingVertical: 14, alignItems: "center", justifyContent: "center", marginTop: 16 },
+  approachStartBtnText: { color: "white", fontSize: 15, fontFamily: "Inter_600SemiBold" },
+  // Item 5: the post-commitment header, replacing the chooser prompt.
+  approachChosenRow: { flexDirection: "row", alignItems: "center", marginBottom: 11 },
+  approachChosenText: { flex: 1, fontSize: 13, fontFamily: "Inter_700Bold", color: BRAND.ink },
+  approachChangeLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green },
   tipBox: { backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 14, padding: 16, flexDirection: "row", marginTop: 4 },
   tipHead: { fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8, color: BRAND.green, marginBottom: 4 },
   tipBody: { fontSize: 14, fontFamily: "Inter_400Regular", color: "#166E38", lineHeight: 20 },
