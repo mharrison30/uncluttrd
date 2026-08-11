@@ -112,10 +112,10 @@ These are render-layer and interaction tests. There is **no UI-driving harness i
 
 ## 5. OTA
 
-Committed and pushed to the `staging` EAS Update branch.
+Committed (`c746a61`) and pushed to the `staging` EAS Update branch.
 
-- iOS update ID: `019ff137-06d4-7bb3-8ba3-a83a9e4b9c25` (group `d0b95dd7-42fd-4b9b-9e63-1a03df0f8dcd`)
-- Android update ID: `019ff137-06d4-72ea-8f68-92cbbb7ba4dc` (group `18c2ef52-71b8-4a24-a5a7-6a7ba26bc2d5`)
+- iOS update ID: `019ff0b5-5f0e-701f-b93b-5aa63a893f74` (group `4daf53a9-5ae5-4e77-bf12-482ce65d467e`)
+- Android update ID: `019ff0b5-5f0e-780f-9bda-11e0237132c6` (group `33cfab4b-6ab7-4ee9-9af9-f59cc9c40e5a`)
 
 ---
 
