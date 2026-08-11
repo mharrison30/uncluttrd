@@ -32,7 +32,7 @@ import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, delet
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, deleteObject } from "firebase/storage";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
-import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation } from "./shared/spaceMigration";
+import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation, resolveSessionScope } from "./shared/spaceMigration";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -374,7 +374,13 @@ async function createAreaForPlan(uid, roomId, planId, areaName) {
     // "changed something the shadow needs to catch up on" pattern
     // renameSpace already uses for an analogous problem - not a new
     // mechanism.
-    await updateDoc(doc(db, "users", uid, "plans", planId), { areaId: areaRef.id, shadowSourceVersion: increment(1) });
+    // sessionScope is written in the SAME update as areaId, deliberately:
+    // savePlanToHistory necessarily stamped this plan "unresolved" a
+    // moment ago (its Area did not exist yet - this function is what
+    // creates it), and the two fields must never be observable in
+    // disagreement. A durable areaId is proof of "area" scope, so this is
+    // the write that settles it.
+    await updateDoc(doc(db, "users", uid, "plans", planId), { areaId: areaRef.id, sessionScope: "area", shadowSourceVersion: increment(1) });
     // Awaited, not fire-and-forget: completeRoomConfirmation already
     // awaits this whole function, and the caller (and any test) needs
     // Project.areaId to be reliably correct by the time this returns, not
@@ -1987,7 +1993,13 @@ async function moveAreaToRoom(uid, sourceRoomId, sourceAreaId, targetRoomId) {
     results.push({ planId: snap.planId, result });
 
     if (result.outcome === "completed") {
-      await updateDoc(doc(db, "users", uid, "plans", snap.planId), { areaId: newAreaId, shadowSourceVersion: increment(1) })
+      // sessionScope travels with areaId (see createAreaForPlan for why
+      // they are always written together). An Area move never changes what
+      // KIND of session this is - it had a durable Area before and has one
+      // after - so this is always "area"; it is restated rather than left
+      // alone only so no plan can ever carry an areaId without the
+      // matching scope.
+      await updateDoc(doc(db, "users", uid, "plans", snap.planId), { areaId: newAreaId, sessionScope: "area", shadowSourceVersion: increment(1) })
         .catch((e) => dlog(`[AREA MOVE] areaId repoint failed for plan ${snap.planId}: ${e.message}`));
       await syncPlanToSpaceGraph(uid, snap.planId).catch((e) => dlog(`[AREA MOVE] shadow resync failed for plan ${snap.planId}: ${e.message}`));
     }
@@ -2126,8 +2138,15 @@ async function mergeRoomIntoRoom(uid, sourceRoomId, targetRoomId) {
 
     if (result.outcome === "completed") {
       const newAreaId = snap.areaId ? (areaMigrationMap.get(snap.areaId) ?? null) : null;
-      await updateDoc(doc(db, "users", uid, "plans", snap.planId), { areaId: newAreaId, shadowSourceVersion: increment(1) })
-        .catch((e) => dlog(`[ROOM MERGE] areaId repoint failed for plan ${snap.planId}: ${e.message}`));
+      // Unlike the Area-move case, newAreaId here CAN legitimately be null
+      // (a whole-Room founding visit carries no Area through the merge),
+      // so the scope is recomputed rather than assumed - from the same
+      // areaScope reclassifyLegacyPlan just wrote for this plan.
+      await updateDoc(doc(db, "users", uid, "plans", snap.planId), {
+        areaId: newAreaId,
+        sessionScope: resolveSessionScope({ areaId: newAreaId, areaScope: snap.areaScope }),
+        shadowSourceVersion: increment(1),
+      }).catch((e) => dlog(`[ROOM MERGE] areaId repoint failed for plan ${snap.planId}: ${e.message}`));
       await syncPlanToSpaceGraph(uid, snap.planId).catch((e) => dlog(`[ROOM MERGE] shadow resync failed for plan ${snap.planId}: ${e.message}`));
     }
   }
@@ -4683,6 +4702,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // plan.areaId set by one of those two call sites ever populates
         // it.
         areaId: plan.areaId !== undefined ? plan.areaId : null,
+        // Session Scope (SessionScopeDesign.md Q4 / SessionScopeImplementation.md):
+        // THE authoritative discriminator for this session's scope, from
+        // now on. Every other signal previously used to infer it - areaId
+        // absence, areaScope absence, schemaVersion - is either ambiguous
+        // or unrelated (Q2/Q3), so no consumer should ever go back to
+        // them. Derived here from exactly the two values being written
+        // immediately above, restated rather than referenced so this can
+        // never silently disagree with what actually lands in the document.
+        //
+        // This is the single creation chokepoint: createReturningPlan
+        // wraps this function, and finalizeAnalysisResult/
+        // completeRoomConfirmation both reach Firestore only through one
+        // of those two - so stamping it here covers every plan-creation
+        // path in the app. The one case this cannot settle at save time is
+        // a fresh sub-area visit whose Area does not exist yet (the Area
+        // is created AFTER the plan, by createAreaForPlan) - that lands
+        // here as "unresolved" and is corrected to "area" in the same
+        // write that sets areaId. See createAreaForPlan.
+        sessionScope: resolveSessionScope({
+          areaId: plan.areaId !== undefined ? plan.areaId : null,
+          areaScope: plan.areaScope ?? null,
+        }),
         // spaceName: the CONFIRMED Room name (Phase C). For a returning
         // visit (canonicalSpaceId set), inheritedSpaceName - re-read fresh
         // from the target Space's own displayName - always wins, exactly

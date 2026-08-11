@@ -75,7 +75,7 @@ const {
   computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION,
   detectMergeCandidates, evaluateCandidateInvalidation, DETECTION_VERSION,
   computeMergeCandidateId, CANDIDATE_KEY_VERSION, getSpaceDisplayName, SHADOW_SCHEMA_VERSION,
-  validateTargetSpace, resolveRecognitionCandidates,
+  validateTargetSpace, resolveRecognitionCandidates, resolveSessionScope,
 } = require("../shared/spaceMigration");
 
 // ---- My Rooms -> True Room Grouping, Phase A: Room summary maintenance
@@ -142,7 +142,11 @@ async function createAreaForPlanAdmin(db, uid, roomId, planId, areaName) {
     // with areaId: null - updating the plan document alone does not fix
     // it. Bump shadowSourceVersion and re-sync so syncPlanToSpaceGraphAdmin
     // re-derives the Project from the plan's now-current areaId.
-    await db.collection("users").doc(uid).collection("plans").doc(planId).update({ areaId: areaRef.id, shadowSourceVersion: admin.firestore.FieldValue.increment(1) });
+    // sessionScope written in the SAME update as areaId - mirrors App.js's
+    // createAreaForPlan 1:1. savePlanToHistory{Admin} necessarily stamped
+    // this plan "unresolved" moments ago (its Area did not exist yet), and
+    // the two fields must never be observable in disagreement.
+    await db.collection("users").doc(uid).collection("plans").doc(planId).update({ areaId: areaRef.id, sessionScope: "area", shadowSourceVersion: admin.firestore.FieldValue.increment(1) });
     await syncPlanToSpaceGraphAdmin(db, uid, planId);
     return areaRef.id;
   } catch (e) {
@@ -566,6 +570,15 @@ async function savePlanToHistoryAdmin(db, uid, plan, { canonicalSpaceId = null, 
     // always written, null (not absent) unless the caller explicitly
     // supplies a real Area id.
     areaId: plan.areaId !== undefined ? plan.areaId : null,
+    // Session Scope - mirrors App.js's savePlanToHistory 1:1. Derived from
+    // exactly the two values written immediately above, via the same
+    // shared pure resolveSessionScope the client calls, so a plan created
+    // here and a plan created in the app can never be classified by two
+    // different rules.
+    sessionScope: resolveSessionScope({
+      areaId: plan.areaId !== undefined ? plan.areaId : null,
+      areaScope: plan.areaScope ?? null,
+    }),
     ...(canonicalSpaceId
       ? { canonicalSpaceId, spaceName: inheritedSpaceName }
       : (plan.spaceName ? { spaceName: plan.spaceName } : {})),

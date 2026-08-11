@@ -740,6 +740,47 @@ const AREA_QUALIFIER_WORDS = [
   "storage", "workspace", "media center",
 ];
 
+// ---- Session Scope (SessionScopeDesign.md Q4) ----
+// Pure. THE authoritative discriminator for what a session was scoped to:
+//
+//   "area"       - this session targets a specific durable Area
+//   "room"       - this session intentionally targets the whole Room
+//   "unresolved" - scope cannot be PROVEN from this plan's own data
+//
+// Deliberately derived from only two inputs, in strict priority order, and
+// only ever from facts that were themselves the product of an explicit
+// decision:
+//
+//   1. areaId set        -> "area". A durable Area id is only ever written
+//      by navigation from a real Area (startOrganizeAgain) or by explicit
+//      Area creation/confirmation (createAreaForPlan / completeRoomConfirmation)
+//      - never inferred from areaName. Its presence is proof.
+//   2. areaScope === "whole-room" -> "room". Only the confirmation
+//      resolvers (resolveExistingRoomConfirmation/resolveNewRoomConfirmation)
+//      ever produce this value, so it too records a real decision.
+//   3. everything else   -> "unresolved". Notably includes
+//      areaScope === "sub-area" with NO areaId, which SHOULD have an Area
+//      and doesn't (pre-Area-Identity, or a failed Area creation), and any
+//      plan with no areaScope at all (pre-Room-First-Identity legacy).
+//
+// What this function must NEVER do is guess. "unresolved" is the honest
+// answer for a session whose scope was never established, and it is a
+// TEMPORARY state to be settled by a future user-facing recovery flow -
+// not a third kind of place. Nothing here reads schemaVersion (which
+// tracks the AI payload shape only - see SessionScopeDesign.md Q3),
+// spaceType, or areaName, all of which were shown to carry no reliable
+// scope signal.
+//
+// Idempotent by construction: same plan fields in, same answer out, so
+// re-running classification over already-classified data is a no-op
+// unless the underlying areaId/areaScope genuinely changed.
+function resolveSessionScope(planData) {
+  if (!planData) return "unresolved";
+  if (planData.areaId) return "area";
+  if (planData.areaScope === "whole-room") return "room";
+  return "unresolved";
+}
+
 function classifyLegacySpaceType(planData) {
   if (!planData) return "ambiguous";
   if (typeof planData.spaceName === "string" && planData.spaceName.trim()) return "user-confirmed";
@@ -979,6 +1020,7 @@ module.exports = {
   resolveRecognitionCandidates,
   summarizeRecognitionCandidateWork,
   classifyLegacySpaceType,
+  resolveSessionScope,
   dedupeToKnownRooms,
   findPlausibleParentRoom,
   routeRoomConfirmation,
