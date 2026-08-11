@@ -86,6 +86,38 @@ function resolveResultsRoomName(plan, currentPlanId, roomsList) {
   return matchedRoom?.displayName || getSpaceDisplayName(plan);
 }
 
+// Recognition Identity Fix (stale plan metadata bug, 2026-08-10): the same
+// live-Space-first, plan-field-fallback precedence resolveResultsRoomName
+// already established for Results' own room name, extended to Generic
+// Camera Recognition (findRecognitionCandidates, below). resolveRecognition
+// Candidates (shared/spaceMigration.js) is deliberately pure and plan-only -
+// its own contract, unchanged here - so live Space resolution happens
+// entirely in this I/O shell, BEFORE plans ever reach that function, not
+// inside it. For each plan, if its canonical Space (canonicalSpaceId, or
+// the plan's own id for a not-yet-merged Project - the same computeShadowIds
+// precedence used everywhere else) is found in the already-loaded `rooms`
+// list, this transient copy's spaceName is overridden to that Space's own
+// current displayName - the REAL plan document and its data are never
+// touched. getSpaceDisplayName reads spaceName first, so this single
+// override is enough to make resolveRecognitionCandidates's own matching
+// AND its own candidate.displayName output both resolve through the live
+// Space's current name, with zero changes to that function. A plan whose
+// canonical Space isn't in `rooms` (legacy/orphaned plan, or `rooms` hasn't
+// loaded yet this session) passes through with its original data completely
+// unchanged - falls back to getSpaceDisplayName(plan)'s existing historical-
+// label behavior automatically, the same graceful degradation
+// resolveResultsRoomName already has. Pure (no I/O), independently testable.
+function withLiveSpaceIdentity(plans, roomsList) {
+  return (plans || []).map((p) => {
+    if (!p || !p.data) return p;
+    const canonicalSpaceId = p.data.canonicalSpaceId || p.id;
+    const matchedRoom = (roomsList || []).find((r) => r.id === canonicalSpaceId);
+    const liveDisplayName = typeof matchedRoom?.displayName === "string" ? matchedRoom.displayName.trim() : "";
+    if (!liveDisplayName) return p;
+    return { ...p, data: { ...p.data, spaceName: liveDisplayName } };
+  });
+}
+
 // My Rooms card icons (Room Detail UX Revision, Section 2): matched by
 // case-insensitive substring against Space.displayName ONLY - never the
 // AI's original spaceType, which isn't stored on the Space document at
@@ -4641,7 +4673,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     };
 
     const cachePlans = (historyList || []).map((h) => ({ id: h.id, data: h }));
-    const cacheCandidatesRaw = resolveRecognitionCandidates(freshLabel, cachePlans);
+    // Recognition Identity Fix: resolve each plan's live Space identity
+    // (via the already-loaded `rooms` state) before it ever reaches the
+    // pure resolveRecognitionCandidates - see withLiveSpaceIdentity's own
+    // comment. resolveRecognitionCandidates itself is untouched.
+    const cacheCandidatesRaw = resolveRecognitionCandidates(freshLabel, withLiveSpaceIdentity(cachePlans, rooms));
     const cacheCandidates = await excludeRetiredCandidates(cacheCandidatesRaw);
     diagnostics.cacheCandidateCount = cacheCandidates.length;
     if (cacheCandidates.length) return finish("MATCH_FOUND", cacheCandidates);
@@ -4661,7 +4697,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       [...byType.docs, ...byName.docs].forEach((d) => {
         if (!merged.has(d.id)) merged.set(d.id, { id: d.id, data: d.data() });
       });
-      const resolvedRaw = resolveRecognitionCandidates(freshLabel, [...merged.values()]);
+      // Same live-Space resolution applied to whatever the exact-field
+      // fallback query happened to find - it does not (and, without a
+      // canonicalSpaceId-keyed query, structurally cannot) discover a
+      // renamed Room's plans that the query itself missed because no plan
+      // document's own spaceType/spaceName literally equals freshLabel;
+      // that residual gap is bounded by the same cache-first design this
+      // function already documents above (a renamed Room's own recent
+      // plans are the common case and are covered via the cache path).
+      const resolvedRaw = resolveRecognitionCandidates(freshLabel, withLiveSpaceIdentity([...merged.values()], rooms));
       const resolved = await excludeRetiredCandidates(resolvedRaw);
       return finish(resolved.length ? "MATCH_FOUND" : "NO_MATCH", resolved);
     } catch (e) {
