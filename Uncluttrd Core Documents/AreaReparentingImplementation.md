@@ -157,7 +157,25 @@ Committed (`33a5e9c`) and pushed to the `staging` EAS Update branch.
 
 ---
 
-## 5. Known, accepted, out of scope
+## 5. Addendum — Legacy Area Backfill (`scripts/backfillLegacyAreas.js`)
+
+Re-parenting operates on Area **documents**, but plans written before Area Identity Phase A carry only a flat `areaName` string with `areaId: null`. Those visits had no Area to move, and Room Detail's AREAS IN THIS ROOM section renders only Areas some plan points at — so the feature was unusable on exactly the existing data it was built to fix. This script closes that.
+
+Per plan with a non-empty `areaName` and null `areaId`: resolve the canonical Room (`computeShadowIds(...).spaceId`), group by **(Room, areaName)** so N plans naming the same Area share ONE document, create the Area (`displayName` from `areaName`; `originalPhotoUrl`/`latestPhotoUrl` from the group's oldest/newest plan photo; `createdAt` from the **oldest member plan**, since a backfill is an administrative correction, not a new organizing event), repoint each plan's `areaId`, bump `shadowSourceVersion` and re-sync so `Project.areaId` catches up, then recompute the Area summary from its actual Projects.
+
+**Grouping is exact-match on `areaName`, deliberately.** This codebase never auto-merges same-named Areas (§7) and has no un-merge tool, so collapsing names only a human can confirm are the same spot is not a call this script makes. Near-duplicates are reported instead; `--group-case-insensitive` exists for when the user has reviewed the report and wants it.
+
+**Restartability:** a plan with an `areaId` is not a target, and an existing non-retired same-named Area in the Room is reused before creating — so a crash between "Area created" and "plans repointed" converges rather than duplicating. Created Areas are stamped `backfillSource: "legacy-areaName"` and preferred when matching.
+
+**Safety:** refuses any project other than `cluttrd-staging` without an explicit `--i-understand-this-is-not-staging` flag.
+
+**Run — `cluttrd-staging`, uid `ZYe7h9hM25UB7Pk6YRbPysg2cGC3`:** 28 plans scanned, 7 already had an `areaId`, 16 had no `areaName`; **5 plans backfilled into 5 Areas**, 0 groups skipped. Second run: 0 groups, 0 created, 0 backfilled — no-op. Office went 0 → 1 Area row; Living Room 3 → 7. One near-duplicate reported and **not** acted on: `"Corner shelf"` and `"Corner Shelf"` in Living Room.
+
+Grouping, crash-resume and idempotency were exercised separately against a throwaway staging uid, since every group in the real dataset happened to contain exactly one plan — 12/12 checks passed, including two plans sharing one Area document and `visitCount` recomputed to 2.
+
+---
+
+## 6. Known, accepted, out of scope
 
 - **Benign `[AREA SUMMARY] NOT_FOUND` log line during a move.** `reclassifyLegacyPlan`'s reprojection recomputes the Area summary using the plan's *current* `areaId` — still the source Area's — under the *target* Room, where no such document exists. It is caught and logged, never thrown, and the correct summary is written moments later by Phase 5's `updateAreaSummary(target, newAreaId)`. Pre-existing behavior shared with `mergeRoomIntoRoom`, not introduced here.
 - **Phase B — "Create a new Room during move."** Deferred as instructed. §3b's finding stands: no `createRoom()` helper exists anywhere; every Space today is founded as a side effect of a plan being saved. Needs its own design decision (synthesize an empty Room vs. let the moved Area's first plan found it).
