@@ -138,6 +138,10 @@ Tests (a)–(g) ran against the real account; (h)–(j) against a throwaway uid,
 
 Client-side plan-creation paths changed, so this **does** need an OTA (the task's conditional applies).
 
+Committed (`bc1f975`) and pushed to the `staging` EAS Update branch.
+
+- iOS update ID: `019ff09f-572d-72b2-aaa0-632715eaf7da` (group `4dbd6fa2-a961-49a7-8c4e-56af332d0f4b`)
+- Android update ID: `019ff09f-572d-76e7-982c-9176eda2caa5` (group `bd8c8a5c-9846-4573-a0d7-9f0e5d7f6e25`)
 - Firestore indexes deployed to `cluttrd-staging` before the verification run.
 - `functions/shared/` and `functions/scripts/` regenerated via `scripts/prepareFunctionsDeploy.js` — they are generated copies, never hand-edited.
 
