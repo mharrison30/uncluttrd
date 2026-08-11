@@ -432,10 +432,40 @@ exports.generateNextAction = onCall(
 exports.generateVisualization = onCall(
   { secrets: [OPENAI_KEY], maxInstances: 10, timeoutSeconds: 300, memory: "512MiB" },
   async (request) => {
-    const { imageBase64, prompt } = request.data || {};
+    // Security fix (VisualizationAlignmentImplementation.md §4). This
+    // function had NO auth check at all: the Pro gate lived entirely in the
+    // client, so anyone holding the callable's URL could spend OpenAI image
+    // credits on this project's key without an account, let alone a
+    // subscription. Two gates now, in order of strength.
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "You must be signed in to generate a visualization.");
+    }
+
+    const { imageBase64, prompt, planId } = request.data || {};
 
     if (!imageBase64 || !prompt) {
       throw new HttpsError("invalid-argument", "Missing image or prompt.");
+    }
+
+    // Ownership. planId is null for a plan whose background save has not
+    // finished yet, which is a real and common state when the user taps
+    // quickly - that case falls back to the authenticated-only gate above
+    // rather than blocking a legitimate visualization. When a planId IS
+    // supplied it must resolve under THIS caller's own subcollection, so a
+    // signed-in user cannot visualize somebody else's plan by id.
+    if (planId) {
+      let planSnap;
+      try {
+        planSnap = await db.collection("users").doc(uid).collection("plans").doc(String(planId)).get();
+      } catch (e) {
+        console.error(`[generateVisualization] uid=${uid} planId=${planId} ownership lookup failed: ${e.message}`);
+        throw new HttpsError("internal", "Couldn't verify this plan. Please try again.");
+      }
+      if (!planSnap.exists) {
+        console.warn(`[generateVisualization] uid=${uid} requested planId=${planId} which it does not own`);
+        throw new HttpsError("permission-denied", "You don't have access to this plan.");
+      }
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_KEY.value() });

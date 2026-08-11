@@ -3823,9 +3823,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [faqOpen, setFaqOpen] = useState(null);
   const [vizImage, setVizImage] = useState({});
   const [currentPlanId, setCurrentPlanId] = useState(null); // Firestore doc id of the plan currently being viewed
-  const [vizModal, setVizModal] = useState(null); // keyed by tier id
+  // vizImage/vizLoading are keyed by tier id on an old-format plan and by
+  // approach id ("simple"/"polished"/"elevated") on a new-format one. The
+  // two vocabularies never coexist on a single plan - a plan has tiers or
+  // approaches, never both - so one flat map serves both formats.
+  const [vizModal, setVizModal] = useState(null); // holds the URL being viewed full-screen
   const [vizModalKey, setVizModalKey] = useState(0);
-  const [vizLoading, setVizLoading] = useState({}); // keyed by tier id
+  const [vizLoading, setVizLoading] = useState({}); // keyed by tier id or approach id, see vizImage above
   const [vizTipIndex, setVizTipIndex] = useState(0);
   const vizTipTimer = useRef(null);
 
@@ -5123,7 +5127,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // that's only just now being saved.
         selectedApproach: null,
         proTip: plan.proTip,
-        vizImages: {},
+        // vizImages is deliberately NOT initialized here. Every reader
+        // already spells it `item.vizImages || {}`, and generateVisualization
+        // writes with the dotted path `vizImages.<key>`, which Firestore
+        // creates on demand - so an empty map at save time carried no
+        // information and only made "has this plan ever been visualized?"
+        // unanswerable without inspecting the map's size.
         // Approach Selection Phase B: Companion has nothing to show until
         // the user explicitly taps "Start This Plan" on Results and
         // handleStartThisPlan seeds currentBatch from their chosen
@@ -6625,27 +6634,112 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
-  const generateVisualization = async (tier) => {
+  // ---- Visualization prompt construction ----
+  // Two builders, one per plan format, because the two formats carry
+  // genuinely different source material - not because the image model
+  // needs different handling. Everything they share (the architectural
+  // preservation clause, the photographic direction, the no-text/no-people
+  // prohibitions) lives in VIZ_PROMPT_FRAME so the two can never drift on
+  // the parts that are actually the same requirement.
+  //
+  // Room-First Identity (Implementation Phase A): results.spaceType is only
+  // populated once a plan is actually saved (savePlanToHistory sets it from
+  // suggestedRoomName) - a freshly-analyzed, not-yet-saved `results` (the
+  // raw parsed AI response) carries suggestedRoomName directly instead.
+  // Both are read since a visualization can run against either shape,
+  // depending on how quickly the user taps relative to the background save.
+  const resolveVizSpaceLabel = () => {
+    // spaceName is the Room's own durable displayName once the plan is
+    // filed (it is written from the Space, not from the AI), so it wins -
+    // a Room the user renamed "The Snug" should visualize as the snug, not
+    // as whatever the AI called it the day the photo was taken.
+    const room = (typeof results.spaceName === "string" && results.spaceName.trim())
+      || results.spaceType || results.suggestedRoomName || "room";
+    const area = (typeof results.areaName === "string" && results.areaName.trim())
+      || results.suggestedAreaName || null;
+    // The Area is a qualifier, never a replacement: the image model still
+    // has to be told it is looking at a whole room, or it reframes the
+    // photo around the sub-area and invents architecture outside it.
+    return area ? `${room} (specifically the ${area})` : room;
+  };
+  const VIZ_PROMPT_FRAME = {
+    preserve: "Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes.",
+    style: "Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.",
+  };
+  // Old-format (tiers). Byte-for-byte the prompt this function has always
+  // produced - extracted, not rewritten, so an old plan visualized before
+  // this change and after it get the same instruction.
+  const buildTierVizPrompt = (tier) => {
+    const productList = tier.products?.map(p => p.name).join(", ");
+    const suggestionList = tier.suggestions?.join(". ");
+    const itemsFound = normalizeItemsFound(results.itemsFound).join(", ");
+    const roomLabelForViz = results.spaceType || results.suggestedRoomName || "room";
+    return `Reorganize and declutter this exact ${roomLabelForViz}. ${VIZ_PROMPT_FRAME.preserve} Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the suggestions say to.` : ""} ${VIZ_PROMPT_FRAME.style}`;
+  };
+  // New-format (approaches). visualizationDirection leads, deliberately:
+  // it is the one field the analysis prompt wrote FOR this purpose ("what
+  // that approach's finished result should look like for this specific
+  // space"), and it is what makes three visualizations of one photo differ
+  // in ambition rather than in tidiness. Until now it was generated on
+  // every plan and read by nothing.
+  //
+  // organizingGuidance and productRecommendations follow as supporting
+  // context, not as instructions of equal weight - guidance is written as
+  // advice to a person ("group like with like"), and handing that to an
+  // image model as a co-equal directive produces literal-minded results.
+  // Product TYPES only, never searchTerms or reasons: the model needs to
+  // know a tray may appear, not how to shop for one.
+  const buildApproachVizPrompt = (approachId, approach) => {
+    const meta = APPROACH_META[approachId];
+    const direction = typeof approach.visualizationDirection === "string" ? approach.visualizationDirection.trim() : "";
+    const guidance = (approach.organizingGuidance || []).filter((g) => typeof g === "string" && g.trim()).slice(0, 4).join(" ");
+    const productTypes = [...new Set(
+      (approach.productRecommendations || [])
+        .map((p) => (typeof p?.productType === "string" ? p.productType.trim() : ""))
+        .filter(Boolean)
+    )].join(", ");
+    const itemsFound = normalizeItemsFound(results.itemsFound).join(", ");
+    const spaceLabel = resolveVizSpaceLabel();
+
+    return [
+      `Transform this photo to show the ${spaceLabel} after implementing the "${meta?.name || approachId}" approach.`,
+      // Falls back to the approach's own strategy rather than to nothing:
+      // a plan written before visualizationDirection existed, or one where
+      // the AI omitted it, should still visualize as ITS approach and not
+      // silently collapse into a generic tidy-up.
+      direction || (typeof approach.strategyDescription === "string" ? approach.strategyDescription.trim() : ""),
+      VIZ_PROMPT_FRAME.preserve,
+      guidance ? `The space should reflect these changes: ${guidance}` : "",
+      productTypes ? `Items that may be added, rendered realistically and only where they plausibly fit: ${productTypes}.` : "",
+      // Same reasoning as the tier prompt: without this the model tends to
+      // empty the room rather than organize it.
+      itemsFound ? `The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the approach calls for it.` : "",
+      VIZ_PROMPT_FRAME.style,
+    ].filter(Boolean).join(" ");
+  };
+
+  // Accepts EITHER an old-format tier object (unchanged call site) or a
+  // new-format { approachId, approach } descriptor. Everything after the
+  // prompt - the edit call, compression, Storage upload, persistence - is
+  // format-independent and deliberately shared: the two formats differ in
+  // what they ask for, not in what happens to the image that comes back.
+  const generateVisualization = async (target) => {
     if (!isPro) { setShowPaywall(true); return; }
     if (!photo?.uri) {
       Alert.alert("Photo unavailable", "We couldn't find the original photo for this room. Please reopen it from My Rooms and try again.");
       return;
     }
-    setVizLoading(prev => ({ ...prev, [tier.id]: true }));
+    const isApproach = !!target?.approachId;
+    // The storage key. For an approach this is "simple"/"polished"/
+    // "elevated", which is what makes the three independent: generating
+    // one writes vizImages.<thatId> and cannot touch the other two.
+    const vizKey = isApproach ? target.approachId : target.id;
+    setVizLoading(prev => ({ ...prev, [vizKey]: true }));
     startVizTips();
     try {
-      const productList = tier.products?.map(p => p.name).join(", ");
-      const suggestionList = tier.suggestions?.join(". ");
-      const itemsFound = normalizeItemsFound(results.itemsFound).join(", ");
-      // Room-First Identity (Implementation Phase A): results.spaceType is
-      // only populated once a plan is actually saved (savePlanToHistory
-      // sets it from suggestedRoomName) - a freshly-analyzed, not-yet-saved
-      // `results` (the raw parsed AI response) carries suggestedRoomName
-      // directly instead. Both read here since generateVisualization can
-      // run against either shape, depending on how quickly the user taps
-      // "See the transformation" relative to the background save.
-      const roomLabelForViz = results.spaceType || results.suggestedRoomName || "room";
-      const prompt = `Reorganize and declutter this exact ${roomLabelForViz}. Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes. Only change the contents: remove clutter, and apply these specific changes: ${suggestionList}.${productList ? ` Add these storage solutions in a realistic way: ${productList}.` : ""}${itemsFound ? ` The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the suggestions say to.` : ""} Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.`;
+      const prompt = isApproach
+        ? buildApproachVizPrompt(target.approachId, target.approach)
+        : buildTierVizPrompt(target);
 
       // Use the image EDIT endpoint (not generations) so the model anchors on the
       // user's actual photo instead of inventing an unrelated room from text alone.
@@ -6658,11 +6752,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const generateVisualizationFn = httpsCallable(functions, "generateVisualization", { timeout: 300000 });
       let b64;
       try {
-        const result = await generateVisualizationFn({ imageBase64: vizInput.base64, prompt });
+        // planId is sent so the function can verify the caller actually
+        // owns the plan being visualized, not merely that they are signed
+        // in. Null for a not-yet-saved plan, which the function treats as
+        // "authenticated but unattributable" and allows - the alternative
+        // would break visualizing a plan the background save hasn't
+        // finished writing yet.
+        const result = await generateVisualizationFn({ imageBase64: vizInput.base64, prompt, planId: currentPlanId || null });
         b64 = result.data?.b64;
       } catch (vizErr) {
         console.log("Viz function error:", vizErr.code, vizErr.message);
-        Alert.alert("Visualization failed", "Please try again.");
+        Alert.alert(
+          "Visualization failed",
+          vizErr.code === "functions/permission-denied" || vizErr.code === "functions/unauthenticated"
+            ? "Please sign in again and retry."
+            : "Please try again."
+        );
         return;
       }
       const rawImage = b64 ? ("data:image/png;base64," + b64) : null;
@@ -6676,7 +6781,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         let sourceUri = rawImage;
         if (b64) {
           // manipulateAsync needs a file URI, not a raw base64 string. Write it to a temp file first.
-          const tempPath = FileSystem.cacheDirectory + `viz_raw_${tier.id}_${Date.now()}.png`;
+          const tempPath = FileSystem.cacheDirectory + `viz_raw_${vizKey}_${Date.now()}.png`;
           await FileSystem.writeAsStringAsync(tempPath, b64, { encoding: FileSystem.EncodingType.Base64 });
           sourceUri = tempPath;
         }
@@ -6692,7 +6797,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           xhr.open("GET", compressed.uri, true);
           xhr.send(null);
         });
-        const path = `viz/${user.uid}/${currentPlanId || "unsaved"}/${tier.id}_${Date.now()}.jpg`;
+        const path = `viz/${user.uid}/${currentPlanId || "unsaved"}/${vizKey}_${Date.now()}.jpg`;
         const fileRef = storageRef(storage, path);
         await uploadBytes(fileRef, blob, { contentType: "image/jpeg" });
         finalUrl = await getDownloadURL(fileRef);
@@ -6701,13 +6806,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // finalUrl stays as the raw OpenAI image. Works for this session, just won't persist cheaply.
       }
 
-      setVizImage(prev => ({ ...prev, [tier.id]: finalUrl }));
-      logEvent(getAnalytics(), "visualization_generated");
+      setVizImage(prev => ({ ...prev, [vizKey]: finalUrl }));
+      logEvent(getAnalytics(), "visualization_generated", { format: isApproach ? "approach" : "tier", vizKey });
 
       if (currentPlanId) {
         try {
-          await updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { [`vizImages.${tier.id}`]: finalUrl });
-          setHistory(prev => prev.map(h => h.id === currentPlanId ? { ...h, vizImages: { ...(h.vizImages || {}), [tier.id]: finalUrl } } : h));
+          // A dotted field path, so this is a targeted write to ONE key
+          // inside vizImages - the other approaches' images are not read,
+          // rewritten, or even present in the payload, which is what makes
+          // "generate Polished, then Elevated" additive rather than a
+          // last-writer-wins overwrite of the map.
+          await updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { [`vizImages.${vizKey}`]: finalUrl });
+          setHistory(prev => prev.map(h => h.id === currentPlanId ? { ...h, vizImages: { ...(h.vizImages || {}), [vizKey]: finalUrl } } : h));
         } catch (saveErr) {
           console.log("Save vizImage to plan error:", saveErr.message);
         }
@@ -6718,7 +6828,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       Alert.alert("Visualization failed", e.message);
     } finally {
       stopVizTips();
-      setVizLoading(prev => ({ ...prev, [tier.id]: false }));
+      setVizLoading(prev => ({ ...prev, [vizKey]: false }));
     }
   };
 
@@ -9544,12 +9654,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // FAQ SCREEN
   if (showFaq) {
     const faqs = [
-      { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and creates a personalized organization plan across three budget levels with specific product recommendations." },
+      { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and offers three different approaches to transforming it, each with its own guidance, first-session checklist, and product recommendations." },
       { q: "What can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
-      { q: "What's the difference between the budget tiers?", a: "Budget (under $50) uses quick wins and items you may already have. Mid-Range ($50-$200) adds quality organizers and storage systems. Premium ($200+) features custom solutions and high-end products for a fully transformed room." },
-      { q: "Can I enter my own budget?", a: "Yes! Below the budget tier buttons you'll find a custom budget field. Enter any dollar amount and Uncluttrd will highlight which tier best fits your budget." },
+      { q: "What's the difference between the three approaches?", a: "They differ in ambition, not just price. Keep It Simple makes the space work and look noticeably better using what you already own. Polished & Practical solves the organization problems and finishes the space with a few targeted purchases. Elevated Finish is a full transformation, addressing every problem and every opportunity the photo shows. Open any approach to see its full guidance, checklist, and recommendations before you choose." },
+      { q: "Can I enter my own budget?", a: "Yes! Below the budget buttons you'll find a custom budget field. Enter any dollar amount and it's shown alongside your plan so you can weigh the three approaches against it." },
       { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
-      { q: "What is the AI Visualization feature?", a: "After getting your organization plan, tap 'See the transformation' on any tier to generate an AI-created image showing what your room could look like after organizing. This is a Pro feature." },
+      { q: "What is the AI Visualization feature?", a: "After getting your organization plan, open any approach and tap 'See the transformation' to preview the result: an AI-created image showing what your space could look like under that approach. Each approach has its own visualization, so you can generate one, several, or all three and compare them. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
       { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. Pro members also get unlimited continuing guidance on each room and can share a branded PDF." },
       { q: "How do I cancel my subscription?", a: "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
@@ -10707,7 +10817,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </View>
           {budget ? (
             <View style={s.budgetBanner}>
-              <Text style={s.budgetBannerText}>💰 Based on your ${budget} budget. Best Match highlighted below.</Text>
+              {/* "Best Match highlighted below" is a tier-era promise: the
+                  ⭐ Best Match badge is rendered by getBestMatch() inside
+                  the tier map, which a new-format plan never enters. The
+                  banner would otherwise point at a badge that does not
+                  exist on this screen. */}
+              <Text style={s.budgetBannerText}>
+                {results.approaches
+                  ? `💰 Your $${budget} budget. Compare the three approaches below.`
+                  : `💰 Based on your $${budget} budget. Best Match highlighted below.`}
+              </Text>
             </View>
           ) : null}
           {results.tiers?.map(t => {
@@ -10997,6 +11116,54 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                               );
                             }))}
                           </>
+                        )}
+                        {/* Approach-Aware Visualization: each approach owns
+                            its own image, keyed by approach id, so
+                            generating Polished leaves Simple and Elevated
+                            untouched and all three can coexist. Placed
+                            below the recommendations and above the
+                            commitment button deliberately - it is the last
+                            piece of evidence for the decision, not the
+                            decision itself. */}
+                        {vizImage[id] ? (
+                          <View style={{ marginTop: 14 }}>
+                            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                              <Sparkles size={14} color={meta.color} strokeWidth={2.25} />
+                              <Text style={s.prodLabel}>{`${meta.name.toUpperCase()} VISUALIZED`}</Text>
+                            </View>
+                            <TouchableOpacity
+                              onPress={() => { setVizModal(vizImage[id]); setVizModalKey(k => k + 1); }}
+                              activeOpacity={0.9}
+                              accessibilityLabel={`View the ${meta.name} transformation full screen`}
+                              accessibilityRole="button"
+                            >
+                              <Image source={{ uri: vizImage[id] }} style={s.vizImage} resizeMode="cover" />
+                              <Text style={{ fontSize: 11, color: BRAND.mist, textAlign: "center", marginTop: 6, fontFamily: "Inter_400Regular" }}>Tap to view full screen</Text>
+                            </TouchableOpacity>
+                          </View>
+                        ) : (
+                          <TouchableOpacity
+                            style={[s.vizBtn, { borderColor: meta.color }]}
+                            onPress={() => generateVisualization({ approachId: id, approach: a })}
+                            disabled={vizLoading[id]}
+                            accessibilityLabel={`See the ${meta.name} transformation${!isPro ? ", Pro feature" : ""}`}
+                            accessibilityRole="button"
+                          >
+                            {vizLoading[id] ? (
+                              <View style={{ alignItems: "center", gap: 8 }}>
+                                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                                  <ActivityIndicator color={meta.color} size="small" />
+                                  <Text style={[s.vizBtnText, { color: meta.color }]}>Creating your transformation...</Text>
+                                </View>
+                                <Text style={{ fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", paddingHorizontal: 8 }}>{VIZ_TIPS[vizTipIndex]}</Text>
+                              </View>
+                            ) : (
+                              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                                <Text style={{ fontSize: 16 }}>🎨</Text>
+                                <Text style={[s.vizBtnText, { color: meta.color }]}>See the transformation{!isPro ? " ⭐ PRO" : ""}</Text>
+                              </View>
+                            )}
+                          </TouchableOpacity>
                         )}
                         {/* Item 4: THE single commitment action, and it
                             lives inside the card it commits to. The old
