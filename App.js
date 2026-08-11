@@ -2537,6 +2537,40 @@ const APPROACH_ORDER = ["simple", "polished", "elevated"];
 // keyword-table-with-fallback pattern. Falls back to Package for any
 // unrecognized/missing value so a malformed AI response can never crash on
 // an undefined icon component.
+// Pure. Reduces a productRecommendation's own productType - which the AI
+// writes as a full descriptive phrase ("decorative tray for cabinet
+// surface", "floating shelf or niche shelf") - to the short core noun the
+// collapsed card's "Suggested additions" preview needs ("tray", "shelf").
+// Display-only: productType itself is never rewritten, and the expanded
+// card's product rows still show the AI's full phrase.
+//
+// Three steps, in order:
+//   1. Cut at the first connector. Everything after it is either an
+//      alternative ("or niche shelf") or a placement/purpose clause ("for
+//      cabinet surface") - neither belongs in a scannable preview.
+//   2. Drop a leading descriptor ("decorative tray" -> "tray"). A small
+//      explicit list rather than "always take the last word", which would
+//      turn "wall art" into "art" and "picture light" into "light" - the
+//      failure mode of an unmatched descriptor is a slightly longer but
+//      still accurate phrase, which the wrapping preview line can absorb.
+//   3. Cap at two words, keeping the last two (the head noun and its
+//      nearest qualifier).
+const PRODUCT_DESCRIPTOR_WORDS = new Set([
+  "decorative", "floating", "small", "large", "modern", "slim", "tall", "wide",
+  "compact", "adjustable", "stackable", "clear", "woven", "wooden", "metal",
+  "acrylic", "led", "simple", "classic", "minimalist", "sturdy", "portable",
+]);
+function shortProductNoun(productType) {
+  const raw = typeof productType === "string" ? productType.trim() : "";
+  if (!raw) return "";
+  const cut = raw.split(/\s+(?:or|and|for|with|to|on|in|under|that|which)\s+|\s+[-–—]\s+|[,(]/i)[0].trim();
+  let words = cut.split(/\s+/).map((w) => w.replace(/[^A-Za-z0-9-]/g, "")).filter(Boolean);
+  if (!words.length) return raw.toLowerCase();
+  if (words.length > 1 && PRODUCT_DESCRIPTOR_WORDS.has(words[0].toLowerCase())) words = words.slice(1);
+  if (words.length > 2) words = words.slice(-2);
+  return words.join(" ").toLowerCase();
+}
+
 const PRODUCT_CATEGORY_ICONS = {
   cable: Cable,
   basket: ShoppingBasket,
@@ -9942,10 +9976,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 // Product TYPES only, never a shop affordance - item 6 is
                 // explicit that shopping lives solely in the expanded
                 // card's full product rows. This line is informational.
-                const additionsPreview = products
-                  .map((p) => p.productType)
-                  .filter((t) => typeof t === "string" && t.trim())
-                  .join(" · ");
+                // Results Polish item 2: short core nouns, deduped - two
+                // recommendations reducing to the same noun ("floating
+                // shelf", "niche shelf") would otherwise read as
+                // "shelf · shelf". Order preserved.
+                const additionsPreview = [...new Set(
+                  products.map((p) => shortProductNoun(p.productType)).filter(Boolean)
+                )].join(" · ");
                 // Section 5 (future service-referral extensibility): an
                 // ordered list of recommendation groups, not a single
                 // hardcoded productRecommendations.map(...) call. Today
@@ -9968,7 +10005,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                     <TouchableOpacity
                       onPress={() => setPreviewApproach((prev) => (prev === id ? null : id))}
                       activeOpacity={0.8}
-                      accessibilityLabel={`${meta.name}, estimated ${a.estimatedSpendRange}`}
+                      accessibilityLabel={meta.name}
                       accessibilityState={{ expanded }}
                       accessibilityRole="button"
                     >
@@ -9976,7 +10013,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                         <View style={[s.approachPill, { backgroundColor: meta.bg, borderColor: meta.border }]}>
                           <Text style={[s.approachPillText, { color: meta.color }]}>{meta.name}</Text>
                         </View>
-                        <Text style={s.approachRange}>{a.estimatedSpendRange}</Text>
+                        {/* Results Polish item 1: the estimated spend range
+                            is deliberately NOT rendered. The deterministic
+                            scope x approach table (SCOPE_SPEND_TABLE) still
+                            runs and estimatedSpendRange is still persisted
+                            on every plan - the number isn't architecturally
+                            wrong, it's just disconnected from the actual
+                            recommendations until Product Intelligence can
+                            derive it from real product data. Display only;
+                            nothing about how it's computed or stored
+                            changed, so restoring this is a one-line
+                            revert. */}
                       </View>
                       <Text style={s.approachStrategy}>{a.strategyDescription}</Text>
                       {keyChanges.length > 0 && (
@@ -9989,13 +10036,26 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                           ))}
                         </View>
                       )}
-                      {/* Item 2: omitted entirely when the approach
-                          recommends nothing - never an empty label. */}
-                      {!!additionsPreview && (
-                        <Text style={s.approachAdditions} numberOfLines={2}>
+                      {/* Results Polish items 2 and 3. No numberOfLines
+                          cap: the line wraps rather than truncating with an
+                          ellipsis, since a clipped "decorative tray for cab…"
+                          is strictly worse than a second line. Shortening
+                          (shortProductNoun) makes wrapping rare; wrapping
+                          makes the remaining long cases readable.
+
+                          An approach with no products now SAYS so, rather
+                          than silently dropping the line - "Uses what you
+                          already have" reads as a deliberate property of
+                          that approach (which for "Keep It Simple" it
+                          usually is), where an absent line read as
+                          incomplete data. */}
+                      {additionsPreview ? (
+                        <Text style={s.approachAdditions}>
                           <Text style={s.approachAdditionsLabel}>Suggested additions: </Text>
                           {additionsPreview}
                         </Text>
+                      ) : (
+                        <Text style={[s.approachAdditions, s.approachAdditionsLabel]}>Uses what you already have</Text>
                       )}
                       {/* Replaces the bare chevron: a worded affordance
                           that says what tapping does and which way it goes,
@@ -10039,7 +10099,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                   key={`${group.kind}-${i}`}
                                   style={s.prodRow}
                                   onPress={() => { logEvent(getAnalytics(), "product_clicked", { product: item.productType, approach: id }); openProduct(item.searchTerms); }}
-                                  accessibilityLabel={`Shop options for ${item.productType}`}
+                                  accessibilityLabel={`Find options for ${item.productType}`}
                                   accessibilityRole="button"
                                 >
                                   <View style={[s.prodIco, { backgroundColor: meta.bg }]}>
@@ -10049,7 +10109,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                     <Text style={s.prodName}>{item.productType}</Text>
                                     <Text style={s.approachProdReason}>{item.reason}</Text>
                                   </View>
-                                  <Text style={s.approachShopLink}>Shop options →</Text>
+                                  {/* Results Polish item 4: "Shop options"
+                                      overpromised - what actually happens is
+                                      an Amazon search built from generic
+                                      searchTerms, not a curated shopping
+                                      surface. "Find options" describes that
+                                      honestly until real product
+                                      intelligence exists. */}
+                                  <Text style={s.approachShopLink}>Find options →</Text>
                                 </TouchableOpacity>
                               );
                             }))}
@@ -10905,6 +10972,9 @@ const s = StyleSheet.create({
   approachCardHead: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
   approachPill: { borderWidth: 1, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 10 },
   approachPillText: { fontSize: 13, fontFamily: "Inter_700Bold" },
+  // Retained, currently unrendered - Results Polish item 1 removed the
+  // spend range from display only. Kept so restoring it (once Product
+  // Intelligence can derive a real figure) needs no style archaeology.
   approachRange: { flex: 1, fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate },
   approachStrategy: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, lineHeight: 19 },
   approachExpanded: { marginTop: 4, paddingTop: 8, borderTopWidth: 1, borderTopColor: BRAND.offWhite },

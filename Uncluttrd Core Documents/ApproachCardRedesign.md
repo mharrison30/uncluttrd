@@ -119,7 +119,42 @@ Committed (`c746a61`) and pushed to the `staging` EAS Update branch.
 
 ---
 
-## 6. Known / deferred
+## 6. Addendum — Results Polish (four fixes)
+
+Four follow-up fixes, applied after the redesign shipped.
+
+**1. Spend range removed from display.** `estimatedSpendRange` is no longer rendered on any card, collapsed or expanded, and the accessibility label no longer announces it. `SCOPE_SPEND_TABLE` and `applyDeterministicSpendRanges` still run, and the field is still persisted on every plan — the number isn't architecturally wrong, just disconnected from the actual recommendations until Product Intelligence can derive it from real product data. `s.approachRange` is kept (unrendered) so restoring the display is a one-line change.
+
+**2. "Suggested additions" truncation fixed** — two independent changes, both needed:
+- New pure helper `shortProductNoun` reduces the AI's full descriptive `productType` to its core noun. Cut at the first connector (`or`/`and`/`for`/`with`/…, spaced dash, comma, paren) → drop a leading descriptor from a small explicit list → cap at two words. A **list** rather than "always take the last word", which would turn `"wall art"` into `"art"` and `"picture light"` into `"light"`; an unmatched descriptor degrades to a slightly longer but still accurate phrase, which the wrapping line absorbs.
+- The `numberOfLines={2}` cap is **removed**, so the line wraps instead of clipping. Shortening makes wrapping rare; wrapping makes the remaining long cases readable.
+- Results are also deduped — `"floating shelf"` and `"niche shelf"` both reduce to `shelf`, which would otherwise read `"shelf · shelf"`.
+
+Verified against **every** `productType` string in staging, plus the spec's own example:
+
+| Real `productType` | Preview |
+|---|---|
+| `decorative tray for cabinet surface` | `tray` |
+| `decorative tray` | `tray` |
+| `floating shelf or niche shelf` | `shelf` |
+| `bar cabinet or liquor cabinet` | `bar cabinet` |
+| `LED picture light or niche lighting` | `picture light` |
+| `decorative sculpture or art object` | `sculpture` |
+| `accent lighting for niche` | `accent lighting` |
+| `statement centerpiece bowl or vase` | `centerpiece bowl` |
+| `sculptural vases and decorative objects for niche` | `sculptural vases` |
+
+**3. Zero-product messaging.** An approach with no recommendations now renders **"Uses what you already have"** in place of the additions line, rather than omitting it. The absence reads as a deliberate property of that approach — which for "Keep It Simple" it usually is — instead of missing data. Exercised by real data: `simple` has zero products on **both** new-format plans in staging.
+
+**4. "Shop options →" → "Find options →"**, in the link text and the accessibility label (the only two occurrences in the file). What actually happens is an Amazon search built from generic `searchTerms`, not a curated shopping surface; the old label overpromised.
+
+**The keyChanges gap from §3 is now closed.** A `schemaVersion: 3` plan (`ubol1RMlSJeDGyIKCDj9`) exists in staging with real keyChanges on all three approaches (3 / 3 / 4, all within the ≤4 slice) — e.g. *"Table cleared completely"*, *"Niche curated with decor"*, *"Ambient lighting layered throughout"*. Test (a) from §4 is now fully satisfiable on real data.
+
+Metro production export clean. Nothing else changed: collapsed cards, expand/collapse browsing, and "Start with [Approach] →" are exactly as shipped.
+
+---
+
+## 7. Known / deferred
 
 - **Approach switching is not built.** "Change approach" is a placeholder alert.
 - **keyChanges is unobservable on current staging data** — run one fresh analysis to produce a `schemaVersion: 3` plan and see the complete collapsed card.
