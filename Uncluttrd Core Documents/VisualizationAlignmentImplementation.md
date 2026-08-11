@@ -293,3 +293,15 @@ export clean.
   (Node 24, 2nd gen) — required for the auth fix; the client sends `planId`
   and would otherwise be sending a field nothing reads.
 - Client shipped by OTA to the `staging` branch.
+
+Commit `6bacd3c`:
+
+| Platform | Runtime version | Update group | Update ID |
+|---|---|---|---|
+| Android | `c266213e8d2ef2dcba1adcae706e94c1a1495fb8` | `be67867f-13c0-4942-896c-dda34988fb2e` | `019ff28d-354a-73b3-a631-d8f2105a1b76` |
+| iOS | `194c6294ae70b8bf34cd79c67f09187a2289a4a1` | `5b7d12e6-64cb-4d72-81ea-3979d023ddb1` | `019ff28d-354a-7029-83f5-38a20102bb00` |
+
+The Cloud Function was deployed **before** the evidence run, so (g1)–(g3)
+are observations of the live staging endpoint rather than of local source.
+Whether any device has pulled the client update cannot be observed from
+here — the IDs above are what EAS reports as published.
