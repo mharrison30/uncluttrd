@@ -148,7 +148,16 @@ Full Metro production export (`npx expo export --platform ios`) succeeded — 9.
 
 ---
 
-## 4. Known, accepted, out of scope
+## 4. OTA
+
+Committed (`33a5e9c`) and pushed to the `staging` EAS Update branch.
+
+- iOS update ID: `019feeab-8d3a-78e9-97db-3a9c55d20589` (update group `d71fe1a8-c663-462d-ab8a-de3936801fef`)
+- Android update ID: `019feeab-8d3a-79c9-9bdf-57562f3a57fb` (update group `bb21b10b-db16-41a0-a975-cebed28e268e`)
+
+---
+
+## 5. Known, accepted, out of scope
 
 - **Benign `[AREA SUMMARY] NOT_FOUND` log line during a move.** `reclassifyLegacyPlan`'s reprojection recomputes the Area summary using the plan's *current* `areaId` — still the source Area's — under the *target* Room, where no such document exists. It is caught and logged, never thrown, and the correct summary is written moments later by Phase 5's `updateAreaSummary(target, newAreaId)`. Pre-existing behavior shared with `mergeRoomIntoRoom`, not introduced here.
 - **Phase B — "Create a new Room during move."** Deferred as instructed. §3b's finding stands: no `createRoom()` helper exists anywhere; every Space today is founded as a side effect of a plan being saved. Needs its own design decision (synthesize an empty Room vs. let the moved Area's first plan found it).
