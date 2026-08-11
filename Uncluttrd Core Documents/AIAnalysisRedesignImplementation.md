@@ -195,3 +195,79 @@ Committed (`8e78be6`) and pushed to the `staging` EAS Update branch.
 
 - iOS update ID: `019fee74-c1f3-7668-a60d-b54aab12161a`
 - Android update ID: `019fee74-c1f3-745c-8b70-ce5667198237`
+
+---
+
+# Addendum — Product Recommendation Grounding Schema (2026-08-11)
+
+**This is the contract Product Intelligence will build on.** It closes the AI Analysis Redesign.
+
+## Schema evolution
+
+| | Old | New |
+|---|---|---|
+| Link to a problem | `relatedProblemId: string` — **singular, mandatory, never null** | `relatedProblemIds: string[]` — **array, may be empty** |
+| Evidence when no problem applies | *(no representation)* | `grounding: string \| null` |
+
+Every other field on a recommendation (`productType`, `reason`, `searchTerms`, `icon`, `approachId`) is unchanged.
+
+## The three valid states
+
+| State | `relatedProblemIds` | `grounding` | Meaning |
+|---|---|---|---|
+| **Problem-solving** | one id | `null` | Directly addresses one identified problem or opportunity. |
+| **Multi-problem** | two or more ids | `null` | Genuinely serves several identified issues; lists **every** one it serves rather than picking arbitrarily. |
+| **Optional enhancement** | `[]` | a sentence of visible evidence | Improves the space but solves no *named* problem. Honest, not lesser. |
+
+**Invalid:** empty `relatedProblemIds` **and** `null` grounding. That is ungrounded filler and must never be returned.
+
+Every id must exist in that plan's own `problemsFound`. An id is never permitted as a placeholder for "this had nowhere else to point."
+
+### Constraints on the optional-enhancement state
+
+Added after the state was observed being used too loosely. An optional enhancement is permitted **only** when the photo shows specific visible evidence of an unmet improvement opportunity:
+
+- **Existing ownership of the same functional product type is evidence AGAINST** recommending another, unless the image shows the existing item is inadequate (visibly broken, obviously undersized, wrong type for the task).
+- Compatibility is not grounding. *"The room is the kind of space that benefits from X"* is not evidence.
+- The grounding must cite **a specific visible characteristic the product would improve**, not a general assumption about the space or activity type.
+
+## Why the schema changed (do not re-litigate this in prose)
+
+A single mandatory `relatedProblemId` left nowhere honest for a legitimate recommendation that solves no *named* problem, and the model resolved that by mislabelling rather than omitting. Across two controlled tests on the same dining-room photo, an area rug whose own `reason` cited hard flooring was linked first to `blank-wall`, then — after the instruction was tightened with an explicit worked example — to `credenza-top-styling`. **Tightening the prose only changed which wrong id it chose.** With the third state available, the same photo returns:
+
+```json
+{
+  "productType": "Area rug sized for dining table and chairs",
+  "relatedProblemIds": [],
+  "grounding": "The visible dark wood-look flooring extends throughout the dining area
+                with no rug, leaving the dining zone visually unanchored."
+}
+```
+
+The array form fixed a second, quieter failure: a product serving several problems previously had to discard all but one link. A desktop file organizer now correctly reports `["paper-overflow", "no-paper-system", "work-surface-unavailable"]`.
+
+**The lesson worth keeping:** when a model repeatedly produces a dishonest value, check whether the schema left it an honest one. Two prompt revisions failed where one schema change succeeded.
+
+## Backward compatibility
+
+Plans written before this change carry the singular field. `normalizeProductRecommendation` (App.js) is the single place that difference is flattened, exactly as `normalizeItemsFound` already does for the `itemsFound` shape change:
+
+```
+relatedProblemId: "x"  ->  relatedProblemIds: ["x"], grounding: null
+```
+
+It is pure and tolerant — a malformed entry degrades to an empty id list rather than throwing — and sets `isUngrounded` so a future validation pass can surface the invalid state instead of hiding it. **No backfill:** old plans keep their stored shape forever and are normalized on read, the same no-backfill discipline `schemaVersion` 1/2/3 already follows.
+
+`resolveRecommendationReason` decides the line rendered under a product name: the grounding sentence for an optional enhancement, the linked problems' own descriptions for a problem-solving one, and the AI's `reason` as the fallback an older plan relies on.
+
+## Related: icon vocabulary is now derived, not hand-written
+
+`PRODUCT_CATEGORY_ICONS` gained ten decor/styling keys (`art`, `lighting`, `textile`, `plant`, `tray`, `barware`, `glassware`, `decor`, `storage`, `furniture`). The prompt interpolates `PRODUCT_ICON_VOCAB`, derived from that map's own keys, so **the vocabulary the AI chooses from is definitionally the vocabulary the app can render** — adding a key to the map is the only edit needed. Verify any new lucide name against the installed version first; an unavailable name imports as `undefined` and crashes at render.
+
+## Evidence-constrained interventions apply to every field
+
+Infrastructure-dependent work (installation, electrical, plumbing, mounting to unknown structure) may not be stated as achievable in **any** generated field — `strategyDescription`, `keyChanges`, `organizingGuidance`, `taskChecklist`, `productRecommendations`, `visualizationDirection` — without visible evidence. It must be omitted or explicitly conditional. Naming the fields individually was necessary: when the rule listed only `taskChecklist` and `productRecommendations`, one approach correctly wrote *"If an outlet is available in or near the niche, install a picture light"* in its checklist while writing *"Install proper accent lighting in the niche"* in its guidance.
+
+## Status
+
+Deployed to staging. **The AI Analysis Redesign is closed** — further tuning comes from real-space usage, not from iterating on test photos.
