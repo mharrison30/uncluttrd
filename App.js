@@ -4599,17 +4599,30 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // Cache-first, query-as-fallback: checks the already-loaded `history`
   // array (zero new reads, covers the common case - a user's 20 most
   // recent plans) via the shared pure resolveRecognitionCandidates.
-  // Only if that finds nothing does it run the two targeted single-field
-  // queries (spaceType, spaceName - each auto-indexed, no deployment
-  // needed) to catch a Room organized 6+ months ago, outside the cache.
-  // Deliberate deviation from RememberedHomeDesign.md §2a, which said to
-  // run the query unconditionally in parallel with the cache check: doing
-  // that would mean two extra Firestore reads on EVERY analysis,
-  // including the common first-time-user case with no history at all to
-  // match against. Conditional-on-cache-miss still catches exactly the
-  // case §2a's own reasoning cared about (an older Room the 20-item cache
-  // missed) - it just avoids paying the query's cost when the cache
-  // already has a real answer. Flagged explicitly, not silently changed.
+  // Only if that finds nothing does it fall back to Firestore. Deliberate
+  // deviation from RememberedHomeDesign.md §2a, which said to run the
+  // query unconditionally in parallel with the cache check: doing that
+  // would mean extra Firestore reads on EVERY analysis, including the
+  // common first-time-user case with no history at all to match against.
+  // Conditional-on-cache-miss still catches exactly the case §2a's own
+  // reasoning cared about (an older Room the 20-item cache missed) - it
+  // just avoids paying the query's cost when the cache already has a real
+  // answer. Flagged explicitly, not silently changed.
+  //
+  // The fallback itself (Recognition Rename Fix - Fallback Completion) is
+  // Space-identity-first, not plan-label-first: it queries the user's own
+  // active Spaces for one whose CURRENT displayName matches freshLabel
+  // (single-field equality, auto-indexed, no deployment needed) - this is
+  // what makes a renamed Room discoverable even when every one of its own
+  // plans still carries its obsolete pre-rename label, since renameSpace
+  // never touches plan documents (see its own comment). The original
+  // exact-field plan queries (spaceType, spaceName) still run alongside
+  // it, unconditionally - that's what keeps a genuinely legacy plan (no
+  // canonicalSpaceId, no live Space at all) discoverable via its own
+  // historical label, exactly as before. Recognition is therefore no
+  // longer dependent on `history` cache state at all: a renamed Room with
+  // no matching plan anywhere in the cache OR in the exact-field query
+  // is still found, through its live Space identity alone.
   //
   // Never THROWS out to its caller - a recognition failure must never
   // block the fresh-start path it's proposing something in front of (§2d's
@@ -4640,6 +4653,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       fallbackQueryReason: null, // "no-fresh-label" | "cache-not-loaded" | "cache-had-zero-matches" | null
       byTypeCount: null,
       byNameCount: null,
+      liveSpaceMatchCount: null,
       error: null,
       finalCandidateCount: 0,
       status: null,
@@ -4687,24 +4701,65 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
     try {
       const plansRef = collection(db, "users", forUid, "plans");
-      const [byType, byName] = await Promise.all([
+      // Recognition Rename Fix - Fallback Completion: Space identity comes
+      // FIRST now, not just plan labels. A renamed Room's own plans may
+      // never carry its current name anywhere in spaceType/spaceName -
+      // renameSpace never touches them (see its own comment) - so the
+      // exact-field plan queries below can structurally never find a
+      // renamed Room whose plans are all still labeled with its obsolete
+      // name. Querying the user's own active Spaces for one whose CURRENT
+      // displayName matches freshLabel finds it directly, independent of
+      // what any of its plans' own historical fields say - closing the
+      // residual gap the previous fix (cache-path-only) explicitly
+      // disclosed. Equality-only on both the Space query and the
+      // per-Space plan lookup below - no orderBy, no composite index
+      // needed (this file's own established indexing discipline
+      // elsewhere) - "most recent" is picked client-side from a small
+      // bounded fetch instead. Retired Spaces are filtered client-side
+      // too, same reasoning as excludeRetiredCandidates below: a `!=`
+      // filter would incorrectly exclude every Space that's never had
+      // `retired` written at all, which is the common, non-deleted case.
+      const spacesRef = collection(db, "users", forUid, "spaces");
+      const [spaceMatchSnap, byType, byName] = await Promise.all([
+        getDocs(query(spacesRef, where("displayName", "==", freshLabel))),
         getDocs(query(plansRef, where("spaceType", "==", freshLabel))),
         getDocs(query(plansRef, where("spaceName", "==", freshLabel))),
       ]);
+      const liveSpaceMatches = spaceMatchSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((s) => s.retired !== true);
+      diagnostics.liveSpaceMatchCount = liveSpaceMatches.length;
       diagnostics.byTypeCount = byType.size;
       diagnostics.byNameCount = byName.size;
+
+      // Bounded to the first 3 name-matching live Spaces - matches
+      // resolveRecognitionCandidates's own final .slice(0,3) cap; more
+      // than 3 live Spaces sharing one exact display name is already an
+      // unusual edge case, low-stakes the same way this file already
+      // treats similarly rare collisions elsewhere.
+      const spaceIdentityPlans = liveSpaceMatches.length
+        ? (await Promise.all(liveSpaceMatches.slice(0, 3).map(async (space) => {
+            const plansSnap = await getDocs(query(plansRef, where("canonicalSpaceId", "==", space.id), limit(5)));
+            const plans = plansSnap.docs.map((d) => ({ id: d.id, data: d.data() }));
+            plans.sort((a, b) => Date.parse(b.data.createdAt || 0) - Date.parse(a.data.createdAt || 0));
+            return plans[0] || null; // most recent, client-side - no plans yet under a brand-new Space is a valid, if unlikely, outcome
+          }))).filter(Boolean)
+        : [];
+
+      // Historical spaceType/spaceName matching (byType/byName) still
+      // coexists unconditionally - it's what keeps a genuinely legacy
+      // plan (no canonicalSpaceId, no live Space at all) discoverable via
+      // its own historical label, exactly as before this fix.
       const merged = new Map();
-      [...byType.docs, ...byName.docs].forEach((d) => {
-        if (!merged.has(d.id)) merged.set(d.id, { id: d.id, data: d.data() });
-      });
-      // Same live-Space resolution applied to whatever the exact-field
-      // fallback query happened to find - it does not (and, without a
-      // canonicalSpaceId-keyed query, structurally cannot) discover a
-      // renamed Room's plans that the query itself missed because no plan
-      // document's own spaceType/spaceName literally equals freshLabel;
-      // that residual gap is bounded by the same cache-first design this
-      // function already documents above (a renamed Room's own recent
-      // plans are the common case and are covered via the cache path).
+      const addPlan = (id, data) => { if (!merged.has(id)) merged.set(id, { id, data }); };
+      spaceIdentityPlans.forEach((p) => addPlan(p.id, p.data));
+      byType.docs.forEach((d) => addPlan(d.id, d.data()));
+      byName.docs.forEach((d) => addPlan(d.id, d.data()));
+
+      // withLiveSpaceIdentity still does the same job it always has -
+      // re-stamping each candidate plan's transient spaceName from its
+      // live Space's displayName - it's just no longer the only path by
+      // which a live Space's own plan can reach this point.
       const resolvedRaw = resolveRecognitionCandidates(freshLabel, withLiveSpaceIdentity([...merged.values()], rooms));
       const resolved = await excludeRetiredCandidates(resolvedRaw);
       return finish(resolved.length ? "MATCH_FOUND" : "NO_MATCH", resolved);
