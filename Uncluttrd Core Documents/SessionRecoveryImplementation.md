@@ -284,3 +284,14 @@ flow with no distinguishing property.
 
 Metro production export clean. Client-only, so this ships by OTA to the
 staging channel with no Cloud Function deploy and no index change.
+
+Commit `09b8819`. Published to the `staging` branch:
+
+| Platform | Runtime version | Update group | Update ID |
+|---|---|---|---|
+| Android | `c266213e8d2ef2dcba1adcae706e94c1a1495fb8` | `8628fc8a-49ac-4b2a-a445-4f69bbf52387` | `019ff239-a690-732c-af0f-a85b6fa74bcb` |
+| iOS | `194c6294ae70b8bf34cd79c67f09187a2289a4a1` | `35a67783-574f-4108-8977-1bddd8f58b1c` | `019ff239-a690-7713-aa5c-d0a0e5dbe841` |
+
+Whether a device has actually pulled the update cannot be observed from
+here — the IDs above are what EAS reports as published, not what any
+handset is running.
