@@ -237,3 +237,17 @@ export would make the document disagree with the product. The fix belongs
 upstream in the analysis prompt. Note that plan predates the all-fields
 evidence rule, and no new-format plan has been created since it shipped,
 so whether current analyses still do this is untested.
+
+---
+
+## 9. Deployment
+
+Commit `bcdf13a`, published to `staging`:
+
+| Platform | Update group | Update ID |
+|---|---|---|
+| Android | `e543ef65-e0c4-4a1f-b0fd-08b167a554d1` | `019ff3c7-2870-7f1f-9067-3c61bb74a4b5` |
+| iOS | `a0ba0096-bc1d-499b-8689-a0d7ed4c574c` | `019ff3c7-2870-7b54-9c15-bbdc8623ff36` |
+
+Client-only; no Cloud Function deploy and no index change. Whether a device
+has pulled the update cannot be observed from here.
