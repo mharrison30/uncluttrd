@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated
+  TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -2641,8 +2641,16 @@ function DrawerIcon({ size = 38, dark = false }) {
 // require) - dropped in as the last child of each confirmation screen's
 // own <SafeAreaView>, so it sits on top of that screen's own content
 // without needing to touch the content itself.
+// pointerEvents="auto" is explicit, not decorative: this overlay's job is
+// as much to SWALLOW taps as to show a spinner. A View defaults to auto, so
+// this is documentation of intent rather than a behaviour change - the real
+// tap protection is the re-entry guard on the handler itself, because an
+// overlay that has not painted yet protects nothing.
 const ProcessingOverlay = ({ text = "Processing..." }) => (
-  <View style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(255,255,255,0.94)", alignItems: "center", justifyContent: "center", zIndex: 999 }}>
+  <View
+    pointerEvents="auto"
+    style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(255,255,255,0.94)", alignItems: "center", justifyContent: "center", zIndex: 999 }}
+  >
     <ActivityIndicator size="large" color={BRAND.green} />
     <Text style={{ marginTop: 14, fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink }}>{text}</Text>
   </View>
@@ -4188,12 +4196,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // roomConfirmation/recognitionPendingRef, so the user's selection stays
   // intact and "try again" re-attempts without re-doing confirmation.
   const [roomConfirmationSaving, setRoomConfirmationSaving] = useState(false);
+  // The overlay caption. One state instead of a hardcoded string because
+  // the confirmation flow has two genuinely different waits: saving the
+  // plan, and looking up the Room's existing Areas before the Area screen
+  // can show. Telling the user which one they are in is the whole point of
+  // having an overlay at all.
+  const [roomConfirmationText, setRoomConfirmationText] = useState("Setting up your plan...");
   const [roomConfirmationError, setRoomConfirmationError] = useState(null);
   // Holds { resolvedResult, sourceCandidate } for whichever action was
   // last attempted, so retryRoomConfirmation can re-invoke the exact same
   // completeRoomConfirmation call after a failure - a ref, not state,
   // since it doesn't need its own render.
   const lastRoomConfirmationAttemptRef = useRef(null);
+  // Synchronous tap guard for the Room confirmation actions. See
+  // completeRoomConfirmation for why this is a ref and not state.
+  const roomConfirmationInFlightRef = useRef(false);
   // Area Identity, Phase B (AreaRecognitionPhaseBImplementation.md): the
   // Area-level analog of roomConfirmation above - null when not showing,
   // else { status: "MATCH_FOUND" | "RECOGNITION_FAILED", candidates,
@@ -6157,6 +6174,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const completeRoomConfirmation = async (resolvedResult, sourceCandidate) => {
     const pending = recognitionPendingRef.current;
     if (!pending) return; // defensive - not reachable while the screen isn't showing
+    // Re-entry guard (on-device fix, 2026-08-12). A ref, not the
+    // roomConfirmationSaving state, because state is the thing that cannot
+    // be trusted here: setRoomConfirmationSaving(true) does not take effect
+    // until React re-renders, so two taps landing in the same frame BOTH
+    // passed a state check and both ran the whole save - creating the plan
+    // twice. A ref flips synchronously, so the second tap loses the race
+    // even if the overlay has not painted a single pixel yet.
+    if (roomConfirmationInFlightRef.current) return;
+    roomConfirmationInFlightRef.current = true;
     lastRoomConfirmationAttemptRef.current = { resolvedResult, sourceCandidate };
     setRoomConfirmationError(null);
     setRoomConfirmationSaving(true);
@@ -6180,13 +6206,27 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         const areasSnap = await getDocs(collection(db, "users", user.uid, "spaces", resolvedResult.canonicalSpaceId, "areas"));
         const existingAreas = areasSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((a) => !a.retired);
         if (existingAreas.length > 0) {
-          setRoomConfirmationSaving(false);
+          // THE "Existing Room" DELAY (on-device fix, 2026-08-12).
+          //
+          // The overlay used to be switched OFF on this line, immediately
+          // before beginAreaConfirmation - which compresses the photo and
+          // runs visual Area recognition through a Cloud Function. That is
+          // the multi-second gap the user hit: the spinner vanished and the
+          // screen sat there looking finished and unresponsive, so they
+          // tapped again. The overlay now stays up across that work and is
+          // cleared only once the Area confirmation screen is ready.
+          setRoomConfirmationText("Checking your areas...");
           await beginAreaConfirmation({
             roomId: resolvedResult.canonicalSpaceId,
             existingAreas,
             suggestedAreaName: confirmedPlan.areaName,
             saveContinuation: (areaIntent) => finishRoomConfirmationSave(resolvedResult, sourceCandidate, confirmedPlan, areaIntent),
           });
+          setRoomConfirmationSaving(false);
+          setRoomConfirmationText("Setting up your plan...");
+          // The user now acts on the Area screen, so this flow is no longer
+          // in flight and its guard must not stay latched.
+          roomConfirmationInFlightRef.current = false;
           return; // paused - Area confirmation screen now showing, nothing saved yet
         }
       } catch (e) {
@@ -6201,6 +6241,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setRoomConfirmationSaving(false);
       setRoomConfirmationError(e.message || "Something went wrong saving your plan. Please try again.");
       console.log("Room confirmation save error:", e.message);
+    } finally {
+      // Released on BOTH paths. On success the screen is gone and the guard
+      // is moot; on failure the retry affordance has to actually work, and
+      // a latched guard would make Retry a silent no-op - a worse bug than
+      // the one being fixed.
+      roomConfirmationInFlightRef.current = false;
     }
   };
 
@@ -7923,9 +7969,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // so neither branch duplicates the JSX itself.
   const renderRenameSheet = () => (
     <>
+      {/* Keyboard fix (on-device, iOS, 2026-08-12). The sheet is bottom-
+          anchored (renameSheetBackdrop is justifyContent: flex-end), so an
+          iOS keyboard covered the input and both buttons outright - the
+          user could not see what they were typing. KeyboardAvoidingView
+          with behavior="padding" lifts the card; "height" is used on
+          Android, where the window resizes instead.
+
+          The KAV wraps the WHOLE backdrop rather than just the card,
+          because the card is positioned by the backdrop's flex-end and
+          padding applied outside that has nothing to push against. */}
       <Modal visible={!!renamePlanTarget} animationType="slide" transparent onRequestClose={closeRenameSheet}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
         <View style={s.renameSheetBackdrop}>
-          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeRenameSheet} accessibilityLabel="Close" accessibilityRole="button" />
+          {/* Dismisses the KEYBOARD, not the sheet. Closing the sheet here
+              threw away whatever the user had typed the moment they tapped
+              anywhere to get the keyboard out of the way - Cancel is the
+              deliberate way out. */}
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => Keyboard.dismiss()} accessibilityLabel="Dismiss keyboard" accessibilityRole="button" />
           <View style={s.renameSheetCard}>
             <Text style={s.renameSheetTitle}>{renamePlanTarget?.kind === "area" ? "Rename Area" : "Rename Room"}</Text>
             <TextInput
@@ -7937,6 +7998,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               placeholderTextColor="#94A3B8"
               autoFocus
               editable={!renameSheetSaving}
+              returnKeyType="done"
+              onSubmitEditing={() => { if (renameSheetValue.trim() && !renameSheetSaving) handleSaveRename(); }}
             />
             {renameSuggestions().length > 0 && (
               <>
@@ -7964,6 +8027,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* Room Rename Validation (2026-08-10): shown INSTEAD OF an
@@ -8504,10 +8568,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // ---- Name entry, shared by "new Room" and "new Area" ----
   const renderClassifyNameSheet = () => {
     const isRoom = classifyStep === "name-room";
+    // Same keyboard treatment as renderRenameSheet - this is the other
+    // sheet in the app with a text input in a bottom-anchored card, so it
+    // had the identical iOS problem.
     return (
       <Modal visible={classifyStep === "name-room" || classifyStep === "name-area"} animationType="slide" transparent onRequestClose={closeClassify}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
         <View style={s.renameSheetBackdrop}>
-          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeClassify} accessibilityLabel="Close" accessibilityRole="button" />
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => Keyboard.dismiss()} accessibilityLabel="Dismiss keyboard" accessibilityRole="button" />
           <View style={s.renameSheetCard}>
             <Text style={s.renameSheetTitle}>{isRoom ? "Name this Room" : "Name this Area"}</Text>
             <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 14 }}>
@@ -8524,6 +8592,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               placeholderTextColor="#94A3B8"
               autoFocus
               editable={!classifySaving}
+              returnKeyType="done"
+              onSubmitEditing={() => { if (classifyName.trim() && !classifySaving) { isRoom ? submitNewRoomName() : runClassify(classifyRoom.id, null, classifyName.trim()); } }}
             />
             {classifyError && (
               <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
@@ -8544,6 +8614,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
     );
   };
@@ -10863,7 +10934,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           {area.evidenceReason && (
             <Text style={{ fontSize: 12, color: "#94A3B8", fontStyle: "italic", marginBottom: 10 }}>{area.evidenceReason}</Text>
           )}
-          <TouchableOpacity disabled={areaConfirmationSaving} style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: areaConfirmationSaving ? 0.6 : 1 }]} onPress={onConfirm}>
+          <TouchableOpacity disabled={areaConfirmationSaving} style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: areaConfirmationSaving ? 0.6 : 1 }]} onPress={onConfirm} disabled={roomConfirmationSaving}>
             <Text style={[s.startOverText, { color: "white" }]}>{confirmLabel}</Text>
           </TouchableOpacity>
         </View>
@@ -10894,7 +10965,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
-          {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {areaConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -10923,7 +10994,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={[s.startOverText, { color: "white" }]}>This is a new area</Text>
             </TouchableOpacity>
           </ScrollView>
-          {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {areaConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -10954,7 +11025,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </TouchableOpacity>
           )}
         </ScrollView>
-        {areaConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+        {areaConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
       </SafeAreaView>
     );
   }
@@ -11002,7 +11073,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             {days !== null ? `Last organized ${days} day${days === 1 ? "" : "s"} ago` : "Last organized a while ago"}
             {candidate.workSummary ? ` · ${candidate.workSummary}` : ""}
           </Text>
-          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onConfirm}>
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onConfirm} disabled={roomConfirmationSaving}>
             <Text style={[s.startOverText, { color: "white" }]}>{confirmLabel}</Text>
           </TouchableOpacity>
         </View>
@@ -11073,15 +11144,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 12 }}>You don't have any saved Rooms yet.</Text>
             )}
             {knownRooms.map((room) => (
-              <TouchableOpacity key={room.canonicalSpaceId} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10 }} onPress={() => onRoomPickerSelect(room)}>
+              <TouchableOpacity key={room.canonicalSpaceId} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10 }} onPress={() => onRoomPickerSelect(room)} disabled={roomConfirmationSaving}>
                 <Text style={{ fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.ink }}>{room.displayName}</Text>
               </TouchableOpacity>
             ))}
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11100,15 +11171,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               onChangeText={setRoomFreeformInput}
               placeholder={isParentFlavor ? "e.g. Kitchen" : "e.g. Guest Bedroom"}
               autoFocus
+              editable={!roomConfirmationSaving}
+              returnKeyType="done"
+              onSubmitEditing={() => { if (roomFreeformInput.trim() && !roomConfirmationSaving) onSubmitRoomFreeform(); }}
             />
-            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: roomFreeformInput.trim() ? 1 : 0.5 }]} disabled={!roomFreeformInput.trim()} onPress={onSubmitRoomFreeform}>
+            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0, opacity: roomFreeformInput.trim() ? 1 : 0.5 }]} disabled={!roomFreeformInput.trim() || roomConfirmationSaving} onPress={onSubmitRoomFreeform}>
               <Text style={[s.startOverText, { color: "white" }]}>Save</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={backToRoomConfirmationMain} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>← Back</Text>
             </TouchableOpacity>
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11128,11 +11202,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               confirmLabel={`Yes, this is my ${routing.candidate.displayName}`}
               onConfirm={() => completeRoomConfirmation(resolveExistingRoomConfirmation(routing.candidate, { areaName: pendingParsed?.suggestedAreaName ?? null, areaScope: pendingParsed?.areaScope || "whole-room" }), routing.candidate)}
             />
-            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC}>
+            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>No, this is a new room</Text>
             </TouchableOpacity>
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11153,11 +11227,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 onConfirm={() => completeRoomConfirmation(resolveExistingRoomConfirmation(candidate, { areaName: pendingParsed?.suggestedAreaName ?? null, areaScope: pendingParsed?.areaScope || "whole-room" }), candidate)}
               />
             ))}
-            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC}>
+            <TouchableOpacity style={s.mergeSecondaryBtn} onPress={declineToOutcomeC} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>None of these - it's a new room</Text>
             </TouchableOpacity>
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11179,34 +11253,34 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             {routing.outcome === "b3" && (
               <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 14 }}>Is it its own room, or part of an existing room?</Text>
             )}
-            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onOwnRoom}>
+            <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onOwnRoom} disabled={roomConfirmationSaving}>
               <Text style={[s.startOverText, { color: "white" }]}>{`${label} is its own Room`}</Text>
             </TouchableOpacity>
             {routing.firstTimeUser ? (
               <>
-                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-parent-zero")}>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-parent-zero")} disabled={roomConfirmationSaving}>
                   <Text style={s.mergeSecondaryBtnText}>Create the Room it belongs to</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-freeform-zero")}>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("b2-freeform-zero")} disabled={roomConfirmationSaving}>
                   <Text style={s.mergeSecondaryBtnText}>Enter a different Room name</Text>
                 </TouchableOpacity>
               </>
             ) : routing.plausibleParent ? (
               <>
-                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onInsideSpecificParent}>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onInsideSpecificParent} disabled={roomConfirmationSaving}>
                   <Text style={s.mergeSecondaryBtnText}>{`${label} is inside ${routing.plausibleParent.displayName}`}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)}>
+                <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)} disabled={roomConfirmationSaving}>
                   <Text style={s.mergeSecondaryBtnText}>Choose another Room</Text>
                 </TouchableOpacity>
               </>
             ) : (
-              <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)}>
+              <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker(insidePickerContext)} disabled={roomConfirmationSaving}>
                 <Text style={s.mergeSecondaryBtnText}>{`${label} is inside another Room`}</Text>
               </TouchableOpacity>
             )}
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11233,11 +11307,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <Text style={[s.startOverText, { color: "white" }]}>Choose an existing Room</Text>
               </TouchableOpacity>
             )}
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onAcceptSuggestedRoom}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={onAcceptSuggestedRoom} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>{`Continue as new: "${pendingParsed?.suggestedRoomName || "Room"}"`}</Text>
             </TouchableOpacity>
           </ScrollView>
-          {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+          {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
         </SafeAreaView>
       );
     }
@@ -11248,19 +11322,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <StatusBar barStyle="light-content" />
         <RoomConfirmationHeader title={`We think this is your ${pendingParsed?.suggestedRoomName || "room"}. Is that right?`} />
         <ScrollView contentContainerStyle={s.scrollContent}>
-          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onAcceptSuggestedRoom}>
+          <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onAcceptSuggestedRoom} disabled={roomConfirmationSaving}>
             <Text style={[s.startOverText, { color: "white" }]}>{`Yes, create "${pendingParsed?.suggestedRoomName || ""}"`}</Text>
           </TouchableOpacity>
           {knownRooms.length > 0 && (
-            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker("c-secondary")}>
+            <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomPicker("c-secondary")} disabled={roomConfirmationSaving}>
               <Text style={s.mergeSecondaryBtnText}>Actually, it's an existing Room</Text>
             </TouchableOpacity>
           )}
-          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("c-tertiary")}>
+          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 10 }]} onPress={() => openRoomFreeform("c-tertiary")} disabled={roomConfirmationSaving}>
             <Text style={s.mergeSecondaryBtnText}>Enter a different name</Text>
           </TouchableOpacity>
         </ScrollView>
-        {roomConfirmationSaving && <ProcessingOverlay text="Setting up your plan..." />}
+        {roomConfirmationSaving && <ProcessingOverlay text={roomConfirmationText} />}
       </SafeAreaView>
     );
   }
