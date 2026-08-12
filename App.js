@@ -25,7 +25,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, RefreshCw, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, Timestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
@@ -4039,6 +4039,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [vizModal, setVizModal] = useState(null); // holds the URL being viewed full-screen
   const [vizModalKey, setVizModalKey] = useState(0);
   const [vizLoading, setVizLoading] = useState({}); // keyed by tier id or approach id, see vizImage above
+  // Regeneration errors only. Initial generation still uses an Alert:
+  // there is no thumbnail to attach a message to when nothing exists yet.
+  const [vizError, setVizError] = useState({});
   // Two-Stage Analysis. detailRunning is keyed by planId (a background
   // resume for one plan must not paint a spinner on another); detailError
   // is scoped to the plan on screen, since that is the only one that has
@@ -7498,7 +7501,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // prompt - the edit call, compression, Storage upload, persistence - is
   // format-independent and deliberately shared: the two formats differ in
   // what they ask for, not in what happens to the image that comes back.
-  const generateVisualization = async (target) => {
+  const generateVisualization = async (target, { isRegeneration = false } = {}) => {
     if (!isPro) { setShowPaywall(true); return; }
     if (!photo?.uri) {
       Alert.alert("Photo unavailable", "We couldn't find the original photo for this room. Please reopen it from My Rooms and try again.");
@@ -7509,6 +7512,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // "elevated", which is what makes the three independent: generating
     // one writes vizImages.<thatId> and cannot touch the other two.
     const vizKey = isApproach ? target.approachId : target.id;
+    // The known-good image, captured BEFORE anything is attempted. It is
+    // what the thumbnail keeps showing throughout a regeneration, and the
+    // object deleted at the very end - only once its replacement is
+    // confirmed persisted.
+    const previousUrl = isRegeneration ? (vizImage[vizKey] || null) : null;
+    setVizError(prev => { const next = { ...prev }; delete next[vizKey]; return next; });
     setVizLoading(prev => ({ ...prev, [vizKey]: true }));
     startVizTips();
     try {
@@ -7579,28 +7588,71 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       } catch (compressErr) {
         console.log("Visualization compress/upload error:", compressErr.message);
         // finalUrl stays as the raw OpenAI image. Works for this session, just won't persist cheaply.
+        // For a REGENERATION that fallback is not acceptable: it would put a
+        // multi-megabyte data URI where a Storage URL belongs, and step 3 of
+        // the safe-replacement sequence has genuinely failed. Fail hard and
+        // keep the known-good image instead.
+        if (isRegeneration) throw new Error(`upload failed: ${compressErr.message}`);
       }
 
-      setVizImage(prev => ({ ...prev, [vizKey]: finalUrl }));
-      logEvent(getAnalytics(), "visualization_generated", { format: isApproach ? "approach" : "tier", vizKey });
-
+      // SAFE REPLACEMENT ORDER (VisualizationRegenerationImplementation.md
+      // §3). Firestore is written BEFORE the thumbnail changes, so what the
+      // user sees can never be ahead of what is recorded: an image on screen
+      // is always one they will still have after reopening the plan. The
+      // original generation used the opposite order, which was harmless when
+      // there was nothing to lose - but a regeneration has a known-good
+      // image at stake, so the ordering matters.
       if (currentPlanId) {
         try {
           // A dotted field path, so this is a targeted write to ONE key
           // inside vizImages - the other approaches' images are not read,
           // rewritten, or even present in the payload, which is what makes
           // "generate Polished, then Elevated" additive rather than a
-          // last-writer-wins overwrite of the map.
+          // last-writer-wins overwrite of the map. It is also what keeps a
+          // regeneration of one approach from disturbing the other two.
           await updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), { [`vizImages.${vizKey}`]: finalUrl });
           setHistory(prev => prev.map(h => h.id === currentPlanId ? { ...h, vizImages: { ...(h.vizImages || {}), [vizKey]: finalUrl } } : h));
         } catch (saveErr) {
           console.log("Save vizImage to plan error:", saveErr.message);
+          if (isRegeneration) throw new Error(`persist failed: ${saveErr.message}`);
         }
+      } else if (isRegeneration) {
+        // Nothing to replace against - refuse rather than swap the thumbnail
+        // for something that will not survive a reopen.
+        throw new Error("this plan isn't saved yet");
       } else {
         console.log("No currentPlanId yet. Visualization shown locally but not persisted to a saved plan.");
       }
+
+      // Step 5. Only now does the picture change.
+      setVizImage(prev => ({ ...prev, [vizKey]: finalUrl }));
+      logEvent(getAnalytics(), "visualization_generated", { format: isApproach ? "approach" : "tier", vizKey, regenerated: isRegeneration });
+
+      // Step 6, best effort and deliberately last. The regeneration is
+      // ALREADY successful by this point; an orphaned old object costs a
+      // few KB of Storage, while rolling back would cost the user the new
+      // image they just asked for. So this never throws and never reverts -
+      // it only logs, so the orphan is findable later.
+      if (isRegeneration && previousUrl && previousUrl !== finalUrl) {
+        try {
+          await deleteObject(storageRef(storage, previousUrl));
+          dlog(`[VIZ REGEN] old object deleted for ${vizKey}`);
+        } catch (cleanupErr) {
+          dlog(`[VIZ REGEN] old object cleanup FAILED for ${vizKey} (new image kept): ${cleanupErr.message}`);
+          logEvent(getAnalytics(), "visualization_cleanup_failed", { vizKey, reason: cleanupErr.message });
+        }
+      }
     } catch (e) {
-      Alert.alert("Visualization failed", e.message);
+      if (isRegeneration) {
+        // The old image is untouched in Storage, in Firestore and on screen -
+        // nothing above this point mutates any of them until the new one is
+        // fully persisted.
+        dlog(`[VIZ REGEN] failed for ${vizKey}, keeping existing image: ${e.message}`);
+        logEvent(getAnalytics(), "visualization_regenerate_failed", { vizKey, reason: e.message });
+        setVizError(prev => ({ ...prev, [vizKey]: "Couldn't regenerate. Tap to try again." }));
+      } else {
+        Alert.alert("Visualization failed", e.message);
+      }
     } finally {
       stopVizTips();
       setVizLoading(prev => ({ ...prev, [vizKey]: false }));
@@ -12047,6 +12099,43 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                               <Image source={{ uri: vizImage[id] }} style={s.vizImage} resizeMode="cover" />
                               <Text style={{ fontSize: 11, color: BRAND.mist, textAlign: "center", marginTop: 6, fontFamily: "Inter_400Regular" }}>Tap to view full screen</Text>
                             </TouchableOpacity>
+                            {/* Regeneration (§1/§2). The EXISTING thumbnail
+                                above stays mounted and visible throughout -
+                                this is the loading treatment placed BESIDE
+                                it, never in place of it, which is what makes
+                                "never lose the known-good visualization"
+                                true in the UI as well as in the data.
+                                Pro-gated by omission: a non-Pro user has no
+                                visualization here to regenerate, and the
+                                link is inside this branch. */}
+                            {vizLoading[id] ? (
+                              <View style={{ alignItems: "center", gap: 6, paddingVertical: 10 }}>
+                                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                                  <ActivityIndicator size="small" color={meta.color} />
+                                  <Text style={{ fontSize: 13, color: meta.color, fontFamily: "Inter_600SemiBold" }}>Creating your transformation...</Text>
+                                </View>
+                                <Text style={{ fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", paddingHorizontal: 8 }}>{VIZ_TIPS[vizTipIndex]}</Text>
+                              </View>
+                            ) : vizError[id] ? (
+                              <TouchableOpacity
+                                onPress={() => generateVisualization({ approachId: id, approach: a }, { isRegeneration: true })}
+                                style={{ alignItems: "center", paddingVertical: 10 }}
+                                accessibilityLabel="Retry regenerating this visualization"
+                                accessibilityRole="button"
+                              >
+                                <Text style={{ fontSize: 12, color: "#B91C1C", textAlign: "center" }}>{vizError[id]}</Text>
+                              </TouchableOpacity>
+                            ) : isPro ? (
+                              <TouchableOpacity
+                                onPress={() => generateVisualization({ approachId: id, approach: a }, { isRegeneration: true })}
+                                style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 10 }}
+                                accessibilityLabel={`Regenerate the ${meta.name} visualization`}
+                                accessibilityRole="button"
+                              >
+                                <RefreshCw size={13} color={BRAND.slate} strokeWidth={2.25} />
+                                <Text style={{ fontSize: 13, color: BRAND.slate, fontFamily: "Inter_400Regular" }}>Regenerate visualization</Text>
+                              </TouchableOpacity>
+                            ) : null}
                           </View>
                         ) : (
                           <TouchableOpacity
