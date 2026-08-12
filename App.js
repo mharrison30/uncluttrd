@@ -4024,6 +4024,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [faqOpen, setFaqOpen] = useState(null);
   const [vizImage, setVizImage] = useState({});
   const [currentPlanId, setCurrentPlanId] = useState(null); // Firestore doc id of the plan currently being viewed
+  // A ref mirror of currentPlanId, for async work that outlives the render
+  // it started in. runDetailCall awaits a ~50s network call and then has to
+  // decide whether the plan it just finished is still the one on screen;
+  // reading the state variable there reads whatever it was captured as when
+  // the function was created, which for a freshly created plan is null.
+  // See runDetailCall for the bug this caused.
+  const currentPlanIdRef = useRef(null);
+  useEffect(() => { currentPlanIdRef.current = currentPlanId; }, [currentPlanId]);
   // vizImage/vizLoading are keyed by tier id on an old-format plan and by
   // approach id ("simple"/"polished"/"elevated") on a new-format one. The
   // two vocabularies never coexist on a single plan - a plan has tiers or
@@ -5717,6 +5725,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           Alert.alert("We couldn't save your progress", "You may need to redo your last step.");
           return;
         }
+        // CALL 2 for the fourth creation path (audit, 2026-08-12). A free
+        // user who hit the paywall mid-analysis and then upgraded gets
+        // their plan written HERE, by a direct savePlanToHistory that no
+        // other Call 2 trigger covers - so their plan would have been born
+        // at "summary-ready" with nothing scheduled to finish it. Rarer
+        // than the Room-confirmation path, and it never surfaced in
+        // testing precisely because it needs a real upgrade to reach, but
+        // it is the same defect and it is fixed here rather than left to
+        // be rediscovered. Not awaited; the in-flight ref dedupes it
+        // against the launch sweep.
+        runDetailCall(planId, results);
         // savePlanToHistory only ever writes currentBatch fresh (every item
         // "pending") - backfill it with whatever the client already knows
         // actually happened (checked/carried/skipped items from this
@@ -5919,7 +5938,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     detailInFlightRef.current.add(planId);
     // Only surfaces in the UI for the plan currently on screen; a
     // background resume for some other plan must not paint this one.
-    if (planId === currentPlanId) setDetailError(null);
+    if (planId === currentPlanIdRef.current) setDetailError(null);
     setDetailRunning((prev) => ({ ...prev, [planId]: true }));
     const startedAt = Date.now();
     try {
@@ -5965,7 +5984,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // must not resurrect stale results.
       setHistory((prev) => prev.map((h) => (h.id === planId
         ? { ...h, approaches: withSpend.approaches, analysisStage: "complete" } : h)));
-      if (planId === currentPlanId) {
+      // currentPlanIdRef, NOT currentPlanId (fix, 2026-08-12). This is why
+      // a brand-new plan showed no detail even though Firestore said
+      // "complete": runDetailCall closes over currentPlanId from the render
+      // that created it, and on the create path that render happened before
+      // savePlanToHistory's setCurrentPlanId landed - so the captured value
+      // was still null from analyze()'s own reset. Fifty seconds later this
+      // comparison was `newPlanId === null`, false, and the screen was never
+      // told, leaving the Call 1 snapshot on display indefinitely while the
+      // document underneath it was finished. The ref always holds the live
+      // value, so the answer is about now rather than about then.
+      if (planId === currentPlanIdRef.current) {
         setResults((prev) => (prev ? { ...prev, approaches: withSpend.approaches, analysisStage: "complete" } : prev));
       }
       const elapsed = Date.now() - startedAt;
@@ -5978,7 +6007,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // The plan is untouched and still "summary-ready" - a failure here
       // costs the user nothing they already had, which is the entire point
       // of writing the summary first.
-      if (planId === currentPlanId) setDetailError(e.message || "Couldn't load the full details.");
+      if (planId === currentPlanIdRef.current) setDetailError(e.message || "Couldn't load the full details.");
       return { outcome: "failed", reason: e.message };
     } finally {
       detailInFlightRef.current.delete(planId);
