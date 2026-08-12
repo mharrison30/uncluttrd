@@ -6129,6 +6129,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     dlog(`[ROOM-FIRST] resolved confirmation persisted: ${JSON.stringify(resolvedResult)}, planId=${newPlanId}, areaIntent=${JSON.stringify(areaIntent)}`);
     logEvent(getAnalytics(), "room_confirmation_resolved", { outcome: resolvedResult.outcome });
 
+    // CALL 2 (Two-Stage Analysis). This was the bug: runDetailCall was only
+    // ever kicked off from finalizeAnalysisResult, and THIS path never calls
+    // it - finishRoomConfirmationSave writes the plan itself, via
+    // createReturningPlan or savePlanToHistory directly. So every plan
+    // created through Room confirmation (the whole generic-camera flow) was
+    // stranded at "summary-ready" with no detail, while plans from "Organize
+    // Another Area" completed normally, because that path does go through
+    // finalizeAnalysisResult. Not awaited - Results renders now and the
+    // detail lands underneath it.
+    //
+    // The stamp below matters just as much. setResults was handed
+    // confirmedPlan, which carries no analysisStage, so planAnalysisStage()
+    // read it as "complete" and the auto-resume effect - the backstop that
+    // should have caught this - bailed on every render. Stamping the
+    // in-memory object makes that effect a real universal safety net
+    // instead of dead code, for this path and any future one.
+    setResults((prev) => (prev ? { ...prev, analysisStage: "summary-ready" } : prev));
+    runDetailCall(newPlanId, confirmedPlan);
+
     // Point 3: welcome-back fires ONLY for a genuine returning
     // confirmation - the user explicitly said "yes, I'm returning," so
     // "Welcome back to your X" is honest, unlike Phase B's transitional
@@ -6371,7 +6390,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // confirmedPlan, which already carries spaceName.
     const resolvedRoomName = (rooms.find((r) => r.id === returningContext.spaceId) || {}).displayName
       || returningContext.spaceName || parsed.spaceName || null;
-    setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: resolvedRoomName });
+    setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: resolvedRoomName, analysisStage: "summary-ready" });
     logEvent(getAnalytics(), "plan_completed");
     setOrganizeAgainContext(null);
 
@@ -6865,7 +6884,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // visit, so returningContext.spaceId is the resolved Room here.
       const returningRoomName = (rooms.find((r) => r.id === returningContext.spaceId) || {}).displayName
         || returningContext.spaceName || parsed.spaceName || null;
-      setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: returningRoomName });
+      setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: returningRoomName, analysisStage: "summary-ready" });
       logEvent(getAnalytics(), "plan_completed");
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
       // returning visit (organizeAgainContext set) creates its plan via
