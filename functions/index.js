@@ -110,8 +110,24 @@ const CANARY_TEST_IMAGE_BASE64 = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAoHBwkHBgoJCA
 // midnight-their-timezone. Flagged as a deliberate choice, not an oversight.
 const currentMonthUTC = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
 
+// timeoutSeconds: 300 (2026-08-12). This function had no timeoutSeconds and
+// so inherited the 60s v2 default, which stopped being survivable once the
+// evidence-rule commits (7a55b48, bfea005) grew the prompt and the response
+// it asks for: every analysis attempt after them returned HTTP 504 at
+// exactly 60s, meaning no new plan could be created at all.
+//
+// Measured, not guessed: with the FULL 26k prompt but a one-line response
+// the call returns in 1.8s, versus 2.0s for a trivial prompt. Prompt length
+// costs essentially nothing - the whole cost is GENERATING the three-approach
+// JSON, so trimming instructions would not have helped. 300s matches
+// generateVisualization's own limit, chosen there for the same "genuinely
+// slow, not stuck" reason.
+//
+// Note this is a ceiling, not a target: the client's own httpsCallable
+// timeout and the user's patience both bind well before it. Two-stage
+// generation is the real fix for the latency; this stops the bleeding.
 exports.analyzePhoto = onCall(
-  { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
+  { secrets: [ANTHROPIC_KEY], maxInstances: 10, timeoutSeconds: 300 },
   async (request) => {
     const { imageBase64, prompt, analysisId, priorPhotoBase64 } = request.data || {};
 
