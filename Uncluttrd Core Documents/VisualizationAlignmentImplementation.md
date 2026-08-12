@@ -305,3 +305,100 @@ The Cloud Function was deployed **before** the evidence run, so (g1)–(g3)
 are observations of the live staging endpoint rather than of local source.
 Whether any device has pulled the client update cannot be observed from
 here — the IDs above are what EAS reports as published.
+
+---
+
+## Addendum — Evidence constraint on the image prompt (2026-08-11)
+
+### Device confirmation of §9's code-verified items
+
+Three visualizations were generated from a real device against the Dining
+Room plan shortly after the OTA (Storage objects timestamped 20:48:10,
+20:48:56 and 21:54:11), landing at `vizImages.simple`, `.elevated` and
+`.polished` on the user's own plan. That is (a), (h), (j) and (k) observed
+in the product rather than read off the source: the button rendered inside
+expanded approach cards, generated per approach, and wrote three
+independent keys. Those images were left in place.
+
+### The problem
+
+The visualizations were inventing ceiling pendants and chandeliers in a
+room with no visible ceiling electrical infrastructure — the same failure
+the evidence-constrained intervention rule already prevents in text.
+
+Two diagnostic findings:
+
+1. **The prompt was actively requesting them.** The stored
+   `visualizationDirection` read *"a clear table illuminated by a stylish
+   pendant light"* (Polished) and *"layered lighting from a statement
+   chandelier"* (Elevated), and that field is the prompt's primary
+   instruction. A third channel was also feeding fixtures in:
+   `productRecommendations` contained *"Pendant light fixture or
+   chandelier"* and *"Designer pendant light or chandelier with
+   professional installation"*.
+2. **There was no constraint at all.** `preserve` forbids *altering* the
+   ceiling and says nothing about *mounting something new* to it — a
+   direction naming a chandelier satisfies it completely.
+
+That plan was created at `15:13Z`; the all-fields evidence rule (which does
+name `visualizationDirection`) shipped at `17:05Z`, so it predates the fix.
+No new-format plan has been created since, so **whether the current
+analysis prompt still writes fixture requests into that field is unproven.**
+
+### What was tried, and what the measurements said
+
+Each variant was sampled on the real Dining Room photo. Compliance means no
+ceiling-mounted fixture in the output.
+
+| Variant | Polished | Elevated |
+|---|---|---|
+| The prohibition alone, as specified | 0/2 | 0/2 |
+| + affirmative ceiling statement, + sanitizing all three input channels | 0/3 | 3/3 |
+| + conditional outcome clause (final) | 2/2 | 2/2 |
+
+**The prohibition alone did not work.** With it present as the final
+instruction and the direction still asking for a pendant, the model
+returned a pendant, and a crystal chandelier where one was named. An image
+model resolves a contradiction in favour of the affirmative, concrete
+request, and naming a fixture inside a negation makes it *more* likely to
+appear. The only reliable way to not get a chandelier is to never ask for
+one.
+
+So `stripInfrastructureClaims` removes fixture requests from the three
+channels that carry them — `visualizationDirection`, `organizingGuidance`,
+and `productRecommendations` — at the point of use. It runs three passes,
+because one clause routinely carries both something wanted and something
+forbidden: *"a clear table illuminated by a stylish pendant light"* must
+lose the pendant and keep the clear table. Pass 1 strips the verb phrase
+(*"illuminated by …"*), pass 2 the bare prepositional form (*"with layered
+lighting from …"*, which must run second or it would swallow the clear
+table), pass 3 drops any whole clause still naming one.
+
+`itemsFound` is deliberately **not** sanitized. On another plan it reads
+*"recessed ceiling lights providing overhead illumination"* — that is an
+observation of a fixture that is genuinely there, and telling the model
+what already exists is how it knows what to preserve.
+
+Sanitizing alone still left Polished at 0/3. What closed it was making the
+constraint state an *outcome* conditional on the photo — *"If no hanging
+light fixture is visible on the ceiling in the original photo, then no
+hanging light fixture appears in the result and the space above the table
+remains open and empty"* — which gives the model something to render rather
+than only a concept to avoid.
+
+### Honest limits
+
+- 4/4 on the final build, on **one photo, one plan, two approaches**. This
+  is a prompt-level mitigation against a strong model prior ("dining table
+  → hanging light"), not a guarantee. Image generation is stochastic; a
+  larger sample or a different room may still produce a fixture.
+- Nothing verifies the output. A genuine guarantee needs a different
+  mechanism — a masked/inpainting edit that locks the ceiling region, or a
+  post-generation check — not a longer prompt.
+- The upstream analysis prompt is untested against this, per above.
+- Applied to the **approach prompt only**. The old-format tier prompt is
+  asserted byte-identical to its pre-refactor text by evidence (f1), and
+  changing what an old plan renders was not this fix's business. Extending
+  it there is one line.
+
+Client-only; no Cloud Function change, so this ships by OTA alone.

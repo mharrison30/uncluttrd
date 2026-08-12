@@ -6664,6 +6664,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
   const VIZ_PROMPT_FRAME = {
     preserve: "Keep the same room (the same walls, floor, window, door, ceiling, and architecture) exactly as shown in the photo. Do not invent a different room or change its layout, dimensions, or finishes.",
+    // The image-side half of the evidence-constrained intervention rule
+    // that already governs every generated TEXT field. `preserve` above is
+    // not sufficient and was never meant to be: it forbids ALTERING the
+    // ceiling, and says nothing about MOUNTING something new to it, so a
+    // visualizationDirection reading "layered lighting from a statement
+    // chandelier" satisfies it completely while producing exactly the
+    // fabricated infrastructure the text rule exists to prevent.
+    //
+    // Deliberately positioned as the LAST substantive instruction, after
+    // the direction, the guidance and the product list. It has to override
+    // all three - a "lighting" product recommendation can smuggle in a
+    // fixture just as easily as the direction can - and an image model
+    // weights later instructions more heavily than earlier ones.
+    // Leads with an affirmative statement of what the ceiling IS, because a
+    // purely negative rule performed worse in testing - stating the desired
+    // state gives the model something to render, where a prohibition only
+    // gives it a concept to avoid, which it is demonstrably bad at.
+    noNewInfrastructure: "The ceiling stays exactly as photographed, carrying only the light fixtures already visible in it. If no hanging light fixture is visible on the ceiling in the original photo, then no hanging light fixture appears in the result and the space above the table remains open and empty. Do not add ceiling-mounted light fixtures (pendants, chandeliers, ceiling fans), vaulted or altered ceilings, windows, doors, or any architectural/structural features not visible in the original photo. Only add items that could be placed on surfaces, hung on visible walls, or positioned on the floor without requiring new construction or electrical work.",
     style: "Photorealistic result, warm natural lighting, magazine-quality home organization photography. No text, no labels, no annotations, no callouts, no arrows, no watermarks, no overlays. No people.",
   };
   // Old-format (tiers). Byte-for-byte the prompt this function has always
@@ -6689,14 +6707,83 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // image model as a co-equal directive produces literal-minded results.
   // Product TYPES only, never searchTerms or reasons: the model needs to
   // know a tray may appear, not how to shop for one.
+  // Removes requests for ceiling-mounted infrastructure from text that is
+  // about to be handed to the image model.
+  //
+  // This exists because the prohibition alone measurably does not work.
+  // Tested on the real Dining Room photo: with noNewInfrastructure present
+  // as the final instruction, and the direction still reading "illuminated
+  // by a stylish pendant light", the model returned a pendant anyway - and
+  // a crystal chandelier for the approach whose direction named one. An
+  // image model resolves a contradiction in favour of the affirmative,
+  // concrete request, and naming a fixture even inside a negation makes it
+  // MORE likely to appear, not less. The only reliable way to not get a
+  // chandelier is to never ask for one.
+  //
+  // Two passes, because a single clause routinely carries both something
+  // wanted and something forbidden ("a clear table illuminated by a stylish
+  // pendant light" - the clear table is the point of the sentence):
+  //   1. strip the prepositional phrase that requests the fixture
+  //   2. drop any whole clause still naming one
+  const CEILING_INFRA_RE = /pendant|chandelier|ceiling fan|ceiling-mounted|ceiling light|ceiling fixture|track light|recessed light|flush mount|sconce/i;
+  const stripInfrastructureClaims = (text) => {
+    if (!text) return "";
+    // Pass 1: "illuminated by a stylish pendant light" -> removed, the rest
+    // of the clause survives.
+    let out = text.replace(
+      /,?\s*\b(?:illuminated|lit|brightened|crowned|topped|centered|anchored|highlighted|accented|washed)\b\s+(?:by|with|from|under|beneath)\s+[^,.;]*/gi,
+      (m) => (CEILING_INFRA_RE.test(m) ? "" : m)
+    );
+    // Pass 2: the bare prepositional form - "a dining room WITH layered
+    // lighting from a statement chandelier". Must run AFTER pass 1: on
+    // "a clear table illuminated by a stylish pendant light" this pattern
+    // would otherwise swallow the clear table along with the pendant,
+    // whereas by now pass 1 has already removed the offending phrase and
+    // what remains carries no fixture word to match on.
+    out = out.replace(
+      /,?\s*\b(?:with|featuring|including|plus)\b\s+[^,.;]*/gi,
+      (m) => (CEILING_INFRA_RE.test(m) ? "" : m)
+    );
+    // Pass 3: whole clauses that are themselves the request.
+    out = out
+      .split(/(?<=[,;])\s+|(?<=\.)\s+/)
+      .filter((clause) => !CEILING_INFRA_RE.test(clause))
+      .join(" ");
+    // Tidy the seams left by removal.
+    return out
+      .replace(/\s+/g, " ")
+      .replace(/\s+([,.;])/g, "$1")
+      .replace(/([,;])\s*([,.;])/g, "$2")
+      .replace(/,\s*(and\s+)?$/i, "")
+      .replace(/^\s*(and|with)\s+/i, "")
+      .trim()
+      .replace(/[,;]$/, ".");
+  };
+
   const buildApproachVizPrompt = (approachId, approach) => {
     const meta = APPROACH_META[approachId];
-    const direction = typeof approach.visualizationDirection === "string" ? approach.visualizationDirection.trim() : "";
-    const guidance = (approach.organizingGuidance || []).filter((g) => typeof g === "string" && g.trim()).slice(0, 4).join(" ");
+    const rawDirection = typeof approach.visualizationDirection === "string" ? approach.visualizationDirection.trim() : "";
+    // Sanitized at the point of use, never written back: the stored field
+    // is the AI's own output and is the record of what it said. Plans
+    // written before the all-fields evidence rule shipped still carry
+    // fixture requests in this field, and re-analysis is not on the table
+    // for a plan the user has already started working.
+    const direction = stripInfrastructureClaims(rawDirection);
+    // Same treatment for the two other channels a fixture can arrive
+    // through. A "pendant light" productType would otherwise be handed
+    // straight to the model as an item to add, and guidance regularly
+    // repeats the direction's own lighting language.
+    const guidance = (approach.organizingGuidance || [])
+      .filter((g) => typeof g === "string" && g.trim())
+      .map(stripInfrastructureClaims)
+      .filter(Boolean)
+      .slice(0, 4)
+      .join(" ");
     const productTypes = [...new Set(
       (approach.productRecommendations || [])
         .map((p) => (typeof p?.productType === "string" ? p.productType.trim() : ""))
         .filter(Boolean)
+        .filter((t) => !CEILING_INFRA_RE.test(t))
     )].join(", ");
     const itemsFound = normalizeItemsFound(results.itemsFound).join(", ");
     const spaceLabel = resolveVizSpaceLabel();
@@ -6714,6 +6801,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // Same reasoning as the tier prompt: without this the model tends to
       // empty the room rather than organize it.
       itemsFound ? `The space currently contains: ${itemsFound}. Organize these rather than removing them entirely unless the approach calls for it.` : "",
+      // Last, and after the product list, on purpose - see the note on
+      // noNewInfrastructure. Applied to the approach prompt only: the
+      // old-format tier prompt is asserted byte-identical to its
+      // pre-refactor text by evidence (f1), and silently changing what an
+      // old plan renders is not this fix's business. Extending it there is
+      // one line if old plans turn out to invent fixtures too.
+      VIZ_PROMPT_FRAME.noNewInfrastructure,
       VIZ_PROMPT_FRAME.style,
     ].filter(Boolean).join(" ");
   };
