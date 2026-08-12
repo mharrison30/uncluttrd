@@ -5103,6 +5103,63 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     return () => { cancelled = true; };
   }, [isPro, recoveryReloadKey]);
 
+  // ---- Two-Stage Analysis: background auto-heal on launch ----------------
+  // The per-plan auto-resume only fires when the user actually opens a
+  // stranded plan, so a plan whose Call 2 was missed sits incomplete until
+  // they happen to navigate to it. This sweeps them all once per sign-in,
+  // so by the time they open any of them the detail is already there.
+  //
+  // Deliberately sequential. Call 2 runs ~50s; firing N of them at once
+  // would compete with each other, with a fresh analysis the user might
+  // start right now, and with their connection. One at a time is slower in
+  // aggregate and invisible either way, since nothing waits on it.
+  //
+  // No UI at all: runDetailCall only touches detailError/results when the
+  // plan it is working on is the one on screen, and on launch that is
+  // nothing, so a background heal cannot paint a spinner or an error over
+  // whatever the user is actually doing.
+  //
+  // Keyed by uid rather than a boolean so signing out and back in re-arms
+  // it, but a re-render never does.
+  const detailSweepUidRef = useRef(null);
+  useEffect(() => {
+    if (!user?.uid) return;
+    if (detailSweepUidRef.current === user.uid) return;
+    detailSweepUidRef.current = user.uid;
+    let cancelled = false;
+    const sweep = async () => {
+      try {
+        const snap = await getDocs(query(
+          collection(db, "users", user.uid, "plans"),
+          where("analysisStage", "==", "summary-ready")
+        ));
+        // Newest first: the plan the user is most likely to open next is
+        // the one they just made.
+        const stranded = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((p) => p.retired !== true && p.approaches)
+          .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        if (!stranded.length) return;
+        dlog(`[TWO-STAGE SWEEP] ${stranded.length} stranded plan(s) to heal`);
+        for (const plan of stranded) {
+          if (cancelled) return;
+          // runDetailCall never throws - it returns an outcome - so one
+          // plan failing cannot abort the rest of the sweep. The in-flight
+          // ref makes this a no-op for a plan the Results screen is
+          // already healing.
+          const result = await runDetailCall(plan.id, plan);
+          dlog(`[TWO-STAGE SWEEP] ${plan.id} -> ${result?.outcome}`);
+        }
+      } catch (e) {
+        // A failed sweep is not worth surfacing: every plan it would have
+        // healed still heals when opened, via the per-plan effect.
+        dlog(`[TWO-STAGE SWEEP] failed: ${e.message}`);
+      }
+    };
+    sweep();
+    return () => { cancelled = true; };
+  }, [user?.uid]);
+
   // My Rooms -> True Room Grouping, Phase B: Room Detail's own plan list.
   // Verified against real staging data (merged + reclassified cases,
   // Phase B scoping pass Section 1) that a Room's full plan membership is
