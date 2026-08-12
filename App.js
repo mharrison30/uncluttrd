@@ -3080,8 +3080,8 @@ const SLIDES = [
   {
     icon: "✦",
     title: "Get Your Plan",
-    subtitle: "Three budgets, endless possibilities",
-    desc: "Receive a personalized step-by-step organization plan across Budget, Mid-Range, and Premium tiers. Or enter your exact budget.",
+    subtitle: "Three approaches, endless possibilities",
+    desc: "Receive three complete ways to transform the space, from a zero-cost tidy-up to a full redesign, each with its own checklist and recommendations.",
     bg: "#F3EEF9",
   },
   {
@@ -4305,7 +4305,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const LOAD_MESSAGES = [
     "Studying your space layout...",
     "Identifying what needs to stay and what can go...",
-    "Selecting storage solutions for your budget...",
+    "Selecting storage solutions...",
     "Building three options for your room...",
     "Almost ready...",
   ];
@@ -4323,9 +4323,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     if (loadTimer.current) clearInterval(loadTimer.current);
     setLoadMsg(0);
   };
-  const [tier, setTier] = useState("mid");
-  const [tierTouched, setTierTouched] = useState(false); // true once the user actually taps a tier pill
-  const [budget, setBudget] = useState("");
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [err, setErr] = useState(null);
@@ -6812,9 +6809,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       console.log("Photo base64 length:", imageBase64?.length);
       console.log("Photo mime:", photo.mimeType);
 
-      if (budget) {
-        logEvent(getAnalytics(), "custom_budget_entered", { amount: Number(budget) });
-      }
       logEvent(getAnalytics(), "plan_started");
 
       const analyzePhotoFn = httpsCallable(functions, "analyzePhoto");
@@ -7781,13 +7775,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
-  const getBestMatch = () => {
-    if (!budget || tierTouched) return null;
-    const b = parseFloat(budget);
-    if (b < 50) return "budget";
-    if (b <= 200) return "mid";
-    return "premium";
-  };
+
   const meta = (id) => TIERS.find(t => t.id === id) || TIERS[1];
 
   // A plan counts as an active Companion session worth surfacing on Home if the
@@ -8336,7 +8324,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // an in-progress one always has currentBatch.items) - so
   // setShowCompanion(hasCompanionContent) was landing on Companion
   // (results && showCompanion, ~5150) almost unconditionally, and Results
-  // (results && !showCompanion, ~4967) - where the actual budget tiers/
+  // (results && !showCompanion, ~4967) - where the actual approach cards/
   // product recommendations/visualization live - was becoming
   // unreachable from "View Full Plan" in practice. Root cause was this
   // conflation, not a missing navigation path - the Results screen itself
@@ -9197,7 +9185,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setBudget(""); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
   const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setRoomDetailRoomId(null); setResultsCameFromRoomDetail(null); setCompanionEnteredFromResults(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
@@ -10553,7 +10541,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and offers three different approaches to transforming it, each with its own guidance, first-session checklist, and product recommendations." },
       { q: "What can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
       { q: "What's the difference between the three approaches?", a: "They differ in ambition, not just price. Keep It Simple makes the space work and look noticeably better using what you already own. Polished & Practical solves the organization problems and finishes the space with a few targeted purchases. Elevated Finish is a full transformation, addressing every problem and every opportunity the photo shows. Open any approach to see its full guidance, checklist, and recommendations before you choose." },
-      { q: "Can I enter my own budget?", a: "Yes! Below the budget buttons you'll find a custom budget field. Enter any dollar amount and it's shown alongside your plan so you can weigh the three approaches against it." },
       { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
       { q: "What is the AI Visualization feature?", a: "After getting your organization plan, open any approach and tap 'See the transformation' to preview the result: an AI-created image showing what your space could look like under that approach. Each approach has its own visualization, so you can generate one, several, or all three and compare them. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
@@ -11732,41 +11719,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <View style={s.overviewCard}>
             <Text style={s.overviewText}>{results.overview}</Text>
           </View>
-          {budget ? (
-            <View style={s.budgetBanner}>
-              {/* "Best Match highlighted below" is a tier-era promise: the
-                  ⭐ Best Match badge is rendered by getBestMatch() inside
-                  the tier map, which a new-format plan never enters. The
-                  banner would otherwise point at a badge that does not
-                  exist on this screen. */}
-              <Text style={s.budgetBannerText}>
-                {results.approaches
-                  ? `💰 Your $${budget} budget. Compare the three approaches below.`
-                  : `💰 Based on your $${budget} budget. Best Match highlighted below.`}
-              </Text>
-            </View>
-          ) : null}
           {results.tiers?.map(t => {
             const m = meta(t.id);
-            const isSelectedTier = t.id === tier;
             return (
-              <View key={t.id} style={[s.tcard, { borderColor: isSelectedTier ? m.color : m.border }, isSelectedTier && { borderWidth: 2.5 }]}>
+              // Two badges used to sit in this header: "Best Match", driven by
+              // the retired budget field, and "Your Choice", driven by the
+              // retired tier pills. With the selector gone the first could
+              // never render and the second would have claimed every old
+              // plan chose Mid-Range, which the user never did. The tier
+              // card itself - label, range, suggestions, products - is
+              // untouched.
+              <View key={t.id} style={[s.tcard, { borderColor: m.border }]}>
                 <View style={[s.tcardHead, { borderBottomColor: m.border }]}>
                   <m.icon size={18} color={m.color} strokeWidth={2.25} />
                   <View style={[s.tcardPill, { backgroundColor: m.bg, borderColor: m.border }]}>
                     <Text style={[s.tcardPillText, { color: m.color }]}>{t.label}</Text>
                   </View>
                   <Text style={s.tcardRange}>{t.range}</Text>
-                  {getBestMatch() === t.id && (
-                    <View style={s.bestMatchBadge}>
-                      <Text style={s.bestMatchText}>⭐ Best Match</Text>
-                    </View>
-                  )}
-                  {isSelectedTier && (
-                    <View style={[s.bestMatchBadge, { backgroundColor: m.color }]}>
-                      <Text style={s.bestMatchText}>✓ Your Choice</Text>
-                    </View>
-                  )}
                 </View>
                 {t.suggestions?.map((sug, i) => (
                   <View key={i} style={s.step}>
@@ -12434,15 +12403,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
         </TouchableOpacity>
       </View>
-      {/* Keyboard audit (2026-08-12). The budget field sits near the bottom
-          of this scroll, so an iOS keyboard covered it and the Analyze
-          button below it. Three props, each doing a distinct job:
-          automaticallyAdjustKeyboardInsets lifts the content (iOS-only, and
-          a no-op elsewhere); keyboardShouldPersistTaps lets a tap on a
-          button register on the FIRST tap instead of being swallowed to
-          dismiss the keyboard; keyboardDismissMode gives a way out by
-          scrolling, which matters here because the field is keyboardType
-          "numeric" and the iOS number pad has no Return key at all. */}
+      {/* Keyboard audit (2026-08-12), kept after the budget field was
+          removed: these three props still matter for any future input on
+          this screen, and keyboardShouldPersistTaps in particular affects
+          every button here, not just text entry. */}
       <ScrollView
         ref={homeScrollRef}
         contentContainerStyle={s.scrollContent}
@@ -12538,45 +12502,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           ))}
         </View>
         <Text style={s.roomNote}>Don't see your space? No problem. Indoors or out, from a single drawer to a whole basement.</Text>
-
-        <Text style={s.sectionLabel}>CHOOSE YOUR BUDGET LEVEL</Text>
-        <View style={s.tiersRow}>
-          {TIERS.map(t => (
-            <TouchableOpacity key={t.id}
-              style={[s.tierBtn, tier === t.id && { borderColor: t.color, backgroundColor: t.bg }]}
-              accessibilityLabel={`Select ${t.label} tier`}
-              accessibilityRole="button"
-              accessibilityState={{ selected: tier === t.id }}
-              onPress={() => {
-                setTier(t.id);
-                setTierTouched(true);
-                logEvent(getAnalytics(), "tier_selected", { tier: t.id === "mid" ? "mid_range" : t.id });
-              }}>
-              {t.id === "mid" && <View style={s.popularBadgeTop}><Text style={s.popularBadgeText}>POPULAR</Text></View>}
-              <t.icon size={24} color={tier === t.id ? t.color : (t.id === "mid" ? "#C9A86A" : "#475569")} strokeWidth={2.5} style={{ marginBottom: 5 }} />
-              <Text style={[s.tierName, tier === t.id && { color: t.color }]}>{t.label}</Text>
-              <Text style={s.tierRange}>{t.range}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-        <Text style={s.tierHint}>All three plans are included. Your selected budget will simply be highlighted.</Text>
-
-        <View style={s.budgetRow}>
-          <Text style={s.budgetSign}>$</Text>
-          <TextInput
-            style={s.budgetInput}
-            placeholder="Specific budget (optional)"
-            placeholderTextColor={BRAND.mist}
-            value={budget}
-            onChangeText={setBudget}
-            keyboardType="numeric"
-          />
-          {budget.length > 0 && (
-            <TouchableOpacity onPress={() => setBudget("")} style={{ padding: 4 }}>
-              <X size={16} color={BRAND.mist} strokeWidth={2.25} />
-            </TouchableOpacity>
-          )}
-        </View>
 
         {err && <View style={[s.errBox, { flexDirection: "row", alignItems: "center", gap: 8 }]}><AlertTriangle size={16} color="#991B1B" strokeWidth={2.25} /><Text style={s.errText}>{err}</Text></View>}
 
@@ -12983,16 +12908,10 @@ const s = StyleSheet.create({
   roomIcon: { fontSize: 24, marginBottom: 4 },
   roomLabel: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.slate, textAlign: "center" },
   roomNote: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginBottom: 18 },
-  popularBadgeTop: { backgroundColor: BRAND.green, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, marginBottom: 6, alignSelf: "center" },
-  popularBadgeText: { fontSize: 8, fontFamily: "Inter_700Bold", color: "white", letterSpacing: 0.3 },
   photoHandwritten: { fontSize: 13, fontFamily: "Inter_500Medium", color: "#64748B", textAlign: "center", opacity: 0.9 },
-  tierHint: { fontSize: 13, fontFamily: "Inter_500Medium", color: BRAND.ink, textAlign: "center", marginTop: 12, marginBottom: 16 },
   sectionLabel: { fontSize: 12, fontFamily: "Inter_700Bold", letterSpacing: 0.8, color: BRAND.slate, marginBottom: 11 },
-  tiersRow: { flexDirection: "row", gap: 8, marginBottom: 0 },
-  tierBtn: { flex: 1, backgroundColor: BRAND.white, borderWidth: 1.5, borderColor: BRAND.stone, borderRadius: 13, padding: 12, alignItems: "center" },
   tierIcon: { fontSize: 17, marginBottom: 4 },
   tierName: { fontSize: 12, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 2 },
-  tierRange: { fontSize: 11, fontFamily: "Inter_400Regular", color: BRAND.mist },
   errBox: { backgroundColor: "#FEF2F2", borderWidth: 1, borderColor: "#FECACA", borderRadius: 8, padding: 13, marginBottom: 12 },
   errText: { color: "#991B1B", fontSize: 13, fontFamily: "Inter_400Regular" },
   ctaBtn: { backgroundColor: "#1E9E52", borderRadius: 20, height: 60, alignItems: "center", justifyContent: "center", marginTop: 8, shadowColor: "#1E9E52", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.18, shadowRadius: 12, elevation: 5 },
@@ -13279,14 +13198,7 @@ const s = StyleSheet.create({
   photoBtn: { flex: 1, backgroundColor: BRAND.white, borderWidth: 1.5, borderColor: BRAND.stone, borderRadius: 13, padding: 14, alignItems: "center", gap: 6 },
   photoBtnIcon: { fontSize: 24 },
   photoBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
-  budgetBanner: { backgroundColor: BRAND.greenLight, borderWidth: 1, borderColor: BRAND.greenMid, borderRadius: 8, padding: 10, paddingHorizontal: 14, marginBottom: 16 },
-  budgetBannerText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green },
-  bestMatchBadge: { backgroundColor: BRAND.green, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 10, marginLeft: 4 },
-  bestMatchText: { fontSize: 11, fontFamily: "Inter_700Bold", color: "white" },
   loadingBox: { backgroundColor: BRAND.white, borderRadius: 16, padding: 28, alignItems: "center", marginTop: 20, borderWidth: 1, borderColor: BRAND.stone },
-  budgetRow: { backgroundColor: BRAND.white, borderWidth: 1.5, borderColor: BRAND.stone, borderRadius: 13, padding: 13, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 16 },
-  budgetSign: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: BRAND.mist },
-  budgetInput: { flex: 1, fontSize: 15, fontFamily: "Inter_500Medium", color: BRAND.ink, padding: 0 },
   loadingMsg: { fontSize: 17, fontFamily: "Inter_700Bold", color: BRAND.ink, marginTop: 16, marginBottom: 6, textAlign: "center" },
   loadingHint: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.mist, textAlign: "center" },
   startOverText: { color: BRAND.green, fontSize: 16, fontFamily: "Inter_700Bold" },
