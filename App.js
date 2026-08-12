@@ -6544,6 +6544,86 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
+  // ---- Canonical Room/Area identity for exports (ApproachCompatibility §4)
+  // Share and PDF are artifacts the user sends to other people, so they
+  // must carry the names the user currently uses - not the label the AI
+  // wrote the day the photo was taken. Same precedence resolveResultsRoomName
+  // established for the Results header: live Space first, plan fields only
+  // as fallback when the Space is genuinely unavailable (deep link, or My
+  // Rooms not visited yet this session).
+  //
+  // Async because there is no loaded Area list at this point the way there
+  // is a loaded `rooms` list - roomDetailAreas is scoped to whichever Room
+  // the user last opened, which is frequently not this plan's Room. One
+  // document read is cheaper than keeping a second cache correct.
+  const resolveExportIdentity = async () => {
+    const roomName = resolveResultsRoomName(results, currentPlanId, rooms);
+    const roomId = results.canonicalSpaceId || currentPlanId;
+    const areaId = results.areaId || null;
+    let liveAreaName = null;
+    if (areaId && roomId && user?.uid) {
+      try {
+        const areaRef = doc(db, "users", user.uid, "spaces", roomId, "areas", areaId);
+        let snap = await getDoc(areaRef);
+        // An Area retired by a merge or a re-parent leaves a redirectTo
+        // breadcrumb. Followed exactly once: the plan's own areaId is
+        // repointed by those flows, so a chain here would mean something
+        // else is wrong, and looping on user data is never worth it.
+        if (snap.exists() && snap.data().retired === true && snap.data().redirectTo) {
+          const redirected = await getDoc(doc(db, "users", user.uid, "spaces", roomId, "areas", snap.data().redirectTo));
+          if (redirected.exists()) snap = redirected;
+        }
+        if (snap.exists() && snap.data().retired !== true) {
+          const dn = typeof snap.data().displayName === "string" ? snap.data().displayName.trim() : "";
+          if (dn) liveAreaName = dn;
+        }
+      } catch (e) {
+        dlog(`[EXPORT IDENTITY] area lookup failed for ${areaId}: ${e.message}`);
+      }
+    }
+    const areaName = liveAreaName
+      || (typeof results.areaName === "string" && results.areaName.trim() ? results.areaName.trim() : null);
+    return {
+      roomName,
+      areaName,
+      // The Area qualifies the Room, never replaces it - "Corner Shelf"
+      // alone is meaningless to whoever receives the share.
+      label: areaName ? `${roomName} · ${areaName}` : roomName,
+      liveAreaResolved: !!liveAreaName,
+    };
+  };
+
+  // Minimal HTML escaping for AI-authored text going into the PDF. The
+  // existing tier template interpolates raw, which has been harmless only
+  // because tier text happened never to contain markup - a single "&" or
+  // "<" in a product reason is enough to break the layout (test l).
+  const escHtml = (v) => String(v ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+  // Remote image -> inlined data URI, downscaled. Inlined rather than left
+  // as an https src because the print renderer fetches remote images on its
+  // own schedule and silently produces a blank box when it loses the race;
+  // a data URI is already there when layout runs. Returns null on ANY
+  // failure, which is what makes visualization optional content that can
+  // never block an export (§3, test k).
+  const imageToDataUri = async (url, width) => {
+    if (!url || typeof url !== "string") return null;
+    try {
+      let sourceUri = url;
+      if (/^https?:/i.test(url)) {
+        const local = FileSystem.cacheDirectory + `pdf_img_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`;
+        const dl = await FileSystem.downloadAsync(url, local);
+        sourceUri = dl.uri;
+      }
+      const out = await manipulateAsync(sourceUri, [{ resize: { width } }], { compress: 0.7, format: SaveFormat.JPEG, base64: true });
+      return out.base64 ? `data:image/jpeg;base64,${out.base64}` : null;
+    } catch (e) {
+      dlog(`[PDF IMAGE] skipped ${String(url).slice(0, 60)}: ${e.message}`);
+      return null;
+    }
+  };
+
   const generatePDF = async () => {
     if (!results) return;
     try {
@@ -6588,6 +6668,150 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
       const makeHeader = (pageBreak) => `
         <img src="${HEADER_IMG}" width="100%" style="display:block;width:100%;${pageBreak ? 'page-break-before:always;' : ''}"/>`;
+
+      // ---- New-format (approaches) PDF ------------------------------------
+      // A separate document, not a reskin of the tier one. The tier PDF is
+      // a catalogue: three priced options, all shown, because choosing was
+      // what the old Results screen asked the user to do afterwards. An
+      // approach plan has already been chosen inside the app, so its PDF is
+      // a brief for the approach the user committed to - and only falls
+      // back to a three-way comparison when nothing has been chosen yet.
+      const PDF_SHELL = {
+        css: `* { box-sizing:border-box; margin:0; padding:0; }
+          @page { size: letter; margin: 0; }
+          body { font-family:Inter,Arial,sans-serif; background:white; color:#0F2A52; margin:0; padding:0; }
+          .page { padding:4px 24px 24px 24px; }
+          .eyebrow { font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;margin-top:8px; }
+          .h1 { font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:10px; }
+          .note { background:#E6E9EE;border:1px solid #D7DCE3;border-radius:10px;padding:14px;margin-bottom:14px;font-size:13px;color:#64748B;line-height:1.6; }
+          .lbl { font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;margin:12px 0 6px 0; }
+          .prod { padding:8px 10px;background:#F4F6F8;border-radius:8px;margin-bottom:5px;font-size:12px; }
+          .prodname { font-weight:700;color:#0F2A52;display:block;margin-bottom:2px; }
+          .prodwhy { color:#64748B;line-height:1.5; }
+          .shot { width:100%;border-radius:10px;border:1px solid #D7DCE3;display:block;margin-bottom:6px; }
+          .cap { font-size:10px;color:#64748B;text-align:center;margin-bottom:12px; }
+          .foot { text-align:center;padding-top:12px;border-top:1px solid #D7DCE3;color:#64748B;font-size:10px; }`,
+        footer: `<div class="foot">Generated by Uncluttrd Pro &middot; More Space. More Time. More You. &middot; uncluttrd.app</div>`,
+      };
+
+      const buildApproachPdf = async () => {
+        const identity = await resolveExportIdentity();
+        const selectedId = results.selectedApproach || null;
+        const proTip = results.proTip
+          ? `<div style="background:#E6F7EE;border:1px solid #A8DDBF;border-radius:10px;padding:14px;margin-bottom:14px;">
+               <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;">&#9989; PRO TIP</div>
+               <div style="color:#166E38;font-size:13px;line-height:1.6;">${escHtml(results.proTip)}</div>
+             </div>`
+          : "";
+
+        // The original photo. Optional for exactly the same reason the
+        // visualization is: a plan whose photo has been cleaned up from
+        // Storage must still export.
+        const photoUri = await imageToDataUri(results.photoUrl, 1000);
+        const photoBlock = photoUri
+          ? `<img class="shot" src="${photoUri}"/><div class="cap">Your space today</div>`
+          : "";
+
+        const head = `${makeHeader(false)}
+          <div class="page">
+            <div class="eyebrow">${escHtml(identity.label)}</div>
+            <div class="h1">Your Organization Plan</div>
+            ${photoBlock}
+            <div class="lbl" style="margin-top:0;">What we noticed</div>
+            <div class="note">${escHtml(results.overview)}</div>`;
+
+        const productRows = (approach) => {
+          const items = (approach.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
+          if (!items.length) {
+            return `<div class="lbl">Recommended additions</div>
+                    <div class="prod"><span class="prodwhy">This approach uses what you already have.</span></div>`;
+          }
+          // Type + reason only. No price and no retailer link, deliberately:
+          // a shared PDF outlives the prices in it, and the affiliate search
+          // link is a live app affordance, not a document.
+          return `<div class="lbl">Recommended additions</div>` + items.map((item) => `
+            <div class="prod">
+              <span class="prodname">${escHtml(item.productType)}</span>
+              <span class="prodwhy">${escHtml(resolveRecommendationReason(item, results.problemsFound))}</span>
+            </div>`).join("");
+        };
+
+        if (selectedId && results.approaches?.[selectedId]) {
+          const a = results.approaches[selectedId];
+          const m = APPROACH_META[selectedId] || {};
+          const guidance = (a.organizingGuidance || [])
+            .filter((g) => typeof g === "string" && g.trim())
+            .map((g) => `<li style="margin-bottom:5px;font-size:13px;color:#0F2A52;line-height:1.55;">${escHtml(g)}</li>`)
+            .join("");
+          // Present tense on the local state first (this session's
+          // generation), then the persisted map, so a visualization made
+          // moments ago is in the PDF without waiting for a plan reload.
+          const vizUrl = vizImage[selectedId] || results.vizImages?.[selectedId] || null;
+          const vizUri = await imageToDataUri(vizUrl, 1000);
+          const vizBlock = vizUri
+            ? `<img class="shot" src="${vizUri}"/><div class="cap">${escHtml(m.name || selectedId)} &middot; AI visualization</div>`
+            : "";
+          return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>${PDF_SHELL.css}</style></head><body>
+            ${head}
+              <div style="border:1.5px solid ${m.border || "#D7DCE3"};border-radius:12px;padding:16px;margin-bottom:14px;background:white;">
+                <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid ${m.border || "#D7DCE3"};">
+                  <span style="background:${m.bg || "#E6E9EE"};color:${m.color || "#0F2A52"};border:1px solid ${m.border || "#D7DCE3"};padding:3px 12px;border-radius:20px;font-weight:700;font-size:12px;">${escHtml(m.name || selectedId)}</span>
+                </div>
+                <div style="font-size:13px;color:#0F2A52;line-height:1.6;">${escHtml(a.strategyDescription)}</div>
+                ${guidance ? `<div class="lbl">Organizing guidance</div><ul style="margin:0;padding-left:18px;">${guidance}</ul>` : ""}
+                ${productRows(a)}
+              </div>
+            </div>
+            ${makeHeader(true)}
+            <div class="page" style="padding-top:16px;">
+              ${vizBlock}
+              ${proTip}
+              ${PDF_SHELL.footer}
+            </div>
+          </body></html>`;
+        }
+
+        // Nothing committed yet: a comparison, at the depth the collapsed
+        // Results cards themselves show - name, strategy, key changes. Full
+        // guidance and products for all three would be three times the
+        // document for a decision the user has not made.
+        const cards = APPROACH_ORDER.map((id) => {
+          const a = results.approaches?.[id];
+          if (!a) return "";
+          const m = APPROACH_META[id] || {};
+          const changes = (a.keyChanges || [])
+            .filter((k) => typeof k === "string" && k.trim())
+            .slice(0, 4)
+            .map((k) => `<li style="margin-bottom:4px;font-size:12px;color:#0F2A52;line-height:1.5;">${escHtml(k)}</li>`)
+            .join("");
+          return `<div style="border:1.5px solid ${m.border || "#D7DCE3"};border-radius:12px;padding:14px;margin-bottom:10px;background:white;">
+              <span style="background:${m.bg || "#E6E9EE"};color:${m.color || "#0F2A52"};border:1px solid ${m.border || "#D7DCE3"};padding:3px 12px;border-radius:20px;font-weight:700;font-size:12px;">${escHtml(m.name || id)}</span>
+              <div style="font-size:12px;color:#0F2A52;line-height:1.6;margin-top:8px;">${escHtml(a.strategyDescription)}</div>
+              ${changes ? `<ul style="margin:8px 0 0 0;padding-left:18px;">${changes}</ul>` : ""}
+            </div>`;
+        }).join("");
+
+        return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>${PDF_SHELL.css}</style></head><body>
+          ${head}
+            <div class="lbl">Three ways to approach this</div>
+            ${cards}
+          </div>
+          ${makeHeader(true)}
+          <div class="page" style="padding-top:16px;">
+            <div class="note">Open this room in Uncluttrd to choose an approach and get its full checklist, product recommendations, and AI visualization.</div>
+            ${proTip}
+            ${PDF_SHELL.footer}
+          </div>
+        </body></html>`;
+      };
+
+      if (results.approaches) {
+        const approachHtml = await buildApproachPdf();
+        const out = await Print.printToFileAsync({ html: approachHtml, base64: false, width: 612, height: 792 });
+        logEvent(getAnalytics(), "pdf_exported", { format: "approach", selected: results.selectedApproach || "none" });
+        await Sharing.shareAsync(out.uri, { mimeType: "application/pdf", UTI: "com.adobe.pdf" });
+        return;
+      }
 
       const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
         <style>
@@ -6985,6 +7209,50 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const shareResults = async () => {
     if (!results) return;
     try {
+      // Format detection is presence-based, the same discriminator every
+      // other reader uses: a plan has approaches or tiers, never both.
+      if (results.approaches) {
+        const identity = await resolveExportIdentity();
+        const selectedId = results.selectedApproach || null;
+        const a = selectedId ? results.approaches[selectedId] : null;
+
+        let text = "✨ Uncluttrd Organization Plan\n";
+        text += "Room: " + identity.label + "\n\n";
+        text += "What we noticed\n" + results.overview + "\n\n";
+
+        if (a) {
+          const meta = APPROACH_META[selectedId] || {};
+          text += `--- ${meta.name || selectedId} ---\n`;
+          if (a.strategyDescription) text += a.strategyDescription + "\n";
+          const guidance = (a.organizingGuidance || []).filter((g) => typeof g === "string" && g.trim());
+          if (guidance.length) {
+            text += "\nOrganizing guidance:\n";
+            guidance.forEach((g, i) => { text += (i + 1) + ". " + g + "\n"; });
+          }
+          // Type and reason only - no price, no retailer link. Prices are
+          // not on the recommendation schema at all any more, and the
+          // affiliate search is a live app affordance rather than something
+          // that belongs in a message someone forwards.
+          const products = (a.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
+          if (products.length) {
+            text += "\nRecommended additions:\n";
+            products.forEach((p) => {
+              text += "• " + p.productType + " - " + resolveRecommendationReason(p, results.problemsFound) + "\n";
+            });
+          }
+          text += "\n";
+        } else {
+          // Nothing chosen yet. Sharing one arbitrary approach here would
+          // misrepresent a decision the user has not made.
+          text += "Three organizing approaches available in the app.\n\n";
+        }
+
+        if (results.proTip) text += "💡 Pro Tip: " + results.proTip + "\n";
+        text += "\nGenerated by Uncluttrd. More Space. More Time. More You.";
+        await Share.share({ message: text, title: "My Uncluttrd Organization Plan" });
+        return;
+      }
+
       let text = "✨ Uncluttrd Organization Plan\n";
       text += "Room: " + getSpaceDisplayName(results) + "\n\n";
       text += results.overview + "\n\n";
