@@ -402,3 +402,17 @@ than only a concept to avoid.
   it there is one line.
 
 Client-only; no Cloud Function change, so this ships by OTA alone.
+
+Commit `307dc31`, published to `staging`:
+
+| Platform | Update group | Update ID |
+|---|---|---|
+| Android | `a00f46cf-c270-4f44-bdca-1edfd7c800fd` | `019ff3af-3327-7b37-aa3e-697cce1e37ff` |
+| iOS | `f549af49-c5fd-4fe0-9021-17e07daed718` | `019ff3af-3327-71a0-b4ec-a057d631f580` |
+
+Existing visualizations are not regenerated. The three images already on the
+Dining Room plan were produced before this change and still show the
+fixtures; tapping "See the transformation" again is what produces a
+compliant one, and there is currently no way to regenerate over an existing
+image from the UI (the button is replaced by the thumbnail once a
+visualization exists). That is a real gap, not a deliberate choice.
