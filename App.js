@@ -4157,6 +4157,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // durable commitment only happens via handleStartThisPlan.
   const [previewApproach, setPreviewApproach] = useState(null);
   const [startingPlan, setStartingPlan] = useState(false);
+  // Approach switching (Section 6). switchPickerOpen re-opens the three
+  // cards as a chooser; switchingApproach is the id being applied, so only
+  // the tapped card shows a spinner.
+  const [switchPickerOpen, setSwitchPickerOpen] = useState(false);
+  const [switchingApproach, setSwitchingApproach] = useState(null);
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1): set by
   // startOrganizeAgain when the user taps "Organize Again" from either
   // entry point (History row, Space Detail's own button) - carries the
@@ -7650,6 +7655,110 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     } finally {
       stopVizTips();
       setVizLoading(prev => ({ ...prev, [vizKey]: false }));
+    }
+  };
+
+
+  // ---- Approach switching (ApproachSelectionDesign.md Section 6) ---------
+  // Core rule: changing approach changes the FUTURE, not the past.
+  //
+  // State is derived, never stored, so it cannot go stale against the batch
+  // it describes:
+  //   none   - nothing selected yet; the initial chooser handles this
+  //   state2 - selected, but every item is still untouched. Trivial.
+  //   state3 - ANY item is checked, carried or skipped. Skipped counts:
+  //            it is a deliberate user action and must be archived
+  //            truthfully rather than silently dropped.
+  //   state4 - the visit is finished. The approach is history; a new one is
+  //            chosen by starting a fresh visit.
+  const liveBatchItems = () => (batchItems.length ? batchItems : (results?.currentBatch?.items || []));
+  const approachSwitchState = () => {
+    if (!results?.approaches || !results.selectedApproach) return "none";
+    if (results.companionComplete || companionCompletedProject) return "state4";
+    return liveBatchItems().some((i) => i.status && i.status !== "pending") ? "state3" : "state2";
+  };
+
+  const switchApproach = async (newApproachId) => {
+    if (!currentPlanId || !results?.approaches?.[newApproachId] || switchingApproach) return;
+    // Tapping the approach you are already on is a dismissal, not a switch.
+    if (newApproachId === results.selectedApproach) { setSwitchPickerOpen(false); return; }
+    const state = approachSwitchState();
+    if (state === "state4") return;
+    setSwitchingApproach(newApproachId);
+    try {
+      const liveItems = liveBatchItems();
+      // THE DISPOSITION RULE, in one place:
+      //   checked  -> already permanent in the archived batch; not repeated
+      //   carried  -> survives verbatim, same item id. The user said "still
+      //               working on this"; that is invested effort, closer to
+      //               completed than to a fresh suggestion
+      //   pending  -> retired with the old approach. These belong to the old
+      //               approach's guidance, and the new batch is composed
+      //               fresh from the new approach's own checklist
+      //   skipped  -> stays skipped in history, never reintroduced
+      const carried = liveItems.filter((i) => i.status === "carried");
+      const newTasks = (results.approaches[newApproachId].taskChecklist || [])
+        .filter((t) => typeof t === "string" && t.trim())
+        .map((text) => ({ id: makeItemId(), text, status: "pending" }));
+      // Carried first, matching the ordering the existing rotation already
+      // uses - continuing work reads above newly suggested work.
+      const composedItems = [...carried, ...newTasks];
+
+      // Archive ONLY in state 3. In state 2 nothing happened, so writing a
+      // batch of untouched items into batchHistory would invent a chapter
+      // of history the user never lived.
+      const currentIndex = companionBatchIndex || results.currentBatch?.batchIndex || 1;
+      const shouldArchive = state === "state3" && liveItems.length > 0;
+      const archivedBatch = shouldArchive
+        ? { batchIndex: currentIndex, items: liveItems, completedAt: new Date().toISOString() }
+        : null;
+      // Same shape generateNextAction writes. Not a new mechanism - an
+      // early, user-triggered rotation without the progress-photo step,
+      // because the user is changing direction, not reporting progress.
+      const newBatchIndex = shouldArchive ? currentIndex + 1 : currentIndex;
+      const newBatch = { batchIndex: newBatchIndex, suggestedAt: new Date().toISOString(), items: composedItems };
+      const historyEntry = { approach: newApproachId, selectedAt: Timestamp.now() };
+
+      await updateDoc(doc(db, "users", user.uid, "plans", currentPlanId), {
+        selectedApproach: newApproachId,
+        approachHistory: arrayUnion(historyEntry),
+        ...(archivedBatch ? { batchHistory: arrayUnion(archivedBatch) } : {}),
+        currentBatch: newBatch,
+        shadowSourceVersion: increment(1),
+      });
+      syncPlanToSpaceGraph(user.uid, currentPlanId)
+        .catch((e) => dlog(`[APPROACH SWITCH] shadow resync failed for ${currentPlanId}: ${e.message}`));
+
+      setResults((prev) => (prev ? {
+        ...prev,
+        selectedApproach: newApproachId,
+        approachHistory: [...(prev.approachHistory || []), historyEntry],
+        ...(archivedBatch ? { batchHistory: [...(prev.batchHistory || []), archivedBatch] } : {}),
+        currentBatch: newBatch,
+      } : prev));
+      setHistory((prev) => prev.map((h) => (h.id === currentPlanId ? {
+        ...h,
+        selectedApproach: newApproachId,
+        approachHistory: [...(h.approachHistory || []), historyEntry],
+        ...(archivedBatch ? { batchHistory: [...(h.batchHistory || []), archivedBatch] } : {}),
+        currentBatch: newBatch,
+      } : h)));
+      setBatchItems(composedItems);
+      setCompanionBatchIndex(newBatchIndex);
+      // The new approach becomes the expanded card, so returning to Results
+      // shows what is now in effect rather than what used to be.
+      setPreviewApproach(newApproachId);
+      setSwitchPickerOpen(false);
+      dlog(`[APPROACH SWITCH] ${results.selectedApproach} -> ${newApproachId} (${state}), carried ${carried.length}, new ${newTasks.length}, archived=${!!archivedBatch}`);
+      logEvent(getAnalytics(), "approach_switched", {
+        planId: currentPlanId, from: results.selectedApproach, to: newApproachId,
+        state, carried: carried.length, archived: !!archivedBatch,
+      });
+    } catch (e) {
+      console.log("Approach switch error:", e.message);
+      Alert.alert("Couldn't change approach", "Please check your connection and try again.");
+    } finally {
+      setSwitchingApproach(null);
     }
   };
 
@@ -11812,27 +11921,44 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               {/* Item 5: once an approach is committed, the section stops
                   asking a question and starts reporting an answer. The
                   other cards stay present and expandable for reference -
-                  the user can still read what they didn't pick - but the
-                  heading no longer implies the decision is open. "Change
-                  approach" is a deliberate placeholder this phase; approach
-                  switching has real consequences for an in-flight
-                  Companion batch and is its own piece of work. */}
+                  the user can still read what they didn't pick.
+                  "Change approach" is now live (Section 6). It is hidden in
+                  state 4: once the visit is finished the approach is
+                  history, and a new one is chosen by starting a fresh
+                  visit rather than by rewriting a closed one. */}
               {results.selectedApproach ? (
                 <View style={s.approachChosenRow}>
                   <Text style={s.approachChosenText} numberOfLines={1}>
-                    {`Your approach: ${APPROACH_META[results.selectedApproach]?.name || results.selectedApproach}`}
+                    {switchPickerOpen
+                      ? "Choose a different approach"
+                      : `Your approach: ${APPROACH_META[results.selectedApproach]?.name || results.selectedApproach}`}
                   </Text>
+                  {approachSwitchState() !== "state4" && (
                   <TouchableOpacity
-                    onPress={() => Alert.alert("Coming soon", "Switching to a different approach will be available in a future update.")}
-                    accessibilityLabel="Change approach"
+                    onPress={() => setSwitchPickerOpen((v) => !v)}
+                    accessibilityLabel={switchPickerOpen ? "Cancel changing approach" : "Change approach"}
                     accessibilityRole="button"
                     style={{ paddingVertical: 4, paddingLeft: 10 }}
                   >
-                    <Text style={s.approachChangeLink}>Change approach</Text>
+                    <Text style={s.approachChangeLink}>{switchPickerOpen ? "Cancel" : "Change approach"}</Text>
                   </TouchableOpacity>
+                  )}
                 </View>
               ) : (
                 <Text style={s.sectionLabel}>HOW WOULD YOU LIKE TO APPROACH THIS?</Text>
+              )}
+              {/* State 3 confirmation (Section 6). Deliberately not a modal
+                  Alert: the decision needs the three cards visible to
+                  browse, so the warning sits above them and selecting a
+                  different card IS the confirmation. Tapping the current
+                  card, or Cancel, dismisses without changing anything. */}
+              {switchPickerOpen && approachSwitchState() === "state3" && (
+                <View style={{ backgroundColor: "#FFFBEB", borderWidth: 1, borderColor: "#FDE68A", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                  <Text style={{ fontSize: 15, fontFamily: "Inter_700Bold", color: "#92400E", marginBottom: 6 }}>Change approach?</Text>
+                  <Text style={{ fontSize: 13, color: "#B45309", lineHeight: 19 }}>
+                    Your completed work will stay in your history. Unfinished tasks from your current approach will be replaced with the new approach's plan.
+                  </Text>
+                </View>
               )}
               {APPROACH_ORDER.map((id) => {
                 const a = results.approaches?.[id];
@@ -11901,6 +12027,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                         <View style={[s.approachPill, { backgroundColor: meta.bg, borderColor: meta.border }]}>
                           <Text style={[s.approachPillText, { color: meta.color }]}>{meta.name}</Text>
                         </View>
+                        {/* Which one is in effect, marked on the card
+                            itself rather than only in the heading, so it is
+                            still answerable while browsing the others. */}
+                        {results.selectedApproach === id && (
+                          <View style={{ backgroundColor: meta.color, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 9, marginLeft: 6 }}>
+                            <Text style={{ fontSize: 10, fontFamily: "Inter_700Bold", color: "white", letterSpacing: 0.3 }}>CURRENT</Text>
+                          </View>
+                        )}
                         {/* Results Polish item 1: the estimated spend range
                             is deliberately NOT rendered. The deterministic
                             scope x approach table (SCOPE_SPEND_TABLE) still
@@ -12153,6 +12287,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                           >
                             <Text style={s.approachStartBtnText}>
                               {startingPlan ? "Starting..." : `Start with ${meta.name} →`}
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                        {/* The same button becomes the switch action once
+                            the chooser is open, on the cards that are not
+                            already current. Selecting IS the confirmation -
+                            the warning above the cards has already been
+                            read by then in state 3. */}
+                        {switchPickerOpen && results.selectedApproach && results.selectedApproach !== id && (
+                          <TouchableOpacity
+                            style={[s.approachStartBtn, { backgroundColor: switchingApproach ? BRAND.stone : meta.color }]}
+                            onPress={() => switchApproach(id)}
+                            disabled={!!switchingApproach}
+                            accessibilityLabel={`Switch to ${meta.name}`}
+                            accessibilityRole="button"
+                          >
+                            <Text style={s.approachStartBtnText}>
+                              {switchingApproach === id ? "Switching..." : `Switch to ${meta.name} →`}
                             </Text>
                           </TouchableOpacity>
                         )}
