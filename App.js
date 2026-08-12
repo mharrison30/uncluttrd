@@ -10626,7 +10626,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        {/* Staging-only inspector. Same keyboard props as Home: its uid/planId
+            fields sit above a Load button, and without persistTaps the first
+            tap on that button is swallowed dismissing the keyboard. */}
+        <ScrollView
+          contentContainerStyle={s.scrollContent}
+          automaticallyAdjustKeyboardInsets
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+        >
           <SectionCard title="Lookup">
             <TextInput
               style={{ borderWidth: 1, borderColor: "#D7DCE3", borderRadius: 10, padding: 10, fontSize: 14, marginBottom: 8, color: "#0F2A52" }}
@@ -10795,7 +10803,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         </ScrollView>
 
           {/* Delete Account Password Modal */}
+          {/* Keyboard audit (2026-08-12). Centred rather than bottom-
+              anchored, so it is less exposed than the sheets - but "less"
+              is not "not": the card is centred in the FULL screen height,
+              and an iOS keyboard covers roughly the bottom 40%, which on a
+              smaller device reaches the password field and the buttons
+              under it. KAV recentres it in the space that is actually
+              left. This modal is also the one place where not being able
+              to see the field is worst, since the text is obscured. */}
           <Modal visible={showDeleteModal} transparent={true} animationType="fade" onRequestClose={() => setShowDeleteModal(false)}>
+            <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
             <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.6)", justifyContent: "center", alignItems: "center", padding: 24 }}>
               <View style={{ backgroundColor: "white", borderRadius: 20, padding: 28, width: "100%", maxWidth: 360 }}>
                 <Text style={{ fontSize: 20, fontWeight: "700", color: "#0F2A52", marginBottom: 8 }}>Confirm Deletion</Text>
@@ -10851,6 +10868,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   button's own inline spinner. */}
               {deleteLoading && <ProcessingOverlay text="Deleting your account..." />}
             </View>
+            </KeyboardAvoidingView>
           </Modal>
 
       </SafeAreaView>
@@ -12178,7 +12196,22 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
         </TouchableOpacity>
       </View>
-      <ScrollView ref={homeScrollRef} contentContainerStyle={s.scrollContent}>
+      {/* Keyboard audit (2026-08-12). The budget field sits near the bottom
+          of this scroll, so an iOS keyboard covered it and the Analyze
+          button below it. Three props, each doing a distinct job:
+          automaticallyAdjustKeyboardInsets lifts the content (iOS-only, and
+          a no-op elsewhere); keyboardShouldPersistTaps lets a tap on a
+          button register on the FIRST tap instead of being swallowed to
+          dismiss the keyboard; keyboardDismissMode gives a way out by
+          scrolling, which matters here because the field is keyboardType
+          "numeric" and the iOS number pad has no Return key at all. */}
+      <ScrollView
+        ref={homeScrollRef}
+        contentContainerStyle={s.scrollContent}
+        automaticallyAdjustKeyboardInsets
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
         <Text style={s.welcomeText}>Hi, {user.displayName?.split(' ')[0] || "there"}</Text>
         <Text style={s.heroH1}>Turn Clutter{"\n"}Into Calm</Text>
         <Text style={s.heroP}>Take a photo of any space and get personalized recommendations for every budget.{"\n"}Results in seconds.</Text>
