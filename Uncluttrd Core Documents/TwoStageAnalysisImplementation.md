@@ -161,3 +161,106 @@ whole thing.
   the detail call is now a thing that can be quietly failing for a subset of
   users. `analysis_detail_failed` is logged with reason and retry flag.
 - **Not device-verified.** The six render/lifecycle tests above.
+
+---
+
+## 7. Addendum — Call 1 output optimization (2026-08-12)
+
+### Field audit
+
+Every field Call 1 generates, checked against its actual consumers in code.
+"Required before Results" means the Results screen cannot render correctly
+without it. Percentages are measured from the three baseline responses.
+
+| Field | Required before Results | Consumed by Room/Area confirmation | Persisted | % of output | Verdict |
+|---|---|---|---|---|---|
+| `itemsFound` | no | no | **yes** | 25.6% | **keep** — Call 2's entire evidence base, plus the visualization prompt |
+| `approaches.*.strategyDescription` | **yes** | no | **yes** | 25.0% | **keep** — collapsed card |
+| `problemsFound` | **yes** | no | **yes** | 15.4% | **keep** — `relatedProblemIds` link to it |
+| `overview` | **yes** | no | **yes** | 6.9% | **keep** — "What we noticed" |
+| `approaches.*.keyChanges` | **yes** | no | **yes** | 6.3% | **keep** — collapsed card |
+| `proTip` | yes (renders on Results) | no | **yes** | 4.8% | **keep** — considered and rejected, see below |
+| `approaches.*.suggestedAdditionTypes` | **yes** | no | **yes** | 3.5% | **keep** — collapsed card preview |
+| `areaReason` | no | **no** | **no** | 2.7% | **REMOVE** |
+| `roomReason` | no | **no** | **no** | 1.7% | **REMOVE** |
+| `suggestedRoomName` | no | **yes** | yes (as `spaceType`) | 0.2% | **keep** |
+| `areaScope` | no | **yes** | **yes** | 0.2% | **keep** |
+| `scopeSize` | no | no | **yes** | 0.2% | **keep** — drives spend ranges |
+| `suggestedAreaName` | no | **yes** | **yes** | 0.1% | **keep** |
+
+### The two known candidates, confirmed
+
+The Room/Area confirmation flow reads **only** `suggestedRoomName`,
+`suggestedAreaName` and `areaScope`. `roomReason` and `areaReason` appear
+nowhere in `shared/spaceMigration.js` — which is where
+`routeRoomConfirmation` and both resolvers live — nowhere in `scripts/`, and
+nowhere in `functions/`. In `App.js` they appeared in the prompt, in five
+comments, and in **one** dev-only `dlog`. Never persisted, never rendered.
+
+Was that logging worth the latency? No — though it turned out to be worth
+less than expected, see below. **No other field is in the same category:**
+every remaining one is either rendered, persisted, or read by Call 2.
+
+**`proTip` was considered and rejected.** At 4.8% it is larger than both
+removed fields combined, and it is not strictly required *before* Results —
+it renders below the approach cards. Moving it to Call 2 would have saved
+more than the removal did. It was left alone deliberately: it is real
+content the user sees, relocating it would make it pop in late, and that is
+exactly the "removing useful content to chase the number" the task warned
+against.
+
+### What was removed
+
+1. The two keys from `SUMMARY_JSON_TAIL`.
+2. The one sentence in `roomAreaInstruction` requiring the justifications to
+   be written out.
+3. The `dlog` reference.
+
+**Not removed:** the three-question ordering and the self-consistency check
+in `roomAreaInstruction` both stay. Only the requirement to *emit* the
+justification is gone. That distinction mattered — writing a justification
+can act as a reasoning forcing-function — so classification quality was
+re-verified rather than assumed.
+
+### Re-measurement, and why the first result was not the real one
+
+| Photo | Pre-trim | Optimized run 1 | Optimized run 2 |
+|---|---|---|---|
+| dining-room | 33.9s | 32.5s | — |
+| kitchen-diner | 30.7s | 29.4s | — |
+| living-room | 34.7s | 29.7s | — |
+| **mean** | **33.1s** | **30.5s** | **33.0s** |
+
+Run 1 looked like a 2.6s win. **Run 2 of the identical prompt came back at
+33.0s** — indistinguishable from pre-trim. Run-to-run variance dominates a
+change this size, which is unsurprising once the field audit is read: the
+removed fields were 4.4% of output, and measured response size fell 6.5%
+(5,217 → 4,880 chars) in run 1 and not at all in run 2 (5,236 chars).
+
+Pooling both optimized runs gives **~31.8s** against 33.1s — about 1.4s,
+consistent with the output reduction and well inside the noise band of a
+three-photo sample.
+
+**Verdict against the acceptance criteria: this is the "mean barely
+changes" case. The removed fields were not the bottleneck. Shipped anyway,
+because less output is strictly better and the fields were dead — and
+optimization stops here.**
+
+### Quality re-verified
+
+- `stop_reason: end_turn` on all six runs.
+- **Room, `areaScope` and `scopeSize` identical to the pre-trim run on all
+  three photos, in both runs.** Removing the written justification did not
+  cost classification accuracy.
+- Neither removed field appeared in any response.
+- `strategyDescription` briefly looked shorter in run 1 (248 vs 507 chars on
+  one photo). Run 2 came back at 270–593, at or above pre-trim. That was
+  variance, not degradation — recorded because "did I damage the protected
+  content?" is not a question to answer from one sample.
+- `keyChanges` counts unchanged at 3–4 per approach.
+
+### Deployment note
+
+**No Cloud Function change was needed.** The prompt is built client-side and
+passed to `analyzePhoto` as request data, so this pass touches `App.js` only
+and ships by OTA. `functions/` is byte-identical to the previous deploy.
