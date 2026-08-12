@@ -445,6 +445,78 @@ exports.generateNextAction = onCall(
   }
 );
 
+// ---- Two-Stage Analysis, CALL 2 (TwoStageAnalysisDesign.md §4/§5) --------
+// A separate function rather than a mode flag on analyzePhoto, for three
+// reasons that are each individually sufficient:
+//
+//   1. Quota. analyzePhoto decrements the user's free monthly allowance
+//      whenever uid + analysisId are present. Call 2 is the SAME analysis
+//      continuing, so routing it through that function would either charge
+//      the user twice for one photo or require a "don't count this one"
+//      flag - a flag that, if ever sent wrongly, silently gives away free
+//      analyses. Separation makes the miscount unrepresentable.
+//   2. Signature. Call 2 sends no image at all (see §4). analyzePhoto
+//      requires imageBase64 and rejects a request without it.
+//   3. Operations. The two calls have genuinely different latency profiles
+//      and failure meanings - Call 1 failing means "no plan"; Call 2
+//      failing means "plan exists, detail pending" - and they should be
+//      separately monitorable and separately tunable.
+//
+// Auth is required outright here. Unlike analyzePhoto, this function has no
+// legacy App Store build calling it, so there is no compatibility shim to
+// preserve: it was born after the auth-required era.
+exports.analyzePhotoDetail = onCall(
+  { secrets: [ANTHROPIC_KEY], maxInstances: 10, timeoutSeconds: 300 },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "You must be signed in to finish an analysis.");
+    }
+    const { prompt, planId } = request.data || {};
+    if (!prompt) {
+      throw new HttpsError("invalid-argument", "Missing prompt.");
+    }
+    // Ownership, same shape as generateVisualization's: a supplied planId
+    // must resolve under this caller's own subcollection. Call 2 always has
+    // one (it exists to finish a plan that has already been written), so
+    // unlike the visualization case there is no null fallback.
+    if (planId) {
+      let snap;
+      try {
+        snap = await db.collection("users").doc(uid).collection("plans").doc(String(planId)).get();
+      } catch (e) {
+        console.error(`[analyzePhotoDetail] uid=${uid} planId=${planId} ownership lookup failed: ${e.message}`);
+        throw new HttpsError("internal", "Couldn't verify this plan. Please try again.");
+      }
+      if (!snap.exists) {
+        console.warn(`[analyzePhotoDetail] uid=${uid} requested planId=${planId} it does not own`);
+        throw new HttpsError("permission-denied", "You don't have access to this plan.");
+      }
+    }
+
+    const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
+    try {
+      // Text only. No image content block - that absence IS the guarantee
+      // that Call 2 cannot re-analyze the photograph.
+      const message = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        // Same ceiling as analyzePhoto. Call 2's response is the larger
+        // half of the old single response (three approaches' guidance,
+        // checklists, recommendations and visualization directions), so it
+        // needs the same headroom even though its prompt is smaller.
+        max_tokens: 6000,
+        messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+      });
+      const text = message.content.find((b) => b.type === "text")?.text || "";
+      console.log(`analyzePhotoDetail response: planId=${planId} stop_reason=${message.stop_reason} | textLength=${text.length} | outputTokens=${message.usage?.output_tokens}`);
+      return { text, stopReason: message.stop_reason, outputTokens: message.usage?.output_tokens ?? null };
+    } catch (err) {
+      console.error(`[analyzePhotoDetail] uid=${uid} planId=${planId} failed: ${err.message}`);
+      throw new HttpsError("internal", err.message || "Detail generation failed.");
+    }
+  }
+);
+
 exports.generateVisualization = onCall(
   { secrets: [OPENAI_KEY], maxInstances: 10, timeoutSeconds: 300, memory: "512MiB" },
   async (request) => {
