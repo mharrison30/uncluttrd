@@ -518,7 +518,7 @@ exports.analyzePhotoDetail = onCall(
 );
 
 exports.generateVisualization = onCall(
-  { secrets: [OPENAI_KEY], maxInstances: 10, timeoutSeconds: 300, memory: "512MiB" },
+  { secrets: [OPENAI_KEY, REVENUECAT_SECRET_API_KEY], maxInstances: 10, timeoutSeconds: 300, memory: "512MiB" },
   async (request) => {
     // Security fix (VisualizationAlignmentImplementation.md §4). This
     // function had NO auth check at all: the Pro gate lived entirely in the
@@ -554,6 +554,48 @@ exports.generateVisualization = onCall(
         console.warn(`[generateVisualization] uid=${uid} requested planId=${planId} which it does not own`);
         throw new HttpsError("permission-denied", "You don't have access to this plan.");
       }
+    }
+
+    // ---- Pro entitlement, server side (2026-08-12) --------------------
+    // The client-side isPro check stays where it is - it shows the paywall
+    // without a network round trip. This is the backstop for a caller that
+    // never ran that code.
+    //
+    // Why RevenueCat is queried rather than users/{uid}.isPro being read:
+    // that field is STILL CLIENT-WRITABLE. firestore.rules allows
+    //   affectedKeys().hasOnly(['isPro', 'hasSeenTutorial'])
+    // on users/{uid}, so any signed-in user can grant themselves Pro with a
+    // single updateDoc. A server-side read of that field would therefore be
+    // a copy of the client check wearing a server costume, not a security
+    // control. The webhook mirror exists and is real, but it is not yet
+    // authoritative BECAUSE of that rule - closing it is the documented
+    // last step of the migration (BACKLOG.md) and is deliberately not done
+    // here, since it can lock out paying users if the webhook is not
+    // verified end to end first.
+    //
+    // The latency objection does not apply to this function specifically:
+    // it already spends 20-60s generating an image, so a ~200ms entitlement
+    // check is noise.
+    const entitled = await verifyProEntitlement(uid);
+    if (entitled === false) {
+      console.warn(`[generateVisualization] uid=${uid} rejected: no active Pro entitlement`);
+      throw new HttpsError("failed-precondition", "Pro subscription required.");
+    }
+    if (entitled === null) {
+      // RevenueCat unreachable. Falling back to the cached mirror rather
+      // than denying: an outage at RevenueCat must not lock paying users
+      // out of a feature they have paid for. This narrows the residual hole
+      // to "forged isPro AND RevenueCat down simultaneously", which an
+      // attacker cannot arrange, and it is logged so it is visible.
+      let cached = false;
+      try {
+        const snap = await db.collection("users").doc(uid).get();
+        cached = snap.exists && snap.data().isPro === true;
+      } catch (e) {
+        console.error(`[generateVisualization] entitlement fallback read failed for uid=${uid}: ${e.message}`);
+      }
+      console.warn(`[generateVisualization] uid=${uid} RevenueCat unreachable, falling back to cached isPro=${cached}`);
+      if (!cached) throw new HttpsError("failed-precondition", "Pro subscription required.");
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_KEY.value() });
@@ -760,6 +802,49 @@ async function sendCanaryAlertEmail(errorMessage) {
 // itself failed for this uid (logged, not thrown - a 404 e.g. a sandbox/
 // test app_user_id, or a TRANSFER source uid RevenueCat only half-knows
 // about, is a real non-retryable case for that one uid, not the whole event).
+// ---- Strict entitlement verification, for AUTHORIZATION ------------------
+// Deliberately NOT syncProStatus. That function maps every non-OK response
+// to null so the webhook can skip a uid it cannot resolve (e.g. a TRANSFER
+// source RevenueCat only half-knows) without writing a wrong value. That is
+// right for a sync job and dangerous for an authorization gate: a 404 means
+// RevenueCat has never seen this customer, i.e. they have definitively not
+// purchased - and collapsing that into "unavailable" let a forged
+// users/{uid}.isPro through the fallback. A real test caught exactly that.
+//
+// Returns: true (active), false (definitively not entitled), or null
+// (RevenueCat genuinely unreachable - 5xx, network, malformed).
+async function verifyProEntitlement(uid) {
+  let resp;
+  try {
+    resp = await fetch(
+      `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID.value()}/customers/${encodeURIComponent(uid)}/active_entitlements`,
+      { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
+    );
+  } catch (e) {
+    console.error(`[entitlement] network failure for uid=${uid}: ${e.message}`);
+    return null;
+  }
+  // Unknown customer. Not an outage - an answer.
+  if (resp.status === 404) return false;
+  // 4xx other than 404 means our request was wrong (bad key, bad project),
+  // which must not silently grant access either.
+  if (resp.status >= 400 && resp.status < 500) {
+    console.error(`[entitlement] client-error response for uid=${uid}: HTTP ${resp.status}`);
+    return false;
+  }
+  if (!resp.ok) {
+    console.error(`[entitlement] upstream unavailable for uid=${uid}: HTTP ${resp.status}`);
+    return null;
+  }
+  try {
+    const data = await resp.json();
+    return (data.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
+  } catch (e) {
+    console.error(`[entitlement] unparseable response for uid=${uid}: ${e.message}`);
+    return null;
+  }
+}
+
 async function syncProStatus(uid) {
   const activeResp = await fetch(
     `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID.value()}/customers/${encodeURIComponent(uid)}/active_entitlements`,

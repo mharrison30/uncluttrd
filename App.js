@@ -7545,6 +7545,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         b64 = result.data?.b64;
       } catch (vizErr) {
         console.log("Viz function error:", vizErr.code, vizErr.message);
+        // The server uses three distinct codes so the client can respond
+        // correctly rather than showing one generic message:
+        //   failed-precondition -> entitlement. The local isPro said yes and
+        //     the server disagreed, which means the local value is stale or
+        //     forged. The paywall is the right destination, not an error.
+        //   permission-denied / unauthenticated -> identity, not payment.
+        if (vizErr.code === "functions/failed-precondition") {
+          dlog(`[VIZ] server rejected on entitlement (local isPro=${isPro})`);
+          setShowPaywall(true);
+          return;
+        }
         Alert.alert(
           "Visualization failed",
           vizErr.code === "functions/permission-denied" || vizErr.code === "functions/unauthenticated"
