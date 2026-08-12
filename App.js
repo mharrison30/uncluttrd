@@ -79,11 +79,31 @@ function debugHashBase64(b64) {
 // silently prefers the plan's own historical name when the Space IS
 // available. Pure (no I/O, no closure over component state) so it's
 // testable directly, independent of any render.
+// Hardened 2026-08-12: spaceType is the AI's RAW SUGGESTION ("Bedroom" for
+// a bookshelf the user keeps in the Home Office) and must never be shown as
+// the Room name once the user has resolved identity. The old single
+// fallback to getSpaceDisplayName reached spaceType whenever spaceName was
+// absent, which is exactly what surfaced "Bedroom" on Results.
+//
+// The ladder is now explicit, strongest evidence first:
+//   1. the live Space's current displayName - the user's own current name
+//   2. the plan's confirmed spaceName - written at save time from the
+//      confirmation, so it is a resolved name, never an AI guess
+//   3. spaceType, and ONLY for a plan with no canonical identity at all -
+//      a freshly parsed, not-yet-filed analysis, where the AI's label
+//      genuinely is the best thing known about the space
+// A plan that HAS a canonicalSpaceId but resolves to neither 1 nor 2
+// returns null rather than falling back to the guess: an empty heading is
+// a smaller lie than a confidently wrong Room name, and every caller
+// already handles a null (the back-link has its own `|| "Back to Plan"`).
 function resolveResultsRoomName(plan, currentPlanId, roomsList) {
   if (!plan) return null;
   const roomId = plan.canonicalSpaceId || currentPlanId;
   const matchedRoom = (roomsList || []).find((r) => r.id === roomId);
-  return matchedRoom?.displayName || getSpaceDisplayName(plan);
+  if (matchedRoom?.displayName) return matchedRoom.displayName;
+  const confirmedName = typeof plan.spaceName === "string" ? plan.spaceName.trim() : "";
+  if (confirmedName) return confirmedName;
+  return plan.canonicalSpaceId ? null : getSpaceDisplayName(plan);
 }
 
 // Recognition Identity Fix (stale plan metadata bug, 2026-08-10): the same
@@ -6334,7 +6354,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // finishRoomConfirmationSave) so completeAreaConfirmation's own catch
   // surfaces it on whichever screen is showing.
   const finishOrganizeAnotherAreaSave = async (parsed, returningContext, analysesRemaining, areaIntent) => {
-    setResults(parsed);
+    // Stamp the resolved identity onto the in-memory results before it is
+    // displayed (Results heading bug, 2026-08-12).
+    //
+    // `parsed` is the raw AI object: it carries spaceType (the AI's guess -
+    // "Bedroom") and has NO canonicalSpaceId and NO spaceName. The SAVED
+    // document gets both a moment later, but the object handed to
+    // setResults did not, so resolveResultsRoomName had nothing to resolve
+    // through: roomId fell back to currentPlanId, which is a plan id and
+    // never matches a Space id, and the lookup then fell through to
+    // getSpaceDisplayName -> spaceType -> "Bedroom".
+    //
+    // Not a rooms-loading race. `rooms` was loaded the whole time; the
+    // object being resolved simply had no canonical identity on it. The
+    // Room-confirmation path never showed this because it passes
+    // confirmedPlan, which already carries spaceName.
+    const resolvedRoomName = (rooms.find((r) => r.id === returningContext.spaceId) || {}).displayName
+      || returningContext.spaceName || parsed.spaceName || null;
+    setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: resolvedRoomName });
     logEvent(getAnalytics(), "plan_completed");
     setOrganizeAgainContext(null);
 
@@ -6821,7 +6858,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         return; // paused (or already resolved+saved via NO_MATCH/zero-Areas) - see beginAreaConfirmation
       }
 
-      setResults(parsed);
+      // Same identity stamp as finishOrganizeAnotherAreaSave above, for the
+      // returning visit that needs no Area confirmation (its Area is
+      // already known, or the visit is whole-room). Everything past the
+      // `if (!returningContext)` room-confirmation pause is a returning
+      // visit, so returningContext.spaceId is the resolved Room here.
+      const returningRoomName = (rooms.find((r) => r.id === returningContext.spaceId) || {}).displayName
+        || returningContext.spaceName || parsed.spaceName || null;
+      setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: returningRoomName });
       logEvent(getAnalytics(), "plan_completed");
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
       // returning visit (organizeAgainContext set) creates its plan via
