@@ -1,6 +1,13 @@
 # CJ Product Feed API — Shelving Inc. Proof of Concept
 
-**Status: BLOCKED — awaiting credential configuration. No live queries run.**
+**Status: COMPLETE. Live queries run against `https://ads.api.cj.com/query`
+on 2026-08-14 with a real Personal Access Token and CID.**
+
+**Outcome: D — Shelving Inc. does not expose a usable product catalog.**
+Its CJ feed exists but is empty (`productCount: 0`, `lastUpdated: null`).
+Separately, and more consequentially: this publisher account is joined to
+**zero** advertisers with product feeds, so *no* product from *any* advertiser
+currently carries an affiliate link.
 
 Read-only investigation. Nothing was wired into Uncluttrd. `App.js`, Firebase
 Functions, Firestore, and `ProductIntelligenceDesign.md` are untouched, as
@@ -8,188 +15,333 @@ instructed.
 
 ---
 
-## 0. Security findings — read before placing the token
+## 0. Security findings — still current
 
-Two things were found while looking for a safe place to hold the credential.
-Both matter more than the POC itself.
+The credential lives at `C:\Users\mharr\.uncluttrd-cj.env`, outside the
+repository entirely, so no `git add` run from the project can capture it. Every
+harness script passes all output through a replacer that substitutes the token
+with `<REDACTED_PAT>` before printing. The token was never printed, never
+written to an artifact, and never entered chat.
+
+Two pre-existing repository issues were found while choosing that location.
+**Neither was fixed** — they are flagged for a deliberate decision:
 
 ### 0a. `functions/.env` and `functions/.env.cluttrd-staging` are TRACKED IN GIT
 
-Verified with `git ls-files --error-unmatch`. They are committed files, not
-local-only config. They currently hold `CANARY_TEST_UID`,
-`CANARY_WEB_API_KEY` and `REVENUECAT_PROJECT_ID`.
-
-**Consequence for this task:** the obvious-looking place to put a CJ token —
-next to the other Firebase config — would commit it on the next `git add`.
-The token must not go there.
-
-**Separate pre-existing issue, flagged not fixed:** a web API key is already
-committed to the repository. That is out of scope for this POC and I have not
-touched it, but it is worth a deliberate decision. Note that `firebase deploy`
-reads both files ("Loaded environment variables from .env,
-.env.cluttrd-staging"), so they are functional config and cannot simply be
-deleted.
+Verified with `git ls-files --error-unmatch`. They are committed files holding
+`CANARY_TEST_UID`, `CANARY_WEB_API_KEY` and `REVENUECAT_PROJECT_ID`. A web API
+key is already committed to the repository. Note that `firebase deploy` reads
+both files, so they are functional config and cannot simply be deleted.
 
 ### 0b. `.gitignore` does not cover `.env`
 
-Line 34 is `.env*.local` only. Verified:
+Line 34 is `.env*.local` only:
 
 ```
-git check-ignore -v .env   ->  no match  (a root .env would be committable)
-git check-ignore -v .env.local -> .gitignore:34  (ignored)
+git check-ignore -v .env        ->  no match   (a root .env would be committable)
+git check-ignore -v .env.local  ->  .gitignore:34  (ignored)
 ```
 
-So a root `.env` is **not** protected either.
-
-### 0c. Chosen location
-
-```
-C:\Users\mharr\.uncluttrd-cj.env
-```
-
-Outside the repository entirely — it cannot be added to git by any `git add`
-run from the project, regardless of `.gitignore` contents. The harness reads
-it at runtime; nothing writes the token to disk, and no artifact contains it.
-
-The harness also carries a redaction filter: every line it prints is passed
-through a replacer that substitutes the token with `<REDACTED_PAT>` before
-output, and it identifies the credential only by a fingerprint
-(`len=…, ends …abcd`) so you can confirm *which* token was used without the
-value appearing anywhere.
+A root `.env` is **not** protected either.
 
 ---
 
-## Step 1 — Current CJ API contract
+## Step 1 — The actual CJ API contract (introspected, not remembered)
 
-Confirmed from public sources; the remainder is deliberately deferred to
-runtime introspection rather than guessed.
+Public docs render the schema through a client-side app that returns nothing to
+a fetcher, so the contract below was obtained by live introspection against the
+account's own entitlements. It is authoritative for this account.
 
-| Question | Finding | Confidence |
-|---|---|---|
-| Product Feed GraphQL endpoint | `https://ads.api.cj.com/query` — CJ's GraphQL surface for affiliate products, shopping feeds, advertiser discovery, travel and finance | High — multiple independent sources |
-| Auth header | `Authorization: Bearer <Personal Access Token>` | High |
-| Publisher PID / Website ID | Supplied as a **Company ID (CID)** argument on the query, obtained from `members.cj.com`. It is a query argument, not a header | High |
-| Separate endpoints | Commission Detail is a *different* endpoint (`https://commissions.api.cj.com/query`). Do not assume one endpoint serves everything | High |
-| Exact query name, filters, field set | **Not confirmed from public docs** | — |
+| Item | Finding |
+|---|---|
+| Endpoint | `https://ads.api.cj.com/query` (GraphQL, POST) |
+| Auth | `Authorization: Bearer <PAT>` — worked first try, ~650 ms |
+| Publisher ID | `companyId` is a **query argument**, not a header |
+| Latency | 650 ms – 1.6 s per query, consistently |
 
-**Why the last row is blank, deliberately.** The CJ Developer Portal renders
-its schema reference through a client-side app that returns no documentation
-content to a fetcher, and the public marketing article about the Product
-Search API states capabilities without naming the query, its arguments, or
-its fields. Rather than reconstruct the syntax from memory or from
-third-party blog posts — which the task explicitly warned against — the
-harness **introspects the live schema** as its first action:
+**Root queries available (10):** `products`, `shoppingProducts`,
+`travelExperienceProducts`, `productsFromApplication`,
+`shoppingProductsFromApplication`, `travelExperienceProductsFromApplication`,
+`shoppingProductFeeds`, `financeProducts`, `financeCreditCardProducts`,
+`productFeeds`.
+
+**There is no advertiser-lookup root query.** Advertisers can only be
+discovered by enumerating `shoppingProductFeeds` — this matters, and is why the
+first pass of this POC wrongly concluded Shelving Inc. was absent (see
+"Correction" below).
+
+**`shoppingProducts` arguments:**
+```
+companyId, adIds, googleProductCategoryIds, googleProductCategoryNames,
+keywords, partnerIds, partnerStatus, gtin, offset, limit, productIds,
+advertiserCountries, highPrice, lowPrice, currency, itemListId, itemListIds,
+includeDeletedProducts, availability, serviceableAreas
+```
+`keywords` is `[String!]`. `partnerIds` is the advertiser filter. `PartnerStatus`
+enum = `JOINED, NOT_JOINED`. Pagination is `offset`/`limit` and is **hard-capped
+at 10,000 records** — `offset + limit > 10000` is a server-side error.
+
+**Two product types exist.** `products` returns `Product` (36 fields).
+`shoppingProducts` returns `Shopping` (84 fields) — the retail type, and the
+only one worth using. It carries `gtin`, `mpn`, `googleProductCategory`,
+`productType`, `color`, `material`, `size`, `availability`, `condition`,
+`productDetail`, `productHighlight`, `joinedStatus`, and
+`linkCode(pid:) { html clickUrl imageUrl }`.
+
+**No ratings or reviews field exists anywhere in the schema.** This is a
+material gap versus what `ProductIntelligenceDesign.md` assumed a product
+source could provide.
+
+---
+
+## Step 2 — Shelving Inc.: found, but empty
+
+### Correction to the first pass
+
+The initial probe searched `keywords: ["Shelving Inc"]` and got 3.6M results
+from Wayfair, OnBuy and Tesco — the keyword matched the *word* "shelving" in
+product titles, not the advertiser. `keywords: ["shelvinginc"]` returned 0.
+On that evidence I recorded "no Shelving Inc. advertiser found." **That was
+wrong.** `keywords` searches product text only; advertiser names are not
+searchable.
+
+Sweeping `shoppingProductFeeds` and matching `/shelv/i` on `advertiserName`
+found it immediately:
+
+| Advertiser | advertiserId |
+|---|---|
+| **Shelving Inc.** | **5434019** |
+| Speedy Shelving.com | 5314756 |
+
+The sweep covered 10,000 of 15,524 feed rows (the pagination cap), yielding
+**3,620 distinct advertisers** exposing a shopping feed to this account.
+
+### Shelving Inc.'s feed row
+
+```json
+{"advertiserId":"5434019","advertiserName":"Shelving Inc.","adId":"14096347",
+ "feedName":"2020 Feed","productCount":0,"lastUpdated":null,
+ "currency":"USD","advertiserCountry":"US","language":"en","sourceFeedType":"GOOGLE"}
+```
+
+**`productCount: 0` and `lastUpdated: null`.** The feed is registered but has
+never been ingested, or was purged. Both product surfaces confirm it:
+
+```
+shoppingProducts(partnerIds:["5434019"])  ->  totalCount = 0
+products(partnerIds:["5434019"])          ->  totalCount = 0
+```
+
+**Control — the filter itself works.** Same query, Zoro:
+
+```
+shoppingProducts(partnerIds:["4683856"])  ->  totalCount = 6,889,382
+```
+
+So 0 is a real 0, not a broken filter.
+
+**Corroborating control — `productCount: 0` means "dead feed" generally.**
+Zoro has three feed rows: one with `productCount 0` / `lastUpdated null`, and
+two live ones (6.79M and 6.89M, updated today). Wayfair North America has seven,
+including a `Wayfair Canada Product Feed` at 0/null alongside six live ones.
+The 0/null pattern is how CJ represents a dormant feed, and Shelving Inc. has
+*only* that row.
+
+### Speedy Shelving.com — also unusable
+
+```json
+{"advertiserId":"5314756","feedName":"Speedy Shelving Product Feed",
+ "productCount":3037,"lastUpdated":"2022-03-10T11:50:50.879Z",
+ "currency":"GBP","advertiserCountry":"GB"}
+```
+
+Nonzero count, but **last updated March 2022** and GBP/UK. Querying it returns
+`totalCount = 0` on both surfaces — the metadata count is historical; the
+products are not retrievable. Worth recording as a schema caveat: **a nonzero
+`productCount` does not guarantee queryable products.**
+
+---
+
+## Steps 3 & 4 — What the catalog *does* contain, and search quality
+
+Since Shelving Inc. is empty, the sample was taken from the catalog at large so
+the data-quality question could still be answered.
+
+Unfiltered, this account can see **728,609,919 shopping products** — Wayfair,
+Zoro, OnBuy, Tesco, Groupon, TicketNetwork and ~3,600 others.
+
+### Field fill rate — 25 products, `keywords: ["wire shelving"]`, `advertiserCountries: ["US"]`
+
+**Populated 25/25:** `id`, `title`, `description`, `brand`, `link`, `imageLink`,
+`price`, `availability`, `condition`, `gtin`, `mpn`, `identifierExists`,
+`productType`, `color`, `advertiserId`, `advertiserName`, `catalogName`,
+`targetCountry`, `shipping`, `lastUpdated`.
+
+**Empty on all 25 (18 fields):** `salePrice`, `discountPercentage`,
+`additionalImageLink`, `googleProductCategory`, `material`, `pattern`, `size`,
+`sizeType`, `productLength`, `productWidth`, `productHeight`, `productWeight`,
+`shippingWeight`, `productDetail`, `productHighlight`, `itemGroupId`,
+`availabilityDate`, **`linkCode`**.
+
+Representative record:
+
+```
+id             G022796346
+title          Wire Shelving
+description    Wire Shelving          <- identical to title
+price          92.35 USD
+brand          METRO
+mpn            2436NK4
+productType    ["Shelving & Racks","Wire Shelving","Wire Shelf Units"]
+availability   in stock
+link           https://www.zoro.com/c/i/G022796346/
+imageLink      https://www.zoro.com/static/cms/product/full/57d0…jpeg
+shipping       {"price":{"amount":"0.00","currency":"USD"}}
+advertiserName Zoro
+catalogName    ZoroCJ
+lastUpdated    2026-08-14T03:16:15Z
+joinedStatus   false
+linkCode       (empty)
+```
+
+**Search quality is poor for Uncluttrd's use case.** `"wire shelving"` returned
+five near-identical results all titled exactly `Wire Shelving` from Zoro, with
+`description` byte-identical to `title`. `"storage shelf"` returned 10.6M hits
+skewed to GBP/EUR advertisers. There is no relevance ranking exposed and no
+ratings signal to rank by. Matching a recommendation like "3-tier rolling cart
+for under-sink storage" against this would be guesswork.
+
+**Data freshness is excellent** where feeds are live — `lastUpdated` values are
+same-day.
+
+---
+
+## Step 5 — Affiliate links: the real blocker
+
+The schema *does* mint publisher-specific deep links directly. No separate Link
+Search API is needed:
 
 ```graphql
-{ __schema { queryType { fields { name args { name } } } } }
-{ __type(name: "Product") { fields { name type { name kind } } } }
+linkCode(pid: $pid) { html clickUrl imageUrl }
 ```
 
-This is the authoritative contract, it reflects exactly what *this* account is
-entitled to see, and it cannot drift from remembered syntax. Steps 1.4, 1.5
-and 1.6 (schema, filters, restricting to joined advertisers, advertiser CID)
-are answered by that output, and the harness writes it to
-`01-root-queries.json` and `02-product-fields.json`.
+But:
+
+```
+joinedStatus true  : 0 / 25
+affiliate clickUrl : 0 / 25
+```
+
+And across the whole account:
+
+```
+shoppingProducts(partnerStatus: JOINED)  ->  totalCount = 0
+products(partnerStatus: JOINED)          ->  totalCount = 0
+```
+
+**Every single product visible to this account has `joinedStatus: false` and an
+empty `linkCode`.** CJ mints the tracking link only for advertisers the
+publisher has an approved relationship with, and this account has none.
+
+The plain `link` field is present and works — but it is the merchant's own URL
+with no tracking, so it earns nothing.
+
+**The blocker is the advertiser relationship, not the API.** The API works,
+authenticates, and returns 728M products with real prices, images, brands, GTINs
+and MPNs. None of it is monetizable until advertisers approve the publisher
+application.
 
 ---
 
-## Steps 2–7 — BLOCKED
+## Step 6 — `ProductCandidate` suitability
 
-No CJ credentials are present in this environment:
+| `ProductCandidate` field | CJ `Shopping` source | Verdict |
+|---|---|---|
+| title | `title` | Available, but often generic ("Wire Shelving") |
+| price | `price {amount currency}` | **Real, current, same-day fresh** |
+| image | `imageLink` | Available; `additionalImageLink` always empty |
+| destination URL | `linkCode.clickUrl` | **Unavailable — empty for every product** |
+| non-affiliate URL | `link` | Available, but unmonetized |
+| brand | `brand` | Available |
+| identifiers | `gtin`, `mpn` | Available — useful for cross-retailer matching |
+| category | `productType` (array) | Available; `googleProductCategory` always empty |
+| rating / review count | — | **Does not exist in the schema** |
+| availability | `availability` | Available ("in stock") |
 
-- No `CJ_*` environment variable is set (checked by name; no values printed).
-- No credential file at the chosen location.
-- Environment variables set in your own terminal do not reach this session —
-  each command runs in a fresh shell — so a file is the only workable channel.
-
-Per the task's instruction, I am stopping rather than asking you to paste the
-token into chat.
-
-Not run, and therefore not answered:
-
-- **Step 2** — Shelving Inc.'s advertiser CID, relationship status, whether
-  the relationship is active, and whether it exposes a product catalog at all.
-  **Being joined does not imply a catalog exists**; the harness reports the
-  joined-advertiser list and flags a `/shelving/i` match rather than assuming.
-- **Step 3** — the 5–10 product sample and its real field coverage.
-- **Step 4** — the three search-quality probes (`shelving`, `wire shelving`,
-  `storage shelf`).
-- **Step 5** — whether the feed already carries a publisher-specific deep
-  link or whether the Link Search API is required to convert a destination
-  URL into an affiliate URL.
-- **Step 6** — `ProductCandidate` suitability.
-- **Step 7** — the A/B/C/D outcome.
+Four of ten fields Product Intelligence would want are unavailable: the
+affiliate URL, ratings, review counts, and reliable category taxonomy.
 
 ---
 
-## What to configure
+## Step 7 — Outcome
 
-Create this file (it is outside the repo and cannot be committed):
+**D — Shelving Inc. does not expose a product catalog to this publisher/API
+account.** Its feed is registered but empty (`productCount: 0`,
+`lastUpdated: null`), confirmed against a working control.
 
-```
-C:\Users\mharr\.uncluttrd-cj.env
-```
+Two findings sit *outside* the A/B/C/D frame and matter more than the outcome:
 
-with exactly two lines, no quotes and no trailing spaces:
-
-```
-CJ_PAT=<your CJ Personal Access Token>
-CJ_CID=<your CJ company / publisher ID from members.cj.com>
-```
-
-Then say the word and I will run the harness. It will:
-
-1. Introspect the live schema and report what this account can actually query.
-2. List joined advertisers and identify Shelving Inc.'s CID.
-3. Run the product sample and the three search probes.
-4. Inspect the affiliate-link situation.
-5. Complete Steps 6 and 7 and update this document with the outcome.
-
-The harness is already written and verified to fail safely without
-credentials (exercised: it exits with instructions and touches nothing).
+1. **CJ as a platform is a genuine product source.** 728M products, real
+   same-day prices, images, brands, GTIN/MPN. The technical integration is
+   straightforward — one GraphQL endpoint, one bearer token, sub-2-second
+   queries.
+2. **Nothing on it is monetizable today.** Zero joined advertisers means zero
+   affiliate links, universally. This is an account/relationship state, not an
+   API limitation, and it is fixable by applying to advertisers — but it is a
+   business-development step with approval latency, not a coding task.
 
 ---
 
-## Preliminary read on the architecture question
+## Should Product Intelligence v1 scope change?
 
-Not an answer — Step 7 is unanswered until the queries run — but worth
-recording, because it shapes what the result will mean.
+**No — not on this evidence.** The Amazon-search-first Tier A plan in
+`ProductIntelligenceDesign.md` stands unchanged.
 
-Even the best possible outcome here (**A — Strong product source**) would be
-**narrow**: one retailer, in one category. Shelving Inc. sells shelving and
-storage. Uncluttrd recommends trays, wall art, picture lights, rugs, barware,
-baskets and cable management across kitchens, dining rooms, bathrooms and
-offices. A CJ/Shelving Inc. integration would resolve real products for a
-*subset* of one category and nothing else.
+The POC was run to answer one question: *can a per-category real-product branch
+exist now, before Amazon Creators API eligibility?* The answer is no. Shelving
+Inc. has no catalog, and even a live CJ feed would produce unmonetized links
+until advertiser relationships are approved.
 
-That does not make it uninteresting — it makes it a **second resolver
-branch**, not a replacement for the Amazon-only Tier A plan:
+Three things are worth carrying forward:
 
-- Amazon (Tier A search resolution) stays the default destination for
-  everything, because it has coverage.
-- CJ becomes a **category-scoped candidate source** that can return real
-  products *where it has them*, which is exactly the shape
-  `ProductIntelligenceDesign.md` §4 already specified: a resolver returning
-  an array of typed destinations, with `kind: "product"` vs `kind: "search"`
-  decided per result.
+- **CJ is a viable Tier B source later, if the relationship work is done
+  first.** The blocker is joining advertisers, not building a resolver. Wayfair
+  North America alone has 11.1M live US products; Zoro has 6.9M. If either
+  approves the publisher, `linkCode.clickUrl` becomes available and a
+  category-scoped resolver branch is a small amount of work on a proven API.
+- **The design's rating/review assumption needs revisiting regardless of
+  source.** CJ has no ratings field at all. Any "highly rated" language in
+  recommendations cannot be sourced from a product feed.
+- **The design's `kind: "product" | "search"` resolver shape (§4) is validated.**
+  It is exactly the right seam: a CJ branch would slot in without restructuring,
+  and its absence today costs nothing.
 
-So the interesting question this POC really answers is not "should we use CJ
-instead of Amazon" but **"can a per-category real-product branch exist at all
-before Amazon Creators API eligibility?"** If yes, Product Intelligence v1
-gains a genuine Tier B slice for storage/shelving while everything else stays
-Tier A — and, notably, that would be reachable *now*, whereas Amazon's is
-gated behind 10 qualified sales in a trailing 30 days.
+The correct next action is *not* engineering. It is deciding whether to apply
+to CJ advertisers in the storage/home-organization category, which is a
+prerequisite to any CJ work and independent of Product Intelligence v1.
 
-That would be a real change to the v1 recommendation, which is why the POC is
-worth running before any Product Intelligence implementation begins.
+---
+
+## Artifacts
+
+Harness scripts and raw JSON responses are in the session scratchpad under
+`cj-poc/`. Nothing was written into the repository. Every script reads the
+credential from `C:\Users\mharr\.uncluttrd-cj.env` at runtime and redacts it
+from all output.
+
+| File | Contents |
+|---|---|
+| `01-root-queries.json` | The 10 root queries and their arguments |
+| `02-product-fields.json` | `Product` type field list |
+| `05`–`08`, `11` | Product samples and fill-rate measurements |
+| `10-advertisers.json` | 3,620 distinct advertisers exposing a shopping feed |
 
 ---
 
 **Sources**
 
+- Live introspection of `https://ads.api.cj.com/query` — authoritative for
+  everything above.
 - [CJ Developer Portal](https://developers.cj.com/)
 - [Product Feeds — CJ Developer Portal](https://developers.cj.com/docs/data-imports/product-feeds)
 - [Personal Access Tokens — CJ Developer Portal](https://developers.cj.com/account/personal-access-tokens)
-- [Product Discovery, Improved! CJ's New Product Search API](https://junction.cj.com/article/product-discovery-improved-cjs-new-product-search-api)
-- [CJ Affiliate's APIs: 5 Things You Should Know](https://junction.cj.com/article/cj-affiliates-apis-5-things-you-should-know)
-- [CJ Affiliate API — developer docs, auth (API Tracker)](https://apitracker.io/a/cj)
