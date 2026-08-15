@@ -3027,6 +3027,11 @@ function buildDetailPrompt(summary) {
 // reason line is more honest than silently dropping a recommendation the
 // model actually returned, and `isUngrounded` lets a future validation
 // pass surface it rather than hiding it.
+// [PI-RESOLVER-START] - scripts/coverageAnalysis.js extracts everything
+// between this marker and [PI-RESOLVER-END] and evaluates it in Node, so the
+// coverage tool measures the EXACT production resolver rather than a copy
+// that silently drifts. Everything in this region must stay pure: no React,
+// no imports, no module-scope side effects.
 function normalizeProductRecommendation(rec) {
   if (!rec || typeof rec !== "object") return null;
   const ids = Array.isArray(rec.relatedProblemIds)
@@ -3049,6 +3054,223 @@ function resolveRecommendationReason(rec, problemsFound) {
   }
   return rec.reason || "";
 }
+
+// ===========================================================================
+// PRODUCT INTELLIGENCE - MULTI-SOURCE RESOLVER
+// ProductIntelligenceDesign.md Section 4. Recommendations describe WHAT to
+// buy and WHY; this module decides WHERE. Nothing above this boundary knows
+// a retailer exists.
+//
+// The layer split, which is the entire point of the module:
+//
+//   SOURCE ADAPTER LAYER (below)  owns retrieval, source-specific
+//     identifiers, and ALL affiliate URL construction. Each adapter builds
+//     its own links its own way - Amazon appends a tag to a search URL, a
+//     future Awin adapter would read aw_deep_link straight out of a feed
+//     row, a future CJ adapter would call linkCode(pid:). Three
+//     incompatible mechanisms; each stays inside its own adapter.
+//
+//   EVERYTHING ABOVE  sees only a normalized resolution object with an
+//     opaque `url` and a `resolverKind` label. It never sees a tag, a
+//     tracking parameter, or a source-specific id.
+//
+// Adding a source is a new object in PRODUCT_SOURCES plus a `canResolve`
+// predicate. It requires no change to resolveProductDestination's
+// signature, to the returned shape, or to any call site. That is what
+// makes this load-bearing rather than decorative.
+// ===========================================================================
+
+// The Associates tag lives on the next line and nowhere else in the
+// codebase. Grepping the tag literal returns exactly one hit - this
+// constant - and AmazonSearchSource is the only thing that reads it.
+// Deliberately not repeated in this comment, so that grep stays honest.
+const AMAZON_ASSOCIATES_TAG = "uncluttrd20-20";
+
+// Ambition words per approach. These express STYLE AND QUALITY INTENT, not
+// price. Deliberately not a dollar filter: a $50-$175 band on Polished
+// would exclude the best $42 tray and steer toward a $140 one on the
+// authority of a table rather than of the product. The same reasoning
+// retired SCOPE_SPEND_TABLE's displayed ranges; re-adding them as invisible
+// URL parameters would reintroduce exactly the problem we removed.
+//
+// Two words per approach, not five: Amazon's relevance degrades as a query
+// lengthens, and every added word is another chance to over-narrow. These
+// are the two that most change the character of the result set.
+const APPROACH_QUERY_INTENT = {
+  simple: ["simple", "practical"],
+  polished: ["modern", "coordinated"],
+  elevated: ["premium", "designer"],
+};
+
+// Words that must never be appended even when they appear in the context.
+// Room names are the main offender: "dining room tray" is a strictly worse
+// Amazon query than "tray" because it matches listing titles that happen to
+// say "dining room" rather than the product category the user needs. Only
+// context that improves COMMERCIAL relevance is allowed through (see
+// CONTEXT_QUERY_HINTS), and a room name almost never does.
+const QUERY_STOPWORDS = new Set([
+  "room", "living", "dining", "bedroom", "bathroom", "kitchen", "garage",
+  "office", "hallway", "entry", "entryway", "basement", "attic", "closet",
+  "area", "space", "zone", "section", "corner", "wall", "floor", "surface",
+  "the", "a", "an", "and", "or", "for", "with", "of", "to", "in", "on",
+  "your", "this", "that", "these", "those", "some", "any", "is", "are",
+]);
+
+// Context words that DO earn their place in a query because they change
+// which product a shopper actually wants. "bar" in "bar tray" is the
+// canonical example from the design doc: a credenza bar-zone tray is a
+// genuinely different product from a generic tray, and the word narrows
+// toward the right thing rather than away from it.
+//
+// Matched against the problem/grounding/area text, not the room name.
+const CONTEXT_QUERY_HINTS = [
+  { match: /\bbar\b|\bbarware\b|\bcocktail\b|\bliquor\b|\bwine\b/i, word: "bar" },
+  { match: /\bcable\b|\bcord\b|\bwire\b|\bcharg/i, word: "cable" },
+  { match: /\bdesk\b|\bworkstation\b/i, word: "desk" },
+  { match: /\bpantry\b/i, word: "pantry" },
+  { match: /\bunder[- ]?sink\b|\bunder the sink\b/i, word: "under sink" },
+  { match: /\bspice\b/i, word: "spice" },
+  { match: /\bshoe\b|\bfootwear\b/i, word: "shoe" },
+  { match: /\bjewel/i, word: "jewelry" },
+  { match: /\bbook\b|\bbooks\b|\bbookshelf\b/i, word: "book" },
+  { match: /\bmail\b|\bpaper\b|\bdocument\b|\bfiling\b/i, word: "paper" },
+  { match: /\blaundry\b/i, word: "laundry" },
+  { match: /\btoy\b|\bkids?\b|\bchildren/i, word: "kids" },
+  { match: /\bcraft\b|\bhobby\b|\bart supplies\b/i, word: "craft" },
+  { match: /\bbath\b|\btowel\b|\btoiletr/i, word: "bath" },
+];
+
+// Deterministic string manipulation - no AI call, no network, no
+// randomness. Same context in, same query out, which is what makes test (b)
+// meaningful and what lets the coverage tool below reproduce production
+// queries exactly.
+function buildAmazonSearchQuery(ctx) {
+  const base = typeof ctx?.searchTerms === "string" ? ctx.searchTerms.trim() : "";
+  if (!base) return "";
+  const seen = new Set(
+    base.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  );
+  const parts = [base];
+  const push = (word) => {
+    if (!word) return;
+    const tokens = word.toLowerCase().split(/\s+/);
+    // Never repeat a word the AI already chose, and never contribute a
+    // stopword. Multi-word hints ("under sink") count as added only if at
+    // least one of their tokens is new.
+    if (tokens.every((t) => seen.has(t) || QUERY_STOPWORDS.has(t))) return;
+    tokens.forEach((t) => seen.add(t));
+    parts.push(word);
+  };
+
+  // 1. Context hint, from the WHY rather than the WHERE. Problem text,
+  //    grounding, and the AI's own reason are all evidence about what the
+  //    product is for; the area name is included because "Bar Cart" or
+  //    "Desk Nook" is a user-authored functional label. Room name is
+  //    deliberately absent - see QUERY_STOPWORDS.
+  const intentText = [ctx.problemText, ctx.grounding, ctx.reason, ctx.areaName, ctx.productType]
+    .filter((x) => typeof x === "string" && x.trim())
+    .join(" ");
+  if (intentText) {
+    const hit = CONTEXT_QUERY_HINTS.find((h) => h.match.test(intentText));
+    if (hit) push(hit.word);
+  }
+
+  // 2. Ambition words. Appended last so the AI's own terms lead the query,
+  //    which is what Amazon weights most heavily.
+  (APPROACH_QUERY_INTENT[ctx.approachId] || []).forEach(push);
+
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+// --- SOURCE ADAPTER: Amazon search -----------------------------------------
+// The only adapter that ships in v1. Serves 100% of recommendations, because
+// a search destination can always be constructed from searchTerms alone.
+const AmazonSearchSource = {
+  resolverKind: "amazon-search-v1",
+  retailer: "Amazon",
+  // Always true: this is the universal fallback path. A future
+  // AwinFeedSource would return true only for productTypes it has catalog
+  // coverage for, and would be ordered ahead of this one.
+  canResolve: () => true,
+  resolve(ctx) {
+    // Enrichment is best-effort. If anything in it throws, we still owe the
+    // user a working destination - test (h). The bare searchTerms query is
+    // exactly what shipped before this module existed, so the floor here is
+    // "no worse than the previous behaviour", never "no link".
+    let queryUsed = "";
+    let enriched = false;
+    try {
+      queryUsed = buildAmazonSearchQuery(ctx);
+      enriched = !!queryUsed && queryUsed !== (ctx.searchTerms || "").trim();
+    } catch (e) {
+      queryUsed = "";
+    }
+    if (!queryUsed) {
+      queryUsed = (typeof ctx?.searchTerms === "string" && ctx.searchTerms.trim())
+        || (typeof ctx?.productType === "string" && ctx.productType.trim())
+        || "";
+      enriched = false;
+    }
+    // Affiliate construction, owned entirely by this adapter.
+    const url = `https://www.amazon.com/s?k=${encodeURIComponent(queryUsed)}&tag=${AMAZON_ASSOCIATES_TAG}`;
+    return {
+      resolverKind: this.resolverKind,
+      retailer: this.retailer,
+      url,
+      queryUsed,
+      // null for a search destination. A future product-resolving adapter
+      // fills this with { name, image, price, ... } and the UI branches on
+      // its presence, never on the source's identity.
+      productData: null,
+      analyticsContext: {
+        resolverKind: this.resolverKind,
+        retailer: this.retailer,
+        queryEnriched: enriched,
+        productType: ctx.productType || null,
+        approachId: ctx.approachId || null,
+        relatedProblemIds: Array.isArray(ctx.relatedProblemIds) ? ctx.relatedProblemIds : [],
+        hasGrounding: !!ctx.grounding,
+        scopeSize: ctx.scopeSize || null,
+      },
+    };
+  },
+};
+
+// Ordered. First adapter whose canResolve() accepts the context wins, so a
+// future real-product source is added ABOVE AmazonSearchSource and Amazon
+// keeps serving everything it declines. No call site changes.
+const PRODUCT_SOURCES = [AmazonSearchSource];
+
+// The module's single public entry point. Everything above this line is
+// implementation detail; everything below only ever calls this.
+//
+// Accepts the normalized recommendation plus the surrounding plan context.
+// Tolerates a pre-schema recommendation (old `relatedProblemId` singular is
+// normalized by normalizeProductRecommendation before it gets here, and a
+// plan with neither field still resolves off searchTerms alone).
+function resolveProductDestination(rec, context = {}) {
+  const normalized = normalizeProductRecommendation(rec) || {};
+  const problems = context.problemsFound || [];
+  const byId = new Map(problems.filter((p) => p && p.id).map((p) => [p.id, p.description]));
+  const ctx = {
+    productType: normalized.productType || "",
+    searchTerms: normalized.searchTerms || normalized.searchQuery || "",
+    reason: normalized.reason || "",
+    grounding: normalized.grounding || null,
+    relatedProblemIds: normalized.relatedProblemIds || [],
+    problemText: (normalized.relatedProblemIds || []).map((id) => byId.get(id)).filter(Boolean).join(" "),
+    approachId: normalized.approachId || context.approachId || null,
+    roomName: context.roomName || null,
+    areaName: context.areaName || null,
+    scopeSize: context.scopeSize || null,
+    strategyDescription: context.strategyDescription || null,
+  };
+  const source = PRODUCT_SOURCES.find((s) => {
+    try { return s.canResolve(ctx); } catch (e) { return false; }
+  }) || AmazonSearchSource;
+  return source.resolve(ctx);
+}
+// [PI-RESOLVER-END]
 
 const REFERRAL_SOURCES = [
   { id: "instagram", label: "Instagram" },
@@ -4032,6 +4254,42 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // See runDetailCall for the bug this caused.
   const currentPlanIdRef = useRef(null);
   useEffect(() => { currentPlanIdRef.current = currentPlanId; }, [currentPlanId]);
+  // recommendation_shown - the impression pass. Runs only when the expanded
+  // approach or the plan actually changes, never on an unrelated re-render,
+  // and de-duplicates against shownRecommendationsRef so a collapse/expand
+  // cycle produces nothing new.
+  useEffect(() => {
+    if (shownRecommendationsPlanRef.current !== currentPlanId) {
+      shownRecommendationsRef.current = new Set();
+      shownRecommendationsPlanRef.current = currentPlanId;
+    }
+    if (!previewApproach || !results) return;
+    const approach = results.approaches?.[previewApproach];
+    if (!approach) return;
+    // At summary-ready Call 2 has not landed, so there are no product
+    // objects to be exposed to yet. The impression belongs to the real
+    // recommendation, not to the loading state.
+    if (planAnalysisStage(results) === "summary-ready") return;
+    (approach.productRecommendations || [])
+      .map(normalizeProductRecommendation)
+      .filter(Boolean)
+      .forEach((rec) => {
+        const key = `${currentPlanId}::${previewApproach}::${rec.productType || ""}`;
+        if (shownRecommendationsRef.current.has(key)) return;
+        shownRecommendationsRef.current.add(key);
+        const resolution = resolveProductDestination(rec, {
+          approachId: previewApproach,
+          problemsFound: results.problemsFound,
+          scopeSize: results.scopeSize || null,
+        });
+        logEvent(getAnalytics(), "recommendation_shown", {
+          productType: rec.productType || null,
+          approachId: previewApproach,
+          relatedProblemIds: (rec.relatedProblemIds || []).join(",") || null,
+          resolverKind: resolution.resolverKind,
+        });
+      });
+  }, [previewApproach, currentPlanId, results]);
   // vizImage/vizLoading are keyed by tier id on an old-format plan and by
   // approach id ("simple"/"polished"/"elevated") on a new-format one. The
   // two vocabularies never coexist on a single plan - a plan has tiers or
@@ -4156,6 +4414,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // browsing between Simple/Polished/Elevated happens entirely here;
   // durable commitment only happens via handleStartThisPlan.
   const [previewApproach, setPreviewApproach] = useState(null);
+  // Product Intelligence v1 impression tracking. recommendation_shown is an
+  // IMPRESSION event, not a render event, so it cannot live in the render
+  // path - an approach card re-renders on every unrelated state change and
+  // would inflate the count without a single new exposure.
+  //
+  // The exposure rule, stated once so it stays stable:
+  //   ONE event per (planId, approachId, productType), for as long as the
+  //   user stays on that plan.
+  // Collapsing and re-expanding the same card does NOT re-fire, because the
+  // key is already in the set (test e). The set is cleared when currentPlanId
+  // changes, so opening a different plan is a fresh exposure session.
+  const shownRecommendationsRef = useRef(new Set());
+  const shownRecommendationsPlanRef = useRef(null);
   const [startingPlan, setStartingPlan] = useState(false);
   // Approach switching (Section 6). switchPickerOpen re-opens the three
   // cards as a chooser; switchingApproach is the id being applied, so only
@@ -7773,7 +8044,36 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
-  const openProduct = (q) => Linking.openURL(`https://www.amazon.com/s?k=${encodeURIComponent(q)}&tag=uncluttrd20-20`);
+  // Product Intelligence v1: the single outbound path. Takes a resolution
+  // object from resolveProductDestination and hands its URL to the OS.
+  //
+  // outbound_link_opened fires only after Linking.openURL resolves, and it
+  // means exactly one thing: the OS accepted the handoff. It is NOT
+  // evidence the user saw the retailer page, or that a browser rendered
+  // anything - the app loses visibility the moment the URL leaves it. Named
+  // "opened" rather than "viewed" or "visited" for that reason; do not
+  // report it as a page view.
+  const openResolvedProduct = async (resolution) => {
+    if (!resolution?.url) return;
+    try {
+      await Linking.openURL(resolution.url);
+      logEvent(getAnalytics(), "outbound_link_opened", {
+        retailer: resolution.retailer,
+        resolverKind: resolution.resolverKind,
+        url: resolution.url,
+      });
+    } catch (e) {
+      // Handoff refused by the OS (no browser, malformed scheme). Not an
+      // open, so no event - the absence is the signal.
+    }
+  };
+
+  // Back-compat shim for the pre-resolver call shape (a bare query string).
+  // Old plans store `searchQuery` on tier products with no approach, no
+  // grounding, and no problem ids; they route through the same resolver and
+  // get the same resolution object, just with a thinner context.
+  const openProduct = (q, context = {}) =>
+    openResolvedProduct(resolveProductDestination({ searchTerms: q }, context));
 
   // Approach Selection Phase B (ApproachSelectionDesign.md Section 4): the
   // ONLY place a preview (previewApproach) ever becomes a durable
@@ -11867,7 +12167,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 ))}
                 <Text style={s.prodLabel}>SUGGESTED PRODUCTS</Text>
                 {t.products?.map((p, i) => (
-                  <TouchableOpacity key={i} style={s.prodRow} onPress={() => { logEvent(getAnalytics(), "product_clicked", { product: p.name }); openProduct(p.searchQuery); }}>
+                  <TouchableOpacity key={i} style={s.prodRow} onPress={() => {
+                    // Pre-approach plans: no approachId, no grounding, no
+                    // problem ids - only a name and a stored searchQuery.
+                    // Same resolver, thinner context, same resolution shape.
+                    const resolution = resolveProductDestination(
+                      { productType: p.name, searchTerms: p.searchQuery },
+                      { problemsFound: results.problemsFound, roomName: resolveResultsRoomName(results, currentPlanId, rooms), scopeSize: results.scopeSize || null }
+                    );
+                    logEvent(getAnalytics(), "recommendation_tapped", {
+                      productType: p.name || null,
+                      approachId: null,
+                      relatedProblemIds: null,
+                      resolverKind: resolution.resolverKind,
+                      queryUsed: resolution.queryUsed,
+                    });
+                    openResolvedProduct(resolution);
+                  }}>
                     <View style={[s.prodIco, { backgroundColor: m.bg }]}>
                       <Text style={{ fontSize: 14 }}>{p.icon}</Text>
                     </View>
@@ -12158,7 +12474,29 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                 <TouchableOpacity
                                   key={`${group.kind}-${i}`}
                                   style={s.prodRow}
-                                  onPress={() => { logEvent(getAnalytics(), "product_clicked", { product: item.productType, approach: id }); openProduct(item.searchTerms); }}
+                                  onPress={() => {
+                                    const resolution = resolveProductDestination(item, {
+                                      approachId: id,
+                                      problemsFound: results.problemsFound,
+                                      roomName: resolveResultsRoomName(results, currentPlanId, rooms),
+                                      areaName: results.areaName || results.suggestedAreaName || null,
+                                      scopeSize: results.scopeSize || null,
+                                      strategyDescription: a.strategyDescription || null,
+                                    });
+                                    // Recommendation analytics: about the
+                                    // recommendation the user acted on.
+                                    // Kept separate from the affiliate
+                                    // handoff event fired inside
+                                    // openResolvedProduct.
+                                    logEvent(getAnalytics(), "recommendation_tapped", {
+                                      productType: item.productType || null,
+                                      approachId: id,
+                                      relatedProblemIds: (item.relatedProblemIds || []).join(",") || null,
+                                      resolverKind: resolution.resolverKind,
+                                      queryUsed: resolution.queryUsed,
+                                    });
+                                    openResolvedProduct(resolution);
+                                  }}
                                   accessibilityLabel={`Find options for ${item.productType}`}
                                   accessibilityRole="button"
                                 >
