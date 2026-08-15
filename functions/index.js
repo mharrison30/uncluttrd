@@ -127,7 +127,10 @@ const currentMonthUTC = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
 // timeout and the user's patience both bind well before it. Two-stage
 // generation is the real fix for the latency; this stops the bleeding.
 exports.analyzePhoto = onCall(
-  { secrets: [ANTHROPIC_KEY], maxInstances: 10, timeoutSeconds: 300 },
+  // REVENUECAT_SECRET_API_KEY is required now that the free-limit gate below
+  // verifies entitlement against RevenueCat rather than trusting the
+  // client-writable users/{uid}.isPro mirror.
+  { secrets: [ANTHROPIC_KEY, REVENUECAT_SECRET_API_KEY], maxInstances: 10, timeoutSeconds: 300 },
   async (request) => {
     const { imageBase64, prompt, analysisId, priorPhotoBase64 } = request.data || {};
 
@@ -152,6 +155,12 @@ exports.analyzePhoto = onCall(
     let userRef = null;
     let idemRef = null;
     let month = null;
+    // Authoritative Pro entitlement, resolved ONCE below and reused by both
+    // the pre-check and the counting transaction. Declared here so the
+    // transaction can read it; false is the safe default for the
+    // no-uid/no-analysisId shape, which skips limit enforcement entirely
+    // anyway (see the hotfix note above).
+    let entitled = false;
 
     if (enforceLimit) {
       userRef = db.collection("users").doc(uid);
@@ -174,13 +183,38 @@ exports.analyzePhoto = onCall(
       const userData = userSnap.exists ? userSnap.data() : {};
       month = currentMonthUTC();
 
+      // Pro entitlement is verified against RevenueCat, NOT read from
+      // users/{uid}.isPro. That field is client-writable under the current
+      // Firestore rules (affectedKeys().hasOnly(['isPro','hasSeenTutorial'])),
+      // so trusting it here meant one updateDoc bought unlimited Anthropic
+      // vision calls. Same authority generateVisualization already uses.
+      //
       // CANARY_TEST_UID is unconditionally exempt from the free-plan limit,
       // independent of isPro/RevenueCat state - the canary exists to monitor
       // analyzePhoto's own availability, not to test subscription gating, and
-      // its isPro value can legitimately go false on its own (e.g. a sandbox
+      // its entitlement can legitimately lapse on its own (e.g. a sandbox
       // subscription naturally expiring) without that being a real incident.
+      // Short-circuited BEFORE the RevenueCat call so the canary never
+      // depends on RevenueCat being reachable at all.
       // Structural fix, not a per-incident Firestore patch - see DecisionLog.md.
-      if (userData.isPro !== true && uid !== CANARY_TEST_UID.value()) {
+      if (uid === CANARY_TEST_UID.value()) {
+        entitled = true;
+      } else {
+        const verified = await verifyProEntitlement(uid);
+        if (verified === null) {
+          // RevenueCat unreachable or unparseable. Falling back to the cached
+          // mirror rather than denying: an outage must not lock paying users
+          // out of the app's core feature. Same outage policy as
+          // generateVisualization. The exposure this leaves is narrowed to
+          // "forged isPro AND RevenueCat down simultaneously".
+          entitled = userData.isPro === true;
+          console.warn(`[analyzePhoto] uid=${uid} RevenueCat unreachable, falling back to cached isPro=${entitled}`);
+        } else {
+          entitled = verified;
+        }
+      }
+
+      if (!entitled) {
         const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
         if (effectiveCount >= FREE_MONTHLY_LIMIT) {
           throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
@@ -289,12 +323,21 @@ exports.analyzePhoto = onCall(
             Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
           );
 
-          // Same CANARY_TEST_UID exemption as the pre-check above, applied
-          // here too - without it, canary's analysisCount would still climb
-          // indefinitely in the background even though it can never actually
-          // be blocked, which is confusing bookkeeping for an account that
-          // isn't really free-tier-metered.
-          if (freshData.isPro === true || uid === CANARY_TEST_UID.value()) {
+          // Reuses `entitled` from the pre-check rather than re-reading
+          // isPro or re-querying RevenueCat. Two reasons: a second network
+          // call would double the added latency and could disagree with the
+          // decision the request was already admitted under, and re-reading
+          // freshData.isPro here would reintroduce the exact forgeable path
+          // this change removes. `entitled` already folds in the
+          // CANARY_TEST_UID exemption, which still matters here - without it
+          // canary's analysisCount would climb indefinitely in the background
+          // even though it can never actually be blocked, which is confusing
+          // bookkeeping for an account that isn't really free-tier-metered.
+          //
+          // The transaction still re-reads the COUNT (freshData below), which
+          // is the value that genuinely races between concurrent requests.
+          // Entitlement does not race on that timescale.
+          if (entitled) {
             analysesRemaining = null;
             tx.set(idemRef, {
               text,
