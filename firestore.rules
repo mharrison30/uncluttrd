@@ -11,14 +11,35 @@ service cloud.firestore {
         && (!('analysisCount' in request.resource.data) || request.resource.data.analysisCount == 0)
         && !('analysisCountMonth' in request.resource.data);
 
-      // Client updates may only ever touch isPro (temporary, pending the
-      // RevenueCat-webhook migration in BACKLOG.md) or hasSeenTutorial
-      // (DecisionLog.md 2026-07-18 - Firestore is now the source of truth
-      // for onboarding-completion, AsyncStorage is just a local cache) -
-      // this alone guarantees analysisCount/analysisCountMonth can't be
-      // touched by any client write, no separate equality check needed.
+      // Client updates may only ever touch hasSeenTutorial (DecisionLog.md
+      // 2026-07-18 - Firestore is now the source of truth for
+      // onboarding-completion, AsyncStorage is just a local cache) - this
+      // alone guarantees analysisCount/analysisCountMonth can't be touched
+      // by any client write, no separate equality check needed.
+      //
+      // isPro was removed from this list 2026-08-15, completing the
+      // RevenueCat-webhook migration. It is now server-owned: the sole
+      // writer is revenueCatWebhook -> syncProStatus via the Admin SDK,
+      // which re-queries RevenueCat's REST API rather than trusting the
+      // event body. Previously any signed-in user could grant themselves
+      // Pro with one updateDoc.
+      //
+      // Preconditions that had to hold before this line could change, all
+      // verified - see RevenueCatHardeningImplementation.md:
+      //   1. The webhook demonstrably writes isPro=true for a genuinely
+      //      entitled customer (RENEWAL/TRANSFER, 2026-08-15).
+      //   2. No client code path writes isPro any more (both updateDoc
+      //      calls in App.js removed the same day).
+      //   3. Server-side authorization no longer trusts the field -
+      //      analyzePhoto and generateVisualization both call
+      //      verifyProEntitlement.
+      // Tightening this without (2) would have silently demoted paying
+      // users on their next launch.
+      //
+      // Note the seed at signup is a CREATE (isPro: false), governed by the
+      // allow create rule above, so it is unaffected by this restriction.
       allow update: if request.auth != null && request.auth.uid == userId
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPro', 'hasSeenTutorial']);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hasSeenTutorial']);
 
       // NOT tightened per the flagged conflict: blocking delete here would
       // break the existing client-side account deletion flow (deleteDoc while

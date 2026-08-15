@@ -13156,17 +13156,24 @@ function AppRoot() {
 
       // Keep Pro status in sync if it changes while the app is open
       // (e.g. a refund processes, or the subscription is restored on another
-      // device). Reads currentUidRef rather than closing over `user` directly,
-      // since this effect only runs once and would otherwise always see
-      // whichever value `user` had at mount (null).
+      // device).
+      //
+      // LOCAL ONLY - this deliberately does NOT write isPro to Firestore.
+      // users/{uid}.isPro is server-owned: the RevenueCat webhook
+      // (revenueCatWebhook -> syncProStatus) is its sole writer, and the
+      // Firestore rules now reject any client write to it. Writing here
+      // would fail permission-denied, and silently, since the old .catch
+      // only console.logged.
+      //
+      // setIsPro/AsyncStorage stay: they give instant in-session feedback
+      // the moment a purchase resolves, without waiting on the webhook
+      // round trip. They are a UI cache, never an authority - every paid
+      // action is checked server-side against RevenueCat
+      // (verifyProEntitlement in analyzePhoto and generateVisualization).
       const listener = (customerInfo) => {
         const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
         setIsPro(proActive);
         AsyncStorage.setItem("isPro", proActive ? "true" : "false");
-        if (currentUidRef.current) {
-          updateDoc(doc(db, "users", currentUidRef.current), { isPro: proActive })
-            .catch(e => console.log("Sync isPro error:", e.message));
-        }
       };
       Purchases.addCustomerInfoUpdateListener(listener);
       return () => Purchases.removeCustomerInfoUpdateListener(listener);
@@ -13310,12 +13317,16 @@ function AppRoot() {
         // Fresh entitlement read for THIS account, sequenced after logIn() -
         // calling this any earlier would read whichever account RevenueCat
         // was previously tracking, not the one that just signed in.
+        //
+        // LOCAL ONLY, same as the customerInfo listener above: seeds the
+        // in-session UI from RevenueCat directly so a Pro user sees Pro
+        // immediately at launch, without waiting for the Firestore read or
+        // the webhook. It does NOT write users/{uid}.isPro - that field is
+        // server-owned and client writes to it are rejected by rules.
         const customerInfo = await Purchases.getCustomerInfo();
         const proActive = !!customerInfo.entitlements.active["Uncluttrd Pro"];
         setIsPro(proActive);
         await AsyncStorage.setItem("isPro", proActive ? "true" : "false");
-        updateDoc(doc(db, "users", u.uid), { isPro: proActive })
-          .catch(e => console.log("Sync isPro error:", e.message));
       } catch (e) {
         console.log("RevenueCat setAttributes/getCustomerInfo error:", e.message);
       }
