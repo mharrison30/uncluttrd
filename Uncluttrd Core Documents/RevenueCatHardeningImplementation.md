@@ -1,8 +1,12 @@
 # RevenueCat Mirror Hardening
 
-**Status as of 2026-08-15: `isPro` is server-owned on staging.** The client can
-no longer write it, and every paid action is authorized against RevenueCat
-rather than against the Firestore mirror.
+**COMPLETE ON STAGING — 2026-08-15.** All four steps are done and every
+verification listed below has been executed and passed. `isPro` is server-owned:
+the client can no longer write it, and every paid action is authorized against
+RevenueCat rather than against the Firestore mirror.
+
+**Production is unchanged and this is not a production sign-off.** Promotion is
+a separate, deliberate decision — see "Not done" at the end.
 
 | Step | Status |
 |---|---|
@@ -169,8 +173,8 @@ access only. This is architectural, not incidental.
 | Webhook writes `isPro` after client lockout | **VERIFIED** — see full lifecycle below |
 | Client promotion still works post-edit | **VERIFIED** — Pro displayed on the new bundle |
 | Client demotion still works post-edit | **VERIFIED** — app fell back to Free after `EXPIRATION` |
-| Direct client write to `isPro` rejected | **Not executed** — Rules Playground, see below |
-| `hasSeenTutorial` still writable | **Not executed** — same |
+| Direct client write to `isPro` rejected | **VERIFIED** — Rules Playground, DENIED |
+| `hasSeenTutorial` still writable | **VERIFIED** — Rules Playground, ALLOWED |
 
 ### Full sandbox lifecycle, uid `vGoBw6D4saV16PzwNi4HkaA6Cuu2`
 
@@ -224,18 +228,30 @@ first at six renewals, then again after the seventh. Both were wrong; it ran to
 should not be predicted; read the actual `expires_at` in the webhook payload
 instead.
 
-### Why the client-rejection test was not automated
+### Rules Playground results — both passed
 
-It needs an authenticated Firebase ID token for a staging user. The canary mints
-one via `admin.auth().createCustomToken()`, which requires Admin SDK credentials
-— unavailable in this environment (`GOOGLE_APPLICATION_CREDENTIALS` unset,
-`gcloud` non-functional for lack of Python). The alternative, a
-`@firebase/rules-unit-testing` suite against the Firestore emulator, needs Java,
-which is not installed. Neither was installed unprompted.
+Run against the **deployed** staging ruleset (not a local copy), on
+`/users/vGoBw6D4saV16PzwNi4HkaA6Cuu2`, simulation type `update`, authenticated
+as that same uid:
 
-**The authoritative test is the Firebase Console Rules Playground**, which
-evaluates the *deployed* rules rather than a local copy — see the chat summary
-for the exact steps.
+| Payload | Result | Meaning |
+|---|---|---|
+| `{ "isPro": true }` | **DENIED** | The forgery path is closed. This is the exact attack the change exists to prevent — a signed-in user granting themselves Pro with one `updateDoc`. The stored value was `false` at the time (written by the `EXPIRATION` at 16:31:49), so this was a genuine privilege escalation attempt, not a no-op. |
+| `{ "hasSeenTutorial": true }` | **ALLOWED** | The rule was not over-tightened. Onboarding-completion writes still work, so `hasSeenTutorial` is unaffected. |
+
+Both are the intended outcomes. Together they show the `hasOnly` clause
+discriminates correctly rather than simply denying everything — a rule that
+denied both would have looked like a pass on the first test while silently
+breaking onboarding.
+
+**Why this was not automated.** It needs an authenticated Firebase ID token. The
+canary mints one via `admin.auth().createCustomToken()`, which requires Admin SDK
+credentials — unavailable here (`GOOGLE_APPLICATION_CREDENTIALS` unset, `gcloud`
+non-functional for lack of Python). The alternative,
+`@firebase/rules-unit-testing` against the Firestore emulator, needs Java, which
+is not installed. Neither was installed unprompted. The Playground is in any case
+the stronger test, because it evaluates the released ruleset rather than the
+local file.
 
 ### Why the post-lockout webhook write is not yet confirmed
 
@@ -262,6 +278,24 @@ outage at the same time. Before today, it required neither.
 
 ## Not done
 
-- **Production deploy.** Rules, client and functions all still need promoting,
-  and only after staging soak.
-- **`analyzePhoto` production deploy** — step 2 is staging-only so far.
+Nothing here is a defect; each is a deliberate boundary.
+
+- **Production deploy — all three artifacts.** Promoting this means shipping
+  *together*, and in this order:
+  1. `functions` (`analyzePhoto` with `verifyProEntitlement`, plus the webhook)
+  2. the client build/OTA with the `isPro` writes removed
+  3. `firestore.rules`
+
+  **The rule must go last.** Deploying it before the client change reaches
+  production users would silently demote every paying customer on their next
+  launch — the same lockout risk that gated this work from the start. Unlike
+  staging, production users are not all on the latest bundle, so the client
+  change needs time to propagate before the rule tightens.
+
+- **Production webhook verification.** The staging webhook is proven. The
+  production function is deployed but has **no retrievable invocation history**
+  (§1e). Its signing secret and RevenueCat routing should be confirmed the same
+  way — a test event — before the production rule change, not after.
+
+- **A production sandbox/TestFlight purchase.** Worth one end-to-end pass in the
+  production project before the rule lands there.
