@@ -32,15 +32,6 @@ yarn-error.*
 
 # local env files
 .env*.local
-# Repo-root .env files. Anchored with a leading slash on purpose:
-# functions/.env and functions/.env.cluttrd-staging are TRACKED, functional
-# deploy config ("Loaded environment variables from .env,
-# .env.cluttrd-staging" on every firebase deploy), so a bare `.env*` pattern
-# here would be wrong. This closes the root gap only, which is where a
-# credential would land if someone dropped one next to package.json.
-/.env
-/.env.*
-!/.env.example
 
 # typescript
 *.tsbuildinfo
