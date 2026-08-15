@@ -311,9 +311,35 @@ last** — it is the only step that breaks older clients.
 1. New subcollection rules — **required BEFORE** the client OTA (§5a)
 2. `isPro` tightening — **required AFTER** the soak (§6)
 
-Deploying HEAD's rules file as-is in Phase 1 would tighten `isPro` immediately
-and demote every production user still on an older client. **The rules deployment
-must be split.**
+**CORRECTED 2026-08-15.** An earlier version of this report said deploying the
+tightened rule early would "demote every production user still on an older
+client." **That was wrong.** A Firestore rules change does not alter stored data:
+existing `isPro: true` values remain intact, and the webhook — writing through
+the Admin SDK — keeps updating them regardless of rules.
+
+What would actually happen, verified against the production baseline client:
+
+- Older clients still calling `updateDoc(doc(db,"users",uid), { isPro })` receive
+  `permission-denied`.
+- Both baseline call sites swallow it: `.catch(e => console.log("Sync isPro
+  error:", e.message))` (`App.js:3719` and `:3862` at `e361797`). It is never
+  surfaced to the user, never retried, and changes no state.
+- The Pro UI is unaffected either way, because `setIsPro` is driven entirely by
+  RevenueCat's SDK in **both** the baseline and release-candidate clients — no
+  `setIsPro` call anywhere reads the Firestore field.
+
+So the realistic impact is milder than first stated: console noise on older
+clients, plus the loss of a redundant write path. That redundancy mattered when
+the client was a backstop for webhook failure; it matters much less now that
+`analyzePhoto` and `generateVisualization` both authorize via
+`verifyProEntitlement` rather than the mirror.
+
+**The conclusion is unchanged: the rules deployment must still be split.**
+Deploying the tightening early would take a production behaviour change with no
+rollback urgency and no user benefit, ahead of the client that makes it
+meaningful — and it would leave `generateVisualization`'s outage fallback reading
+a mirror that older clients can no longer refresh. There is no reason to accept
+that, and splitting costs one extra deploy.
 
 Recommended: deploy Phase 1 from a temporary rules file identical to HEAD's
 except that the update clause retains `['isPro', 'hasSeenTutorial']`. Phase 4
@@ -427,8 +453,10 @@ firebase deploy --only firestore:rules --project cluttrd-3e335   # HEAD's file, 
 *Verify:* Rules Playground — `{"isPro": true}` **DENIED**,
 `{"hasSeenTutorial": true}` **ALLOWED**. Then confirm a real production purchase
 or renewal still results in `isPro=true` via the webhook.
-*Rollback:* redeploy the Phase-1 variant. Fast, one command, and the failure mode
-(paying users demoted) is loud and immediate.
+*Rollback:* redeploy the Phase-1 variant. Fast, one command. Note the failure
+mode here is **quiet, not loud** — older clients swallow `permission-denied`
+(§6), so nothing alerts. Rollback is cheap, but detection depends on the
+verification step above actually being run rather than on an incident report.
 
 ---
 
@@ -444,14 +472,27 @@ received an OTA**, so this path is unproven.
 *Should it be split?* **Yes, ideally.** EAS supports `--rollout-percentage`.
 Recommend 10% → observe → 50% → 100%.
 
-### HIGH — Rules file contains two changes with opposite timing
+### MEDIUM — Rules file contains two changes with opposite timing
 
-*What could go wrong:* deploying HEAD's rules in Phase 1 demotes every paying
-production customer on next launch.
-*Detection:* immediate — support reports and paywall analytics.
-*Recovery:* redeploy permissive rules; users recover on next launch.
-*Mitigation:* the split described in §6. **This is the single most likely way to
-cause a paying-customer incident in this release.**
+*(Downgraded from HIGH on the corrected analysis in §6.)*
+
+*What could go wrong:* deploying HEAD's rules in Phase 1 makes older clients'
+`isPro` writes fail with `permission-denied`. It does **not** demote anyone —
+stored values are untouched and the webhook keeps writing them. The residual
+harm is the loss of the client-side redundant write, which leaves
+`generateVisualization`'s cached-`isPro` outage fallback reading a mirror older
+clients can no longer refresh.
+*Detection:* device-console noise only; the baseline client swallows the error,
+so there is no telemetry signal. **This is the concerning part — it would fail
+quietly rather than loudly.**
+*Recovery:* redeploy the permissive rules; effect is immediate.
+*Mitigation:* the split described in §6.
+
+The separate, genuinely high-severity ordering risk is the *other* direction:
+deploying the client OTA **before** the new subcollection rules. That one is
+loud and immediate — every `spaces/**`, `mergeCandidates/**` and
+`reclassificationExecutions/**` read and write would be denied, breaking Room
+and Area identity across the app. **Phase 1b must precede Phase 2.**
 
 ### HIGH — `analyzePhoto` 300s timeout is new to production
 
@@ -495,8 +536,10 @@ production data.
 
 **Two things must be settled before any deploy:**
 
-1. **Split the rules deployment.** Shipping HEAD's `firestore.rules` in Phase 1
-   would demote paying customers.
+1. **Split the rules deployment.** The new subcollection rules must ship in
+   Phase 1 (before the client OTA, or Room/Area identity breaks loudly); the
+   `isPro` tightening must not (see the corrected analysis in §6 — it does not
+   demote anyone, but it fails quietly on older clients for no benefit).
 2. **Send the production webhook test event.** It gates Phase 4 and is the only
    unknown in an otherwise verified chain.
 

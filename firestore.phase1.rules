@@ -1,0 +1,159 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      // analysisCount/analysisCountMonth are permanently server-owned (written
+      // only by the Admin SDK inside analyzePhoto's transaction). A client
+      // create must not seed a nonzero/rollover-primed value for itself.
+      allow create: if request.auth != null && request.auth.uid == userId
+        && (!('analysisCount' in request.resource.data) || request.resource.data.analysisCount == 0)
+        && !('analysisCountMonth' in request.resource.data);
+
+      // Client updates may only ever touch hasSeenTutorial (DecisionLog.md
+      // 2026-07-18 - Firestore is now the source of truth for
+      // onboarding-completion, AsyncStorage is just a local cache) - this
+      // alone guarantees analysisCount/analysisCountMonth can't be touched
+      // by any client write, no separate equality check needed.
+      //
+      // isPro was removed from this list 2026-08-15, completing the
+      // RevenueCat-webhook migration. It is now server-owned: the sole
+      // writer is revenueCatWebhook -> syncProStatus via the Admin SDK,
+      // which re-queries RevenueCat's REST API rather than trusting the
+      // event body. Previously any signed-in user could grant themselves
+      // Pro with one updateDoc.
+      //
+      // Preconditions that had to hold before this line could change, all
+      // verified - see RevenueCatHardeningImplementation.md:
+      //   1. The webhook demonstrably writes isPro=true for a genuinely
+      //      entitled customer (RENEWAL/TRANSFER, 2026-08-15).
+      //   2. No client code path writes isPro any more (both updateDoc
+      //      calls in App.js removed the same day).
+      //   3. Server-side authorization no longer trusts the field -
+      //      analyzePhoto and generateVisualization both call
+      //      verifyProEntitlement.
+      // Tightening this without (2) would have silently demoted paying
+      // users on their next launch.
+      //
+      // Note the seed at signup is a CREATE (isPro: false), governed by the
+      // allow create rule above, so it is unaffected by this restriction.
+      // ===== PHASE 1 ONLY - DO NOT MERGE INTO firestore.rules =====
+      // isPro is intentionally still client-writable in this file. It is
+      // byte-identical to firestore.rules at HEAD except for the single
+      // affectedKeys() line below, plus this comment.
+      //
+      // Rationale: the new subcollection rules further down are REQUIRED
+      // before the client OTA (production rules have no match blocks for
+      // spaces/mergeCandidates/reclassificationExecutions, so Firestore
+      // denies by default). The isPro tightening is the opposite - it must
+      // wait until the hardened client has propagated. Shipping both at
+      // once is the conflict this file exists to resolve.
+      //
+      // The tightening ships in Phase 6 by deploying firestore.rules itself.
+      allow update: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPro', 'hasSeenTutorial']);
+
+      // NOT tightened per the flagged conflict: blocking delete here would
+      // break the existing client-side account deletion flow (deleteDoc while
+      // still authenticated - see DecisionLog.md). Left as-is pending a
+      // decision on moving account deletion server-side.
+      allow delete: if request.auth != null && request.auth.uid == userId;
+
+      match /plans/{planId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Space/Project/Session/Batch shadow structure (Space Implementation
+      // Slice 1/2) - same ownership pattern as plans/{planId} above, applied
+      // at every nesting level. Added 2026-08-02 after live testing showed
+      // the shadow write (writeSpaceShadowStructure, App.js) was silently
+      // denied for real authenticated clients with no rule present here.
+      match /spaces/{spaceId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+
+        // Area Identity durable Area objects (AreaIdentityDesign.md §2) -
+        // same ownership pattern as projects/sessions/batches below. Had
+        // ZERO rule coverage until Phase B prerequisites (2026-08-09):
+        // every real client read/write (createAreaForPlan, updateAreaSummary,
+        // renameArea, Room Detail's loadRoomDetailAreas) was being silently
+        // denied - Phase A's "43/43 passing" validation only ever exercised
+        // the Admin SDK path, which bypasses rules entirely. Same failure
+        // mode already documented once above for the shadow structure.
+        match /areas/{areaId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
+        match /projects/{projectId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+          match /sessions/{sessionId} {
+            allow read, write: if request.auth != null && request.auth.uid == userId;
+            match /batches/{batchId} {
+              allow read, write: if request.auth != null && request.auth.uid == userId;
+            }
+          }
+        }
+      }
+
+      // §12 Migration Part 2/3 merge candidates - same ownership pattern as
+      // spaces/{spaceId} above. Previously had ZERO rule coverage (flagged
+      // during Part 3 scoping, MergeProposalDesign.md) - only the Admin SDK
+      // migration runner could touch this collection; a real authenticated
+      // client would have been silently denied on both read and write, the
+      // same failure mode already seen once for the shadow structure above.
+      // Added ahead of the comparison/resolution UI (Part 3) so that work
+      // is never blocked on a rules gap discovered late.
+      match /mergeCandidates/{candidateId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+        match /history/{eventId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
+      }
+
+      // Legacy Reclassification (LegacyReclassificationDesign.md) execution
+      // tracking, keyed by planId - same ownership pattern as
+      // mergeCandidates above. Same failure mode already seen twice this
+      // project (shadow structure, areas): had zero rule coverage since it
+      // was only ever exercised via the Admin-SDK CLI script
+      // (scripts/reclassifyLegacyPlan.js) - added now that Room Rename's
+      // "Move plans to [Room]" duplicate-name resolution calls the client-
+      // SDK mirror of that same workflow directly from the app.
+      match /reclassificationExecutions/{planId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Server (Admin SDK) only - Admin SDK bypasses rules entirely, so this
+      // is purely a statement of intent: no client ever has a legitimate
+      // reason to read or write its own idempotency records directly.
+      match /analysisIdempotency/{analysisId} {
+        allow read, write: if false;
+      }
+
+      // Server (Admin SDK) only - revenueCatWebhook's idempotency records
+      // (DecisionLog.md 2026-07-21), same reasoning as analysisIdempotency
+      // above. NOT yet touching `isPro`'s client-write access above -
+      // that's the last step of the migration, only once the webhook is
+      // verified working end-to-end (BACKLOG.md).
+      match /revenueCatWebhookEvents/{eventId} {
+        allow read, write: if false;
+      }
+    }
+
+    // Server (Admin SDK) only - deletion-monitoring breadcrumbs written by
+    // recordUserDocDeletion and read by checkOrphanedUserDeletions. No client
+    // has a legitimate reason to read or write these directly.
+    match /deletionAudit/{uid} {
+      allow read, write: if false;
+    }
+
+    // App-wide, non-user config (e.g. config/appVersion, the soft
+    // update-nudge's latest-released-version values - DecisionLog.md
+    // 2026-07-30). Public read, since the update check runs on app launch
+    // before a user may have signed in. Never client-writable - set only by
+    // the developer (Firebase Console or an Admin SDK script) after each
+    // release.
+    match /config/{document} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}
