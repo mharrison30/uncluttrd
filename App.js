@@ -4254,42 +4254,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // See runDetailCall for the bug this caused.
   const currentPlanIdRef = useRef(null);
   useEffect(() => { currentPlanIdRef.current = currentPlanId; }, [currentPlanId]);
-  // recommendation_shown - the impression pass. Runs only when the expanded
-  // approach or the plan actually changes, never on an unrelated re-render,
-  // and de-duplicates against shownRecommendationsRef so a collapse/expand
-  // cycle produces nothing new.
-  useEffect(() => {
-    if (shownRecommendationsPlanRef.current !== currentPlanId) {
-      shownRecommendationsRef.current = new Set();
-      shownRecommendationsPlanRef.current = currentPlanId;
-    }
-    if (!previewApproach || !results) return;
-    const approach = results.approaches?.[previewApproach];
-    if (!approach) return;
-    // At summary-ready Call 2 has not landed, so there are no product
-    // objects to be exposed to yet. The impression belongs to the real
-    // recommendation, not to the loading state.
-    if (planAnalysisStage(results) === "summary-ready") return;
-    (approach.productRecommendations || [])
-      .map(normalizeProductRecommendation)
-      .filter(Boolean)
-      .forEach((rec) => {
-        const key = `${currentPlanId}::${previewApproach}::${rec.productType || ""}`;
-        if (shownRecommendationsRef.current.has(key)) return;
-        shownRecommendationsRef.current.add(key);
-        const resolution = resolveProductDestination(rec, {
-          approachId: previewApproach,
-          problemsFound: results.problemsFound,
-          scopeSize: results.scopeSize || null,
-        });
-        logEvent(getAnalytics(), "recommendation_shown", {
-          productType: rec.productType || null,
-          approachId: previewApproach,
-          relatedProblemIds: (rec.relatedProblemIds || []).join(",") || null,
-          resolverKind: resolution.resolverKind,
-        });
-      });
-  }, [previewApproach, currentPlanId, results]);
   // vizImage/vizLoading are keyed by tier id on an old-format plan and by
   // approach id ("simple"/"polished"/"elevated") on a new-format one. The
   // two vocabularies never coexist on a single plan - a plan has tiers or
@@ -4414,19 +4378,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // browsing between Simple/Polished/Elevated happens entirely here;
   // durable commitment only happens via handleStartThisPlan.
   const [previewApproach, setPreviewApproach] = useState(null);
-  // Product Intelligence v1 impression tracking. recommendation_shown is an
-  // IMPRESSION event, not a render event, so it cannot live in the render
-  // path - an approach card re-renders on every unrelated state change and
-  // would inflate the count without a single new exposure.
-  //
-  // The exposure rule, stated once so it stays stable:
-  //   ONE event per (planId, approachId, productType), for as long as the
-  //   user stays on that plan.
-  // Collapsing and re-expanding the same card does NOT re-fire, because the
-  // key is already in the set (test e). The set is cleared when currentPlanId
-  // changes, so opening a different plan is a fresh exposure session.
-  const shownRecommendationsRef = useRef(new Set());
-  const shownRecommendationsPlanRef = useRef(null);
   const [startingPlan, setStartingPlan] = useState(false);
   // Approach switching (Section 6). switchPickerOpen re-opens the three
   // cards as a chooser; switchingApproach is the id being applied, so only
@@ -4602,6 +4553,61 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [err, setErr] = useState(null);
+
+  // Product Intelligence v1 impression tracking. recommendation_shown is an
+  // IMPRESSION event, not a render event, so it cannot live in the render
+  // path - an approach card re-renders on every unrelated state change and
+  // would inflate the count without a single new exposure.
+  //
+  // The exposure rule, stated once so it stays stable:
+  //   ONE event per (planId, approachId, productType), for as long as the
+  //   user stays on that plan.
+  // Collapsing and re-expanding the same card does NOT re-fire, because the
+  // key is already in the set (test e). The set is cleared when currentPlanId
+  // changes, so opening a different plan is a fresh exposure session.
+  //
+  // POSITION IS LOAD-BEARING. This block must stay BELOW the declarations of
+  // previewApproach, currentPlanId and results. A dependency array is
+  // evaluated during render, not when the effect body runs, so placing this
+  // above `results` put those consts in the temporal dead zone and threw
+  // "Cannot access 'previewApproach' before initialization" on every render
+  // of MainApp - which crashed the app on launch and made expo-updates roll
+  // back to the previous bundle. node -c and `expo export` both pass on that
+  // code; only running it catches it. See scripts/auditTdz.js.
+  const shownRecommendationsRef = useRef(new Set());
+  const shownRecommendationsPlanRef = useRef(null);
+  useEffect(() => {
+    if (shownRecommendationsPlanRef.current !== currentPlanId) {
+      shownRecommendationsRef.current = new Set();
+      shownRecommendationsPlanRef.current = currentPlanId;
+    }
+    if (!previewApproach || !results) return;
+    const approach = results.approaches?.[previewApproach];
+    if (!approach) return;
+    // At summary-ready Call 2 has not landed, so there are no product
+    // objects to be exposed to yet. The impression belongs to the real
+    // recommendation, not to the loading state.
+    if (planAnalysisStage(results) === "summary-ready") return;
+    (approach.productRecommendations || [])
+      .map(normalizeProductRecommendation)
+      .filter(Boolean)
+      .forEach((rec) => {
+        const key = `${currentPlanId}::${previewApproach}::${rec.productType || ""}`;
+        if (shownRecommendationsRef.current.has(key)) return;
+        shownRecommendationsRef.current.add(key);
+        const resolution = resolveProductDestination(rec, {
+          approachId: previewApproach,
+          problemsFound: results.problemsFound,
+          scopeSize: results.scopeSize || null,
+        });
+        logEvent(getAnalytics(), "recommendation_shown", {
+          productType: rec.productType || null,
+          approachId: previewApproach,
+          relatedProblemIds: (rec.relatedProblemIds || []).join(",") || null,
+          resolverKind: resolution.resolverKind,
+        });
+      });
+  }, [previewApproach, currentPlanId, results]);
 
   // ── Companion loop state ──────────────────────────────────
   // Analytics-only correlator for the free-tier funnel, since free plans are
