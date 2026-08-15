@@ -166,10 +166,63 @@ access only. This is architectural, not incidental.
 | Client code contains no `isPro` write path | **Verified** — multiline-aware scan, repo-wide |
 | Rules source correct | **Verified** — compiled and released |
 | Rules deployed to staging only | **Verified** — production untouched |
-| Webhook writes `isPro` after client lockout | **Not yet observed** — see below |
-| Direct client write to `isPro` rejected | **Not yet executed** — see below |
-| `hasSeenTutorial` still writable | **Not yet executed** |
-| Staging UI follows server-written changes | **Not yet observed** |
+| Webhook writes `isPro` after client lockout | **VERIFIED** — see full lifecycle below |
+| Client promotion still works post-edit | **VERIFIED** — Pro displayed on the new bundle |
+| Client demotion still works post-edit | **VERIFIED** — app fell back to Free after `EXPIRATION` |
+| Direct client write to `isPro` rejected | **Not executed** — Rules Playground, see below |
+| `hasSeenTutorial` still writable | **Not executed** — same |
+
+### Full sandbox lifecycle, uid `vGoBw6D4saV16PzwNi4HkaA6Cuu2`
+
+The Firestore rule was tightened at ~15:35 and the client-write removal shipped
+by OTA at ~15:47. **Everything from 15:50 onward is a write performed with the
+client fully locked out.**
+
+```
+15:26:09  RENEWAL      -> isPro=true
+15:26:10  TRANSFER     -> 8hD3iwG3… -> false,  vGoBw6D4… -> true
+15:33:13  RENEWAL      -> isPro=true
+--- 15:35  Firestore rule tightened to hasOnly(['hasSeenTutorial']) ---
+15:42:37  RENEWAL      -> isPro=true
+--- 15:47  OTA: client isPro writes removed ---
+15:50:32  RENEWAL      -> isPro=true
+15:59:37  RENEWAL      -> isPro=true
+16:03:33  RENEWAL      -> isPro=true
+16:07:26  RENEWAL      -> isPro=true
+16:16:48  RENEWAL      -> isPro=true
+16:23:59  RENEWAL      -> isPro=true
+16:23:59  CANCELLATION -> isPro=true     (correct: entitlement runs to period end)
+16:31:49  EXPIRATION   -> isPro=false    (demotion)
+```
+
+`Firestore write failed: 0` throughout. The Admin SDK wrote `isPro` in **both
+directions** — true on every renewal and false on expiry — while client writes
+to that field were forbidden by rules. That is the property the whole change
+rests on, and it is now demonstrated rather than argued.
+
+### Client demotion test — passed
+
+After the `EXPIRATION` at 16:31:49, the staging app was observed to have fallen
+back from **Pro member** to **Free** on its own.
+
+That confirms the edited client paths still work in both directions. `isPro`
+initialises to `false` and is only ever set from RevenueCat, so:
+
+- Pro displayed on the new bundle → `setIsPro(true)` ran → the edited block is intact.
+- Free after expiry → `setIsPro(false)` ran → demotion path intact.
+
+Both call sites I edited ([App.js:13162](App.js#L13162) listener and
+[App.js:13320](App.js#L13320) post-login seed) retain their `setIsPro` and
+AsyncStorage calls with only the `updateDoc` removed, and one of the two
+demonstrably fired.
+
+### A correction on sandbox renewal behaviour
+
+I twice predicted the subscription had reached the end of its renewal cycle —
+first at six renewals, then again after the seventh. Both were wrong; it ran to
+**nine** renewals plus a cancellation before expiring. Sandbox renewal counts
+should not be predicted; read the actual `expires_at` in the webhook payload
+instead.
 
 ### Why the client-rejection test was not automated
 
