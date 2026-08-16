@@ -12845,8 +12845,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                         one line for the card - a pure display
                                         transform, no AI call, and the full
                                         text stays in the plan document. */}
+                                    {/* No numberOfLines here, deliberately.
+                                        shortDisplayReason has already capped
+                                        this at 45 chars on a word boundary,
+                                        backing off to a complete thought - and
+                                        the text column is narrower than that
+                                        budget assumed once the 48px icon and
+                                        padding are subtracted, so RN's own
+                                        tail-clipping was re-adding the very
+                                        "..." the word-boundary trimming exists
+                                        to avoid. Wrapping to a second line on a
+                                        narrow screen is the better failure. */}
                                     {shortReason ? (
-                                      <Text style={s.recReason} numberOfLines={1}>{shortReason}</Text>
+                                      <Text style={s.recReason}>{shortReason}</Text>
                                     ) : null}
                                     {/* Results Polish item 4: "Shop options"
                                         overpromised - what actually happens is
