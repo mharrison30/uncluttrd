@@ -25,7 +25,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Menu, Check, X, AlertTriangle, Sparkles, RefreshCw, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair } from "lucide-react-native";
+import { Menu, Check, X, AlertTriangle, Sparkles, RefreshCw, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair, Sprout, ConciergeBell, Amphora, Container, Blinds, Grid2x2 } from "lucide-react-native";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getReactNativePersistence, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, sendPasswordResetEmail } from "firebase/auth";
 import { getFirestore, collection, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, getDocs, query, where, orderBy, limit, serverTimestamp, Timestamp, arrayUnion, writeBatch, runTransaction, increment, deleteField } from "firebase/firestore";
@@ -2793,6 +2793,99 @@ function shortProductNoun(productType) {
   return words.join(" ").toLowerCase();
 }
 
+// ---- Compact product card: display-layer transforms (2026-08-16) ----------
+// Both of these are PURE VIEW CONCERNS. Neither touches the plan document, and
+// neither costs an AI call: productType and reason are written once by the
+// model and stay in the data verbatim, exactly as searchTerms/resolveProduct-
+// Destination still read them. Everything here only decides what a ~80px card
+// shows.
+//
+// A card HEADING, which is a different job from shortProductNoun's inline
+// "shelf · basket · tray" preview - so it shares that function's first rule
+// (cut at the connector) and deliberately diverges on the other two:
+//
+//   * shortProductNoun always strips a leading descriptor, because in a
+//     mid-sentence preview "decorative objects" and "objects" read the same.
+//     As a heading, stripping it leaves a bare "Objects", which says nothing.
+//     So the descriptor is only dropped when a real noun phrase survives it
+//     ("modern wall art" -> "Wall Art"); when it would leave one lone word
+//     the descriptor is kept ("decorative objects" -> "Decorative Object").
+//   * shortProductNoun keeps the LAST two words to protect "wall art" from
+//     becoming "art". Once the descriptor rule above is in place the risk is
+//     gone, and the FIRST two read far better on the heads that are actually
+//     long: "cable management box" -> "Cable Management", not "Management
+//     Box"; "drawer organizer inserts" -> "Drawer Organizer".
+//
+// Singular, because a card names one kind of thing. Only the final word is
+// singularized, and only on suffixes that are unambiguous - "glass" and
+// "-ss" endings are left alone.
+const PRODUCT_NAME_MINOR_WORDS = new Set(["and", "or", "for", "with", "of", "the", "a", "an"]);
+function singularizeWord(w) {
+  const lower = w.toLowerCase();
+  if (lower.length <= 3 || lower.endsWith("ss") || lower.endsWith("us")) return w;
+  if (/[^aeiou]ies$/.test(lower)) return w.slice(0, -3) + "y";
+  // shelves -> shelf, leaves -> leaf; knives -> knife keeps its silent e.
+  if (lower.endsWith("ives")) return w.slice(0, -3) + "fe";
+  if (lower.endsWith("ves")) return w.slice(0, -3) + "f";
+  if (/(ch|sh|s|x|z)es$/.test(lower)) return w.slice(0, -2);
+  if (lower.endsWith("s")) return w.slice(0, -1);
+  return w;
+}
+function displayProductName(productType) {
+  const raw = typeof productType === "string" ? productType.trim() : "";
+  if (!raw) return "";
+  const cut = raw.split(/\s+(?:or|and|for|with|to|on|in|under|that|which)\s+|\s+[-–—]\s+|[,(]/i)[0].trim();
+  let words = cut.split(/\s+/).map((w) => w.replace(/[^A-Za-z0-9-]/g, "")).filter(Boolean);
+  if (!words.length) return "";
+  if (words.length > 1 && PRODUCT_DESCRIPTOR_WORDS.has(words[0].toLowerCase())) {
+    // Only drop it if at least two words remain - otherwise the descriptor is
+    // carrying the meaning and has to stay.
+    if (words.length > 2) words = words.slice(1);
+  }
+  if (words.length > 2) words = words.slice(0, 2);
+  words[words.length - 1] = singularizeWord(words[words.length - 1]);
+  return words
+    .map((w, i) => (i > 0 && PRODUCT_NAME_MINOR_WORDS.has(w.toLowerCase()) ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()))
+    .join(" ");
+}
+
+// One short line explaining why THIS product helps THIS space. The input is
+// already space-specific - resolveRecommendationReason hands back the
+// grounding sentence, the linked problem descriptions, or the AI's own reason,
+// all of which are written about the photographed space rather than the
+// product category. So this only has to SHORTEN, never summarize, which is
+// what keeps it a display transform instead of a second inference step.
+//
+// Order matters: take the first sentence, and only if that is still too long
+// fall back to the first clause. Doing it the other way round would cut
+// "The niche is empty, and the shelf below is crowded" at the comma and lose
+// the sentence's actual subject on inputs that were already short enough.
+const REASON_MAX = 58;
+function shortDisplayReason(reason) {
+  const raw = typeof reason === "string" ? reason.trim().replace(/\s+/g, " ") : "";
+  if (!raw) return "";
+  if (raw.length <= REASON_MAX) return raw;
+  // First sentence. The lookahead requires a following capital so "approx. 3in"
+  // and "e.g. a tray" are not mistaken for sentence ends.
+  const firstSentence = raw.split(/(?<=[.!?])\s+(?=[A-Z])/)[0].trim();
+  let out = firstSentence.length <= REASON_MAX
+    ? firstSentence
+    : firstSentence.split(/[,;:]\s+/)[0].trim();
+  if (out.length > REASON_MAX) {
+    // Word-boundary trim. slice(0, REASON_MAX + 1) so a candidate that ends
+    // exactly ON the limit still finds its trailing space rather than losing
+    // its last whole word.
+    const cut = out.slice(0, REASON_MAX + 1);
+    const lastSpace = cut.lastIndexOf(" ");
+    out = (lastSpace > 0 ? cut.slice(0, lastSpace) : out.slice(0, REASON_MAX)).trim();
+    out = out.replace(/[,;:.\-–—]+$/, "");
+    return out ? `${out}...` : "";
+  }
+  // A clause or sentence that fits keeps its own punctuation, minus a trailing
+  // comma/semicolon left behind by the split.
+  return out.replace(/[,;:]+$/, "");
+}
+
 // The icon vocabulary is enforced at the prompt level (analyze()'s own
 // productInstruction lists these exact keys) - keep the two in sync, and
 // keep every name here verified against the installed lucide-react-native
@@ -2809,22 +2902,22 @@ const PRODUCT_CATEGORY_ICONS = {
   // organizing hardware (original vocabulary, unchanged)
   cable: Cable,
   basket: ShoppingBasket,
-  bin: Box,
+  bin: Container,
   shelf: ShelvingUnit,
   hook: Anchor,
   label: Tag,
-  "drawer-organizer": Archive,
+  "drawer-organizer": Grid2x2,
   hanger: Shirt,
   bag: ShoppingBag,
   // decor / styling / finishing
   art: Frame,
   lighting: Lightbulb,
-  textile: Layers,
-  plant: Leaf,
-  tray: Utensils,
+  textile: Blinds,
+  plant: Sprout,
+  tray: ConciergeBell,
   barware: Wine,
   glassware: GlassWater,
-  decor: Sparkles,
+  decor: Amphora,
   storage: Boxes,
   furniture: Armchair,
   other: Package,
@@ -12612,10 +12705,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                             {recommendationGroups.flatMap((group) => group.items.map((item, i) => {
                               if (group.kind !== "product") return null;
                               const Icon = getProductCategoryIcon(item.icon);
+                              const shortReason = shortDisplayReason(resolveRecommendationReason(item, results.problemsFound));
                               return (
                                 <TouchableOpacity
                                   key={`${group.kind}-${i}`}
-                                  style={s.prodRow}
+                                  style={s.recCard}
                                   onPress={() => {
                                     const resolution = resolveProductDestination(item, {
                                       approachId: id,
@@ -12639,14 +12733,29 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                     });
                                     openResolvedProduct(resolution);
                                   }}
-                                  accessibilityLabel={`Find options for ${item.productType}`}
+                                  accessibilityLabel={`Find options for ${displayProductName(item.productType) || item.productType}`}
                                   accessibilityRole="button"
                                 >
-                                  <View style={[s.prodIco, { backgroundColor: meta.bg }]}>
-                                    <Icon size={15} color={meta.color} strokeWidth={2.25} />
+                                  {/* THE THUMBNAIL SLOT. Fixed 48x48 with
+                                      overflow hidden, so swapping this icon
+                                      for a real product image later is a
+                                      one-element change inside this box and
+                                      needs no layout change anywhere else -
+                                      the row height is already driven by the
+                                      text column, not by this tile. */}
+                                  <View style={[s.recIcon, { backgroundColor: meta.bg }]}>
+                                    <Icon size={30} color={meta.color} strokeWidth={2} />
                                   </View>
-                                  <View style={{ flex: 1 }}>
-                                    <Text style={s.prodName}>{item.productType}</Text>
+                                  <View style={s.recBody}>
+                                    {/* Short display name. item.productType is
+                                        untouched in the data and is still what
+                                        resolveProductDestination builds the
+                                        search query from - this is only what
+                                        the card shows. Falls back to the raw
+                                        type if shortening yields nothing. */}
+                                    <Text style={s.recName} numberOfLines={1}>
+                                      {displayProductName(item.productType) || item.productType}
+                                    </Text>
                                     {/* Product Grounding schema: an optional
                                         enhancement explains itself with its
                                         own grounding evidence; a
@@ -12654,17 +12763,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                         explains itself with the problem(s)
                                         it is linked to. `reason` remains the
                                         fallback and is all a pre-schema plan
-                                        has. See resolveRecommendationReason. */}
-                                    <Text style={s.approachProdReason}>{resolveRecommendationReason(item, results.problemsFound)}</Text>
+                                        has. See resolveRecommendationReason.
+                                        shortDisplayReason then trims that to
+                                        one line for the card - a pure display
+                                        transform, no AI call, and the full
+                                        text stays in the plan document. */}
+                                    {shortReason ? (
+                                      <Text style={s.recReason} numberOfLines={1}>{shortReason}</Text>
+                                    ) : null}
+                                    {/* Results Polish item 4: "Shop options"
+                                        overpromised - what actually happens is
+                                        an Amazon search built from generic
+                                        searchTerms, not a curated shopping
+                                        surface. "Find options" describes that
+                                        honestly until real product
+                                        intelligence exists. */}
+                                    <Text style={s.recLink}>Find options →</Text>
                                   </View>
-                                  {/* Results Polish item 4: "Shop options"
-                                      overpromised - what actually happens is
-                                      an Amazon search built from generic
-                                      searchTerms, not a curated shopping
-                                      surface. "Find options" describes that
-                                      honestly until real product
-                                      intelligence exists. */}
-                                  <Text style={s.approachShopLink}>Find options →</Text>
                                 </TouchableOpacity>
                               );
                             }))}
@@ -13594,6 +13709,20 @@ const s = StyleSheet.create({
   prodIco: { width: 28, height: 28, borderRadius: 7, alignItems: "center", justifyContent: "center" },
   prodName: { flex: 1, fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   prodPrice: { fontSize: 13, fontFamily: "Inter_700Bold" },
+  // Compact recommendation card (2026-08-16). DELIBERATELY separate styles
+  // from prodRow/prodIco/prodName above, which the legacy tier-based
+  // "SUGGESTED PRODUCTS" list still uses - old-format plans must render
+  // exactly as before, and sharing these would have silently restyled them.
+  // Height: 12 + 12 padding around a ~54px text column = ~78px per card, so
+  // three fit on screen without scrolling. The icon tile is 48px and never
+  // drives the row height, which is what makes the later swap to a product
+  // thumbnail a drop-in.
+  recCard: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: BRAND.offWhite, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 12, marginBottom: 8 },
+  recIcon: { width: 48, height: 48, borderRadius: 10, alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  recBody: { flex: 1, minWidth: 0 },
+  recName: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
+  recReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 2 },
+  recLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginTop: 4 },
   amznBadge: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 },
   amznText: { fontSize: 9, fontFamily: "Inter_700Bold", color: BRAND.mist },
   approachCard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderRadius: 16, padding: 16, marginBottom: 12 },
