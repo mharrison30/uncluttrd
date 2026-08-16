@@ -3496,14 +3496,38 @@ function AuthScreen() {
     <SafeAreaView style={s.safe}>
       <StatusBar barStyle="dark-content" />
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
-        <ScrollView contentContainerStyle={s.authScroll}>
+        {/* Keyboard behaviour for the auth screen - this is ONE screen for
+            both login and signup (`mode` only swaps the copy), so both get
+            the same treatment.
 
-          {/* Logo */}
-          <View style={s.authLogo}>
-            <View style={s.hdrMark}><DrawerIcon size={54} dark={true} /></View>
-            <Text style={s.authAppName}>Uncluttrd</Text>
-            <Text style={s.authTagline}>More Space. More Time. More You.</Text>
-          </View>
+            keyboardShouldPersistTaps="handled" is the load-bearing change.
+            Without it, a tap while the keyboard is open is swallowed to
+            dismiss the keyboard, so the primary action needed TWO taps -
+            visible but not actionable, which reads as a dead button.
+
+            keyboardDismissMode lets a scroll drag the keyboard away, and the
+            logo block below is a tap target that dismisses it. Both dismiss
+            the KEYBOARD only and never clear the fields - same principle as
+            renderRenameSheet's backdrop. */}
+        <ScrollView
+          contentContainerStyle={s.authScroll}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+        >
+
+          {/* Logo - doubles as the tap-outside-to-dismiss target. */}
+          <TouchableOpacity
+            activeOpacity={1}
+            onPress={() => Keyboard.dismiss()}
+            accessibilityLabel="Dismiss keyboard"
+            accessibilityRole="button"
+          >
+            <View style={s.authLogo}>
+              <View style={s.hdrMark}><DrawerIcon size={54} dark={true} /></View>
+              <Text style={s.authAppName}>Uncluttrd</Text>
+              <Text style={s.authTagline}>More Space. More Time. More You.</Text>
+            </View>
+          </TouchableOpacity>
 
           {/* Card */}
           <View style={s.authCard}>
@@ -10257,8 +10281,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   accessibilityLabel={`Place session from ${formatSessionDate(plan)}`}
                   accessibilityRole="button"
                 >
+                  {/* The thumbnail is its own Touchable INSIDE the card's
+                      Touchable. A nested Touchable wins the press, so tapping
+                      the photo opens the viewer without also firing the card's
+                      openClassify - which is what makes "look at the photo"
+                      and "classify this session" two separate gestures on one
+                      card. Reuses renderPhotoZoomModal (ImageZoom: pinch,
+                      double-tap, pan), the same viewer Results and Room Detail
+                      already use, so there is no second zoom implementation.
+                      Closing only clears vizModal, so the Needs Review list,
+                      its scroll position and any open sheet are untouched. */}
                   {plan.photoUrl ? (
-                    <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                    <TouchableOpacity
+                      onPress={() => { setVizModal(plan.photoUrl); setVizModalKey((k) => k + 1); }}
+                      accessibilityLabel={`View full-screen photo from ${formatSessionDate(plan)}`}
+                      accessibilityRole="imagebutton"
+                    >
+                      <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
+                    </TouchableOpacity>
                   ) : (
                     <View style={s.historyIcon}><HelpCircle size={26} color="#94A3B8" strokeWidth={2.25} /></View>
                   )}
@@ -10328,6 +10368,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         {renderRoomPicker()}
         {renderAreaPicker()}
         {renderClassifyNameSheet()}
+        {/* Needs Review is now a third caller of the shared viewer, alongside
+            Results and Room Detail. Rendered last so it layers above the
+            classify sheets if one happens to be open. */}
+        {renderPhotoZoomModal()}
       </SafeAreaView>
     );
   }
