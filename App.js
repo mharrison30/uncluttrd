@@ -2860,30 +2860,107 @@ function displayProductName(productType) {
 // fall back to the first clause. Doing it the other way round would cut
 // "The niche is empty, and the shelf below is crowded" at the comma and lose
 // the sentence's actual subject on inputs that were already short enough.
-const REASON_MAX = 58;
+// 45 chars, 5-9 words, and NO ellipsis - measured against real staging output,
+// where the median resolved reason is 137 characters, so essentially every one
+// is cut. That is what makes the "complete thought" rule the whole job here:
+// a plain 45-char word-boundary trim yields "The recessed niche is largely
+// empty and needs", which is a sentence stopped mid-air, and an ellipsis only
+// advertises the damage rather than repairing it.
+//
+// So after fitting the budget, trailing words are dropped while the last word
+// is one that is still WAITING for something - a determiner, preposition,
+// conjunction, auxiliary, or a transitive verb/participle with no object yet.
+// "...empty and needs" -> "...largely empty", which reads as a finished
+// observation. Taking fewer words is explicitly correct here; the 5-9 word
+// target is an aim, not a floor to pad toward.
+const REASON_MAX = 45;
+const REASON_MAX_WORDS = 9;
+const REASON_WEAK_ENDINGS = new Set([
+  // determiners / quantifiers
+  "a", "an", "the", "this", "that", "these", "those", "its", "their", "his",
+  "her", "our", "your", "my", "some", "any", "each", "every", "no", "another",
+  "other", "both", "all", "several", "multiple", "various", "additional",
+  "more", "most", "few", "many", "much", "such", "one", "two", "three",
+  // prepositions
+  "of", "in", "on", "at", "to", "for", "with", "from", "by", "into", "onto",
+  "over", "under", "above", "below", "across", "through", "between", "among",
+  "around", "beside", "behind", "near", "without", "within", "against",
+  "alongside", "upon", "off", "out", "up", "down", "about",
+  // conjunctions / complementizers
+  "and", "or", "but", "nor", "so", "yet", "while", "whereas", "plus", "than",
+  "which", "who", "whom", "whose", "where", "when", "as", "if", "because",
+  // auxiliaries / copulas
+  "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+  "do", "does", "did", "will", "would", "can", "could", "should", "may",
+  "might", "must", "am",
+  // transitive verbs and participles that still want an object
+  "needs", "need", "provides", "provide", "providing", "creates", "create",
+  "creating", "adds", "add", "adding", "holds", "hold", "holding", "keeps",
+  "keep", "keeping", "makes", "make", "making", "gives", "give", "giving",
+  "leaves", "leaving", "establishes", "establish", "establishing", "enhances",
+  "enhance", "softens", "soften", "offers", "offer", "lacks", "lack",
+  "requires", "require", "allows", "allow", "prevents", "prevent", "includes",
+  "include", "including", "features", "contains", "becomes", "brings",
+  "delivers", "supports", "houses", "stores", "displays", "showcases",
+  "anchors", "corrals", "organizes", "organize", "uses", "use", "using",
+  "leaving", "turning", "turns", "reducing", "reduce", "improving", "improve",
+  // degree/focus adverbs, which always point forward at something
+  "only", "just", "even", "still", "very", "quite", "rather", "fairly", "too",
+  // attributive adjectives seen dangling in real staging output ("provides a
+  // clean", "and neutral"). Predicate adjectives that legitimately END a
+  // thought - "is largely empty", "feels incomplete", "appears cluttered" -
+  // are deliberately NOT here.
+  "clean", "neutral", "warm", "cool", "single", "loose", "plain", "bare",
+  "blank", "open", "clear", "small", "large", "deep", "wide", "tall", "short",
+  "dark", "soft", "plush", "upgraded", "coordinating", "matching",
+  "decorative", "wooden", "metal", "white", "black", "brown", "beige",
+  "electronic", "inanimate", "uncertain", "rectangular", "horizontal",
+  "vertical", "overhead", "recessed", "upper", "lower", "middle", "current",
+  "flat", "round", "square",
+  // degree/frame adverbs that modify something still to come
+  "entirely", "currently", "solely", "minimally", "largely", "mostly",
+  // more transitive verbs observed dangling in real output
+  "relies", "rely", "wraps", "wrap", "contain", "sitting", "distributed",
+  "arranged", "positioned", "placed", "stacked", "mounted",
+]);
+// A trailing word ending in one of these suffixes is almost always an
+// adjective still reaching for its noun ("numerous", "architectural",
+// "decorative"). Cheaper and broader than trying to enumerate every adjective
+// the model might produce, and it only ever removes words - a false positive
+// costs one word of context, never correctness.
+const REASON_DANGLING_SUFFIX = /(ous|ial|ual|ative|itive|able|ible|ful|less|ish|ary|ory)$/;
 function shortDisplayReason(reason) {
   const raw = typeof reason === "string" ? reason.trim().replace(/\s+/g, " ") : "";
   if (!raw) return "";
-  if (raw.length <= REASON_MAX) return raw;
-  // First sentence. The lookahead requires a following capital so "approx. 3in"
-  // and "e.g. a tray" are not mistaken for sentence ends.
+  // First sentence, then its first clause. The lookahead requires a following
+  // capital so "approx. 3in" is not mistaken for a sentence end.
   const firstSentence = raw.split(/(?<=[.!?])\s+(?=[A-Z])/)[0].trim();
-  let out = firstSentence.length <= REASON_MAX
-    ? firstSentence
-    : firstSentence.split(/[,;:]\s+/)[0].trim();
-  if (out.length > REASON_MAX) {
-    // Word-boundary trim. slice(0, REASON_MAX + 1) so a candidate that ends
-    // exactly ON the limit still finds its trailing space rather than losing
-    // its last whole word.
-    const cut = out.slice(0, REASON_MAX + 1);
-    const lastSpace = cut.lastIndexOf(" ");
-    out = (lastSpace > 0 ? cut.slice(0, lastSpace) : out.slice(0, REASON_MAX)).trim();
-    out = out.replace(/[,;:.\-–—]+$/, "");
-    return out ? `${out}...` : "";
-  }
-  // A clause or sentence that fits keeps its own punctuation, minus a trailing
-  // comma/semicolon left behind by the split.
-  return out.replace(/[,;:]+$/, "");
+  const firstClause = firstSentence.split(/[,;:]\s+/)[0].trim();
+  const base = firstClause || firstSentence;
+  let words = base.split(/\s+/).filter(Boolean);
+  // Fit the character budget by whole words only - never a mid-word cut.
+  while (words.length > 1 && words.join(" ").length > REASON_MAX) words.pop();
+  if (words.length > REASON_MAX_WORDS) words = words.slice(0, REASON_MAX_WORDS);
+  // Back off to something that reads as finished.
+  const bare = (w) => w.replace(/[^A-Za-z-]/g, "").toLowerCase();
+  const weak = (w) => {
+    const b = bare(w);
+    if (!b) return true;
+    if (REASON_WEAK_ENDINGS.has(b)) return true;
+    if (b.length <= 5) return false;
+    // "-ous" is checked before the plural guard on purpose: "numerous" and
+    // "spacious" both end in s without being plurals, and the guard below
+    // would otherwise let them through.
+    if (b.endsWith("ous")) return true;
+    // Everything else: suffix test, never applied to a plural noun ("items",
+    // "bottles", "shelves").
+    return !b.endsWith("s") && REASON_DANGLING_SUFFIX.test(b);
+  };
+  while (words.length > 1 && weak(words[words.length - 1])) words.pop();
+  const out = words.join(" ").replace(/[,;:\-–—]+$/, "").trim();
+  // A clause that survived whole keeps its own terminal punctuation; a trimmed
+  // one gets none - no ellipsis, by design.
+  return out.length > REASON_MAX ? out.slice(0, REASON_MAX).trim() : out;
 }
 
 // The icon vocabulary is enforced at the prompt level (analyze()'s own

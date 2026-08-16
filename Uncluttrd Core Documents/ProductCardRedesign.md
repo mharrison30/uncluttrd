@@ -191,3 +191,70 @@ Code-verified only. `node -c` and `expo export` cannot measure a rendered card.
 **(c) is the one I would check first** — `Blinds` for `textile` and `Anchor` for
 `hook` are the two mappings chosen from a constrained vocabulary, and only
 looking at them settles whether they communicate the category.
+
+---
+
+# Addendum — shortened to 45 chars / 5–9 words (2026-08-16)
+
+The 58-char limit still wrapped on a phone. Now **45 chars, 5–9 words, no
+ellipsis**, tuned against **54 real staging recommendations** (37 unique
+reasons) rather than invented examples.
+
+**Why the "complete thought" rule does all the work here.** The median resolved
+reason in real staging data is **137 characters** (min 81, max 499), so
+essentially every one is cut. A plain 45-char word-boundary trim produces *"The
+recessed niche is largely empty and needs"* — a sentence stopped mid-air. An
+ellipsis only advertises that instead of repairing it.
+
+So after fitting the budget, trailing words are dropped while the last word is
+still *waiting* for something: determiner, preposition, conjunction, auxiliary,
+degree adverb, attributive adjective, or a transitive verb/participle with no
+object. Plus a suffix test (`-ous`, `-ial`, `-ative`, `-able`, `-ful`, …) that
+catches adjectives the list doesn't name, never applied to a plural noun.
+
+Predicate adjectives that legitimately end a thought — *"is largely empty"*,
+*"feels incomplete"* — are deliberately excluded from the list.
+
+## Before / after on real staging data
+
+| | |
+|---|---|
+| **countertop tray** | |
+| old (57c, 9w) | The vanity counter has multiple items scattered across it |
+| **new (37c, 6w)** | **The vanity counter has multiple items** |
+| **framed wall art** | |
+| old (60c, 11w) | The walls around the toilet and beside the vanity have no... |
+| **new (27c, 5w)** | **The walls around the toilet** |
+| **plush bath mat** | |
+| old (58c, 10w) | The white tile floor provides a clean foundation that a... |
+| **new (20c, 4w)** | **The white tile floor** |
+| **Lazy Susan turntable** | |
+| old (59c, 11w) | The deep corner area appears to have items pushed to the... |
+| **new (42c, 8w)** | **The deep corner area appears to have items** |
+
+Note the old column: every one ends on a dangling `the`, `a`, or `no` and
+needed an ellipsis. None of the new ones do.
+
+## Results across all 37 unique reasons
+
+| | |
+|---|---|
+| over 45 chars | **0** |
+| ellipsis anywhere | **none** |
+| words min / median / max | 2 / 5 / 9 |
+
+The three sub-5-word results (*"The white tile floor"*, *"Canned goods"*, *"The
+bookshelf corner"*) are the rule working as specified — taking fewer words
+rather than emitting a fragment.
+
+All three brief examples pass through **unchanged**: *"Add height to the empty
+niche."*, *"Anchor the dining zone visually."*, *"Organize bottles into a bar
+display."* Null / undefined / empty / non-string all return `""`.
+
+**Two known imperfections**, both from genuine noun/verb ambiguity: *"The
+shelves currently display"* (`display` is a noun in *"as a display"* and a verb
+here — blocking it would break the other) and *"The room relies solely on
+recessed ceiling"* (wants "lighting"). 2 of 37.
+
+`node -c`, TDZ audit (0 violations) and `expo export` all pass. Full `reason`
+still untouched in the data, and PDF/text share still emit it in full.
