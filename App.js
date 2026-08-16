@@ -4349,6 +4349,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [classifyName, setClassifyName] = useState("");
   const [classifySaving, setClassifySaving] = useState(false);
   const [classifyError, setClassifyError] = useState(null);
+  // Names the destination in the overlay ("Assigning to Kitchen...") rather
+  // than a generic "Saving...", so the user can see their choice was the one
+  // that registered - the same reason roomConfirmationText exists.
+  const [classifyText, setClassifyText] = useState("Filing this session...");
+  // Re-entry guard for every Needs Review commit path. A ref, not
+  // classifySaving, for exactly the reason completeRoomConfirmation documents:
+  // setClassifySaving(true) does not apply until React re-renders, so two taps
+  // in the same frame both pass a state check and both run the whole save.
+  // classifySession is NOT idempotent across a double-fire - the second call
+  // re-reads a plan whose canonicalSpaceId the first already moved, so it takes
+  // the "already under the target" branch and reprojects a second time. A ref
+  // flips synchronously, so the second tap loses the race even if the overlay
+  // has not painted a pixel.
+  const classifyInFlightRef = useRef(false);
   const [recoveryReloadKey, setRecoveryReloadKey] = useState(0);
   const [historyItem, setHistoryItem] = useState(null); // viewing a past plan
   // Room Detail screen (My Rooms -> True Room Grouping, Phase B) - replaces
@@ -8899,6 +8913,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // still open underneath, so Cancel goes BACK rather than abandoning the
   // whole classification. For the two move flows it stays a plain close.
   const closeRoomPicker = () => {
+    // A whole-Room classification now commits from inside this picker, so this
+    // is a live dismissal path during that write - backdrop tap, Cancel and
+    // Android back all land here.
+    if (classifyInFlightRef.current) return;
     if (roomPickerFor?.kind === "session") {
       setRoomPickerFor(null);
       setClassifyStep("options");
@@ -8914,17 +8932,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // never a same-tap action).
   const onRoomPickerSelectForMove = (targetRoom) => {
     const ctx = roomPickerFor;
-    setRoomPickerFor(null);
     if (!ctx) return;
     // Session classification has no separate confirmation step, and that
     // is deliberate: it is a repair, not a destructive move. Nothing is
     // merged or retired, the session simply lands where the user says it
     // belongs, and getting it wrong is fixable by classifying again.
     if (ctx.kind === "session") {
-      if (ctx.mode === "whole") runClassify(targetRoom.id, null);
-      else enterAreaStep(targetRoom);
+      if (ctx.mode === "whole") {
+        // Deliberately does NOT clear roomPickerFor first. runClassify's
+        // overlay needs a mounted host to paint on, and this picker is the
+        // only thing on screen at this point - closing it here ran the entire
+        // commit behind a bare Needs Review list with no feedback at all,
+        // which is the gap being fixed. closeClassify (on success) clears
+        // roomPickerFor itself; on failure the picker stays up and shows the
+        // error inline.
+        runClassify(targetRoom.id, null);
+        return;
+      }
+      setRoomPickerFor(null);
+      enterAreaStep(targetRoom);
       return;
     }
+    setRoomPickerFor(null);
     setMoveConfirmTarget({ ...ctx, targetRoom });
   };
 
@@ -9006,7 +9035,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setClassifyError(null);
   };
   const closeClassify = () => {
-    if (classifySaving) return;
+    // Guards on the ref, not classifySaving: the state a given render captured
+    // can be stale by the time a tap fires, and every dismissal path (backdrop
+    // tap, Cancel, Android back, onRequestClose) routes through here.
+    if (classifyInFlightRef.current) return;
     setClassifyFor(null);
     setClassifyStep(null);
     setClassifyRoom(null);
@@ -9032,7 +9064,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // only decides which (Room, Area) pair to pass, so a session classified
   // as whole-Room and one classified into an Area travel identical code.
   const runClassify = async (targetRoomId, targetAreaId, newAreaName = null) => {
-    if (!classifyFor || classifySaving) return;
+    if (!classifyFor) return;
+    if (classifyInFlightRef.current) return;
+    classifyInFlightRef.current = true;
+    // Resolve the destination label BEFORE any await, from the arguments this
+    // call was given - reading it off state later could race a re-render.
+    const roomName = (rooms.find((r) => r.id === targetRoomId) || classifyRoom || {}).displayName || "this Room";
+    const areaLabel = newAreaName || (classifyAreas.find((a) => a.id === targetAreaId) || {}).displayName || null;
+    setClassifyText(areaLabel ? `Moving to ${roomName} / ${areaLabel}...` : `Assigning to ${roomName}...`);
     setClassifySaving(true);
     setClassifyError(null);
     try {
@@ -9055,18 +9094,32 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         });
       }
       logEvent(getAnalytics(), "session_classified", { planId: classifyFor.id, scope: (targetAreaId || newAreaName) ? "area" : "room" });
+      // Release the guard BEFORE closeClassify, which now refuses to run while
+      // a commit is in flight - the behaviour we want for a Cancel tap and
+      // exactly wrong for this success path. refreshRecovery re-runs the
+      // unresolved query, which is what drops this session out of the list and
+      // updates the header count.
+      classifyInFlightRef.current = false;
       setClassifySaving(false);
       closeClassify();
       refreshRecovery();
       return;
     } catch (e) {
+      // Failure leaves the plan in whatever state classifySession left it -
+      // unclassified unless it reported "completed" - and keeps the sheet open
+      // with the error visible so the user can retry. Only the overlay comes
+      // down; nothing here rolls anything back or closes the flow.
       setClassifyError(e.message || "Something went wrong. Please try again.");
     }
+    classifyInFlightRef.current = false;
     setClassifySaving(false);
   };
   const submitNewRoomName = async () => {
     const trimmed = classifyName.trim();
-    if (!trimmed || classifySaving) return;
+    if (!trimmed) return;
+    if (classifyInFlightRef.current) return;
+    classifyInFlightRef.current = true;
+    setClassifyText(`Creating ${trimmed}...`);
     setClassifySaving(true);
     setClassifyError(null);
     try {
@@ -9085,6 +9138,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     } catch (e) {
       setClassifyError(e.message || "Couldn't create that Room. Please try again.");
     } finally {
+      // Released on BOTH paths: success hands off to the Area step, which is
+      // its own commit and needs the guard free again.
+      classifyInFlightRef.current = false;
       setClassifySaving(false);
     }
   };
@@ -9096,11 +9152,23 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         { text: "Cancel", style: "cancel" },
         {
           text: "Delete", style: "destructive", onPress: async () => {
+            // Same guard as every other commit here. The Alert itself is
+            // dismissed by the tap, so a double-tap cannot re-enter through it -
+            // but handleDeleteSession is also reachable from the options sheet,
+            // and softDeletePlan is a real write with real latency.
+            if (classifyInFlightRef.current) return;
+            classifyInFlightRef.current = true;
+            setClassifyText("Deleting session...");
+            setClassifySaving(true);
             try {
-              closeClassify();
               await softDeletePlan(user.uid, plan.id);
+              classifyInFlightRef.current = false;
+              setClassifySaving(false);
+              closeClassify();
               refreshRecovery();
             } catch (e) {
+              classifyInFlightRef.current = false;
+              setClassifySaving(false);
               Alert.alert("Couldn't delete", e.message);
             }
           },
@@ -9143,14 +9211,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <Text style={{ fontSize: 13, color: "#B91C1C" }}>{classifyError}</Text>
             </View>
           )}
-          {classifySaving ? (
-            <View style={{ alignItems: "center", paddingVertical: 22 }}>
-              <ActivityIndicator size="large" color={BRAND.green} />
-              <Text style={{ fontSize: 14, color: "#64748B", marginTop: 12 }}>Filing this session...</Text>
-            </View>
-          ) : (
+          {/* Was an inline spinner that REPLACED the list. Now the shared
+              ProcessingOverlay covers the whole sheet instead, so this sheet
+              behaves like every other multi-step save in the app and the
+              destination name is visible while it runs. */}
+          {(
             <ScrollView keyboardShouldPersistTaps="handled">
               <TouchableOpacity
+                disabled={classifySaving}
                 style={[s.historyItem, { marginBottom: 8 }]}
                 onPress={() => runClassify(classifyRoom.id, null)}
                 accessibilityLabel="This session covers the whole Room"
@@ -9165,6 +9233,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               {classifyAreas.map((area) => (
                 <TouchableOpacity
                   key={area.id}
+                  disabled={classifySaving}
                   style={[s.historyItem, { marginBottom: 8 }]}
                   onPress={() => runClassify(classifyRoom.id, area.id)}
                   accessibilityLabel={`File under ${area.displayName}`}
@@ -9183,6 +9252,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 </TouchableOpacity>
               ))}
               <TouchableOpacity
+                disabled={classifySaving}
                 style={[s.historyItem, { marginBottom: 0 }]}
                 onPress={() => { setClassifyName(""); setClassifyStep("name-area"); }}
                 accessibilityLabel="Create a new Area"
@@ -9200,6 +9270,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
           </TouchableOpacity>
         </View>
+        {classifySaving && <ProcessingOverlay text={classifyText} />}
       </View>
     </Modal>
   );
@@ -9252,6 +9323,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               </TouchableOpacity>
             </View>
           </View>
+          {/* Covers the text input too - without it the keyboard stays up and
+              the field stays editable while the Room/Area is being created. */}
+          {classifySaving && <ProcessingOverlay text={classifyText} />}
         </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -9265,26 +9339,30 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeClassify} accessibilityLabel="Close" accessibilityRole="button" />
         <View style={s.renameSheetCard}>
           <Text style={s.renameSheetTitle}>Where does this session belong?</Text>
-          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-whole"); setRoomPickerFor({ kind: "session", mode: "whole" }); }} accessibilityRole="button" accessibilityLabel="This is a whole-Room session">
+          <TouchableOpacity disabled={classifySaving} style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-whole"); setRoomPickerFor({ kind: "session", mode: "whole" }); }} accessibilityRole="button" accessibilityLabel="This is a whole-Room session">
             <Home size={18} color="#334155" strokeWidth={2.25} />
             <Text style={s.areaActionText}>This is a whole-Room session</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-area"); setRoomPickerFor({ kind: "session", mode: "area" }); }} accessibilityRole="button" accessibilityLabel="This belongs to an Area">
+          <TouchableOpacity disabled={classifySaving} style={s.areaActionRow} onPress={() => { setClassifyStep("pick-room-area"); setRoomPickerFor({ kind: "session", mode: "area" }); }} accessibilityRole="button" accessibilityLabel="This belongs to an Area">
             <Layers size={18} color="#334155" strokeWidth={2.25} />
             <Text style={s.areaActionText}>This belongs to an Area</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={s.areaActionRow} onPress={() => { setClassifyName(""); setClassifyStep("name-room"); }} accessibilityRole="button" accessibilityLabel="Create a new Room for this">
+          <TouchableOpacity disabled={classifySaving} style={s.areaActionRow} onPress={() => { setClassifyName(""); setClassifyStep("name-room"); }} accessibilityRole="button" accessibilityLabel="Create a new Room for this">
             <Plus size={18} color="#334155" strokeWidth={2.25} />
             <Text style={s.areaActionText}>Create a new Room for this</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[s.areaActionRow, { borderBottomWidth: 0 }]} onPress={() => handleDeleteSession(classifyFor)} accessibilityRole="button" accessibilityLabel="Delete this session">
+          <TouchableOpacity disabled={classifySaving} style={[s.areaActionRow, { borderBottomWidth: 0 }]} onPress={() => handleDeleteSession(classifyFor)} accessibilityRole="button" accessibilityLabel="Delete this session">
             <Trash2 size={18} color="#DC2626" strokeWidth={2.25} />
             <Text style={[s.areaActionText, { color: "#DC2626" }]}>Delete this session</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 16 }]} onPress={closeClassify}>
+          <TouchableOpacity disabled={classifySaving} style={[s.mergeSecondaryBtn, { marginTop: 16 }]} onPress={closeClassify}>
             <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
           </TouchableOpacity>
         </View>
+        {/* Delete runs from this sheet, so the overlay lives here too. Placed
+            as the last child of the backdrop so it covers the card AND the
+            tap-to-dismiss area above it. */}
+        {classifySaving && <ProcessingOverlay text={classifyText} />}
       </View>
     </Modal>
   );
@@ -9364,6 +9442,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               ? `Move "${roomPickerFor?.area?.displayName || "this Area"}" to...`
               : `Move "${roomPickerFor?.room?.displayName || "this Room"}" into...`}
           </Text>
+          {/* A whole-Room classification commits from THIS sheet (see
+              onRoomPickerSelectForMove), so its failure has to surface here -
+              otherwise the picker would simply sit there after a failed write
+              with no explanation. */}
+          {roomPickerFor?.kind === "session" && classifyError && (
+            <View style={{ backgroundColor: "#FEF2F2", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+              <Text style={{ fontSize: 13, color: "#B91C1C" }}>{classifyError}</Text>
+            </View>
+          )}
           {roomPickerOptions.length === 0 && roomPickerFor?.kind !== "session" ? (
             <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>
               You don't have another Room to move this into yet. Organize a different room first, then try again.
@@ -9375,6 +9462,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 return (
                   <TouchableOpacity
                     key={r.id}
+                    disabled={classifySaving}
                     style={[s.historyItem, { marginBottom: 8 }]}
                     onPress={() => onRoomPickerSelectForMove(r)}
                     accessibilityLabel={`Move to ${r.displayName}`}
@@ -9401,6 +9489,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   discoverable and its absence explained, not just missing. */}
               {roomPickerFor?.kind === "session" ? (
                 <TouchableOpacity
+                  disabled={classifySaving}
                   style={[s.historyItem, { marginBottom: 0 }]}
                   onPress={() => { setRoomPickerFor(null); setClassifyName(""); setClassifyStep("name-room"); }}
                   accessibilityLabel="Create a new Room"
@@ -9429,10 +9518,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               )}
             </ScrollView>
           )}
-          <TouchableOpacity style={[s.mergeSecondaryBtn, { marginTop: 12 }]} onPress={closeRoomPicker}>
+          <TouchableOpacity disabled={classifySaving} style={[s.mergeSecondaryBtn, { marginTop: 12 }]} onPress={closeRoomPicker}>
             <Text style={s.mergeSecondaryBtnText}>Cancel</Text>
           </TouchableOpacity>
         </View>
+        {/* Only ever true for kind: "session" - the Area/Room move paths hand
+            off to renderMoveConfirm, which carries its own moveSaving overlay. */}
+        {classifySaving && <ProcessingOverlay text={classifyText} />}
       </View>
     </Modal>
   );
