@@ -96,3 +96,18 @@ curl -s  https://uncluttrd.app/partners | grep -o 'href="/privacy"'
 Then check the footer visually at desktop width and at ≤640 px, where the
 media query switches the links to wrapped `inline-block` with larger tap
 targets.
+
+---
+
+## Step 8 — flagged for removal (2026-08-17)
+
+`website/recovered-site/` in this repo is a **duplicate** of the standalone
+website repo at `C:\uncluttrd-website`, which is the source of truth.
+
+**Remove this folder once the standalone repo is pushed to GitHub and a
+Git-backed Netlify deploy is proven byte-identical to the pre-migration
+baseline.** Keeping two copies invites the exact ambiguity the recovery was done
+to eliminate.
+
+Not removed yet — the migration is blocked on credentials (see
+`C:\uncluttrd-website\MIGRATION.md`).
