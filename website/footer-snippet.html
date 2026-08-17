@@ -1,0 +1,48 @@
+<!-- ===========================================================================
+     Uncluttrd site footer — canonical version, 2026-08-17.
+
+     Apply this to EVERY page: /, /privacy, /terms, /partners, /disclosure.
+
+     WHAT CHANGED vs the footer currently live on /privacy and /terms:
+       + <a href="/partners">Partners</a>              (was missing)
+       + <a href="/disclosure">Affiliate Disclosure</a> (page did not exist)
+
+     WHY THIS MATTERS: the homepage currently links to NONE of these. Its only
+     hrefs are in-page anchors (#how, #pricing, #faq, #download), the two app
+     store badges, Google Fonts, and mailto:hello@uncluttrd.app. Verified by
+     grepping the live 567 KB homepage on 2026-08-17. A reviewer landing on
+     uncluttrd.app cannot reach the privacy policy, terms, partners page or
+     this disclosure at all — they exist but are undiscoverable, which for
+     screening purposes is the same as not existing.
+
+     The <style> block below is only needed on the HOMEPAGE, which has no
+     footer styles of its own. /privacy, /terms and /partners already define
+     `footer`, `footer a` and `.footer-copy` — on those pages, paste the
+     <footer> element ONLY and drop the <style>.
+     =========================================================================== -->
+
+<style>
+  footer { background: #0F2A52; padding: 32px 24px; text-align: center; }
+  footer a { color: rgba(255,255,255,0.5); text-decoration: none; font-size: 13px; margin: 0 12px; }
+  footer a:hover { color: #FFFFFF; }
+  .footer-copy { color: rgba(255,255,255,0.3); font-size: 12px; margin-top: 16px; }
+  /* Mobile: the single-line footer wraps badly under ~640px. Making each link
+     an inline-block with vertical margin gives a readable stacked/wrapped
+     layout and a large enough tap target on a phone. */
+  @media (max-width: 640px) {
+    footer a { display: inline-block; margin: 6px 10px; }
+  }
+</style>
+
+<footer>
+  <a href="/">Home</a>
+  <a href="/#transformations">Transformations</a>
+  <a href="/#pricing">Pricing</a>
+  <a href="/#faq">FAQ</a>
+  <a href="/partners">Partners</a>
+  <a href="/privacy">Privacy Policy</a>
+  <a href="/terms">Terms of Use</a>
+  <a href="/disclosure">Affiliate Disclosure</a>
+  <a href="mailto:hello@uncluttrd.app">Support</a>
+  <div class="footer-copy">&copy; 2026 Uncluttrd. All rights reserved.</div>
+</footer>
