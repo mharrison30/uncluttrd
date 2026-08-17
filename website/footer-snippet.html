@@ -7,13 +7,13 @@
        + <a href="/partners">Partners</a>              (was missing)
        + <a href="/disclosure">Affiliate Disclosure</a> (page did not exist)
 
-     WHY THIS MATTERS: the homepage currently links to NONE of these. Its only
-     hrefs are in-page anchors (#how, #pricing, #faq, #download), the two app
-     store badges, Google Fonts, and mailto:hello@uncluttrd.app. Verified by
-     grepping the live 567 KB homepage on 2026-08-17. A reviewer landing on
-     uncluttrd.app cannot reach the privacy policy, terms, partners page or
-     this disclosure at all — they exist but are undiscoverable, which for
-     screening purposes is the same as not existing.
+     WHY THIS MATTERS: the homepage and subpages ALREADY link to /privacy,
+     /terms and /partners (verified against the recovered production files).
+     The ONLY genuinely missing link is /disclosure, plus /partners which is
+     absent from privacy.html only. An earlier claim that no legal links
+     existed was wrong - it came from a grep that matched only double-quoted
+     href attributes, while the site uses single quotes for exactly those
+     links (href='/privacy').
 
      The <style> block below is only needed on the HOMEPAGE, which has no
      footer styles of its own. /privacy, /terms and /partners already define

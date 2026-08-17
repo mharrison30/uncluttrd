@@ -37,15 +37,35 @@ change. That is why this stopped here rather than proceeding.
 
 ---
 
-## What still needs to happen
+## RESOLVED 2026-08-17 — and a correction
 
-1. **Identify the authoritative source.** Either a Netlify-connected Git repo,
-   or confirmation that deploys are drag-and-drop from a local folder.
-2. **Put the site under version control.** Four public pages currently have no
-   source of truth outside Netlify itself, and the working copy appears to be
-   whichever `index (N).html` was most recently edited. That is the actual
-   root problem here; the missing disclosure page is a symptom.
-3. Then apply `disclosure.html` and `footer-snippet.html`.
+The site has since been **recovered byte-exactly from production and placed
+under version control** at `C:\uncluttrd-website` (outside this repo, because
+`C:\uncluttrd54\.gitignore` is an EAS fingerprint input). That repo is now the
+source of truth. Deploys remain drag-and-drop to Netlify; nothing has been
+deployed.
+
+**Correction to an earlier claim in this file and in the report that accompanied
+it.** It stated the live pages "link to NONE" of the legal pages. **That was
+wrong.** The footers *do* link to `/privacy`, `/terms` and `/partners` on all
+four pages. The error was mine: my grep matched only double-quoted `href`
+attributes, and the site uses single quotes for exactly those links
+(`href='/privacy'`).
+
+What is actually true after inspecting the recovered files:
+
+| Page | `/privacy` | `/terms` | `/partners` | `/disclosure` |
+|---|---|---|---|---|
+| `index.html` | yes | yes | yes | **no** |
+| `terms.html` | yes | yes | yes | **no** |
+| `partners.html` | yes | yes | yes | **no** |
+| `privacy.html` | yes | yes | **no** | **no** |
+
+So the footer work is much smaller than described: add `/disclosure` to all four
+pages, and add the missing `/partners` link to `privacy.html`. The disclosure
+page itself is still genuinely absent (`/disclosure` returns 404) and there is
+**zero** affiliate or FTC language anywhere in the real markup — confirmed after
+stripping the 537 KB base64 blob that was producing false keyword matches.
 
 ---
 
