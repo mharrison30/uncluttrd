@@ -18,7 +18,49 @@ For the strategic why behind Commerce, see Commerce.md. For engineering detail, 
 | Amazon Associates | ✅ Active | ID: `uncluttrd20-20` |
 | Awin | ✅ Active | Account active |
 | FlexOffers | ⏳ Pending | Applied, 5 business day review |
-| Rakuten Advertising | Not yet applied | Migrating into Impact per April 2026 alliance; may become moot |
+| Rakuten Advertising | ✅ Active | Publisher API auth, partnership retrieval, SFTP Product Catalog and Deep Link API all validated 2026-08-17. **Supersedes the previous "not yet applied / may become moot" note** — the Impact alliance did not make Rakuten unavailable to us |
+
+---
+
+## Rakuten Advertising — validation status (2026-08-17)
+
+Recorded separately because Rakuten is the first network where feed
+**mechanics** have been validated end to end, and it is important not to let
+that be mistaken for validated **coverage**.
+
+**Proven:**
+
+| Capability | Evidence |
+|---|---|
+| Publisher API authentication | works |
+| Advertiser partnership retrieval | programmatic |
+| Product Catalog via SFTP | full catalog downloaded |
+| Record count fidelity | 2,213 records, **exactly** the count Rakuten reports for that advertiser |
+| Feed contents | names, categories, descriptions, prices, images, availability, UPC/identifiers, product URLs |
+| Affiliate-tracked product URLs | present in the catalog itself |
+| File types available | full, category, delta, template, delta-template |
+| Deep Link API | works on advertiser homepage **and** individual product page; preserves the custom `u1` value |
+
+**Two findings that constrain any future design:**
+
+1. **Product Search ≠ Product Catalog.** Product Search returned **zero**
+   results for the test advertiser while the Product Catalog held 2,213
+   records. The two must not be assumed to have equivalent coverage, and any
+   future adapter must be built on ingested catalog data rather than on
+   Product Search.
+2. **The test advertiser is Highwood USA (MID 50730), an outdoor-furniture
+   merchant.** It validates mechanics only. Its catalog is almost entirely
+   outside the categories Uncluttrd recommends, so it is explicitly **not**
+   evidence of useful coverage.
+
+**Open, and required before any production ingestion:** durable catalog
+storage/retention rights under Rakuten's publisher terms. Amazon's 24-hour
+retention restriction is an Amazon rule and must not be assumed to apply here —
+but neither may durable storage be assumed permitted until verified.
+
+**Status:** validated on mechanics, **gated on category coverage.** Screening
+is in progress via `scripts/rakutenAdvertiserScreen.js`; no ingestion pipeline,
+adapter, or canonical catalog has been built.
 
 ---
 

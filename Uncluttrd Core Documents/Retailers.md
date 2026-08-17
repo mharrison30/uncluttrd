@@ -133,6 +133,56 @@ The operating strategy is:
 
 > **Build direct retailer relationships first. Use affiliate networks where they help. Never let one network become a dependency.**
 
+Rakuten Advertising is now a live access route (validated 2026-08-17 — see
+`AffiliatePipeline.md`). It does not change the strategy above. Network
+selection remains **evidence-driven and undecided**; Impact vs Rakuten is
+explicitly not being chosen on capability alone.
+
+### Catalog size is not coverage
+
+The governing measurement rule for every network, learned from three
+consecutive investigations:
+
+| Merchant | Catalog | Verdict |
+|---|---|---|
+| King Koil (Awin) | 29 rows | **1 distinct product.** Variant rows are not products |
+| DHgate (CJ) | large | mostly non-US locales; live-looking metadata over unmaintained feeds |
+| Highwood USA (Rakuten) | 2,213 records, count verified exactly | **outdoor furniture.** Perfect mechanics, ~zero Uncluttrd relevance |
+
+Each was technically impressive and strategically irrelevant. A merchant is
+worth an application only when its catalog is relevant to what Uncluttrd
+**actually recommends**, which is now a measured quantity rather than an
+assumption:
+
+| Category | Measured share | | Category | Measured share |
+|---|---:|---|---|---:|
+| Furniture | 13.5% | | Trays | 6.9% |
+| Lighting | 12.8% | | Wall art / mirrors | 6.0% |
+| Shelving / risers | 12.0% | | Textiles | 4.1% |
+| Cable management | 10.1% | | Hooks / hardware | 2.7% |
+| Drawer organizers | 9.4% | | Plants | 2.4% |
+| Storage / bins / baskets | 8.4% | | Barware / glassware | 2.0% |
+| Decor objects / vases | 8.0% | | Labels · Kitchen/pantry | 3.4% |
+
+Derived from 1,053 real recommendations across production and staging. This
+demand profile is **broad and long-tailed** — no single home retailer covers
+furniture *and* cable management *and* drawer organizers *and* wall art with
+depth, which is the structural argument for a retailer network rather than a
+primary-source strategy.
+
+`Product Coverage` in the registry fields below should be set from this
+evidence — `scripts/rakutenAdvertiserScreen.js` produces it for Rakuten — not
+from a merchant's own category label.
+
+### The base rate to expect
+
+Awin's directory screen: **5 of 974** advertisers were storage/organisation
+specific, and all five were weak. There is no reason to assume another
+network's distribution differs until measured. Note also that The Container
+Store — the single most category-relevant retailer in this document —
+**migrated off Rakuten to Impact**, which is a real signal about where
+organization specialists are concentrating.
+
 ---
 
 ## Retailer Registry Fields

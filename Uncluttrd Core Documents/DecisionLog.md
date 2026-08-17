@@ -11,6 +11,53 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-08
 
+### 2026-08-17 — Rakuten is validated on mechanics and gated on category coverage; screen before ingesting
+
+**Decision:** Rakuten Advertising is adopted as a validated *access route*, not
+as a product-data source. The next milestone is **advertiser/category
+screening** (`scripts/rakutenAdvertiserScreen.js`), explicitly **not** feed
+ingestion. No adapter, no canonical product catalog, and no change to `App.js`.
+
+**Reason:** Rakuten's mechanics are the best of the three networks investigated
+— SFTP full catalog, working deltas, affiliate URLs inside the feed, a Deep
+Link API that preserves `u1`, and a record count that matched Rakuten's own
+reported figure exactly. None of that is evidence of useful coverage. The test
+advertiser, **Highwood USA (MID 50730)**, is an outdoor-furniture merchant
+whose catalog sits almost entirely outside the categories Uncluttrd
+recommends. Building ingestion because the pipe works would repeat the King
+Koil error (29 feed rows = 1 distinct product) with better plumbing.
+
+**The rule this establishes:** *catalog size is not coverage.* A merchant
+earns ingestion only when its catalog is relevant to the measured Uncluttrd
+demand profile — 15 categories derived from 1,053 real recommendations, now
+recorded in `Retailers.md` and encoded as the screening taxonomy.
+
+**Alternatives considered:**
+- *Ingest Highwood now to exercise the pipeline end to end.* Rejected: it would
+  build durable infrastructure against a merchant we would never recommend
+  from, and the resulting "it works" would be measured on irrelevant data.
+- *Decide Impact vs Rakuten now.* Rejected: network selection stays
+  evidence-driven. The Container Store's migration off Rakuten to Impact is a
+  real signal, but one signal is not a decision.
+
+**Constraints recorded:**
+- **Product Search ≠ Product Catalog.** Search returned zero for an advertiser
+  whose catalog held 2,213 records. Any future adapter must read ingested
+  catalog data, never Product Search.
+- **Amazon's 24-hour retention rule is Amazon-specific.** It must not be
+  generalized to Rakuten — and durable storage must not be assumed permitted
+  either. Rakuten's publisher retention rights are **unverified** and are a
+  hard precondition of production ingestion.
+- **Amazon search remains the permanent fallback**, degrading per
+  recommendation rather than per card.
+
+**Outcome:** Approved. Screening tool built and self-validated against real
+recommendation text (22/22, with Highwood as the negative control, correctly
+screening IRRELEVANT). `ProductIntelligenceDesign.md` deliberately left
+unmodified pending the catalog-ownership decision.
+
+---
+
 ### 2026-08-01 — Session Given Stable Identity, Project Remains the Durable Owner
 [Decision] Session is promoted from an informal/implicit boundary to a stable-identity Project-owned event object.
 

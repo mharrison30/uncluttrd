@@ -1,0 +1,464 @@
+#!/usr/bin/env node
+/**
+ * Rakuten advertiser/category screening tool — BD, not a product feature.
+ *
+ * It answers ONE question, and deliberately not the next one:
+ *   "Does Rakuten have advertisers whose catalogs are relevant to what
+ *    Uncluttrd actually recommends?"
+ *
+ * It does NOT ingest, normalize, store, or rank anything. There is no adapter,
+ * no canonical catalog, and no change to the app. Building ingestion before
+ * this question is answered is the mistake this tool exists to prevent —
+ * AwinProductFeedPOC.md §12 reached the same conclusion for Awin, and Highwood
+ * USA (MID 50730) is the same lesson again: a 2,213-record catalog that is
+ * overwhelmingly outdoor furniture validates MECHANICS, not COVERAGE.
+ *
+ * THE DISTINCTION THIS TOOL IS BUILT AROUND:
+ *
+ *   catalog size            = how many records a merchant has
+ *   relevant catalog size   = how many of them Uncluttrd would ever recommend
+ *
+ * The first is easy and misleading. The second is the decision input. Every
+ * output below reports them separately and never blends them into one score.
+ *
+ * STRICTLY READ-ONLY:
+ *   - GETs against the Rakuten Publisher API only
+ *   - no tracking/deep link is ever FETCHED (that would register a real click);
+ *     deep-link construction is out of scope here entirely
+ *   - no SFTP connection is opened and no catalog file is downloaded — SFTP
+ *     input is an OPTIONAL directory listing the operator captures themselves
+ *     (--sftp-listing), so this tool never becomes half an ingestion pipeline
+ *
+ * CREDENTIALS live OUTSIDE the repository in ~/.uncluttrd-rakuten.env, are
+ * never printed, never written to an artifact, and never passed as argv.
+ * Every value is redacted from all output, including error paths.
+ *
+ * Usage:
+ *   node scripts/rakutenAdvertiserScreen.js --self-test
+ *       Validates the relevance taxonomy against a labeled fixture drawn from
+ *       real Uncluttrd recommendations. Needs NO credentials. Run this first.
+ *
+ *   node scripts/rakutenAdvertiserScreen.js
+ *       Tier 1 only: partnership + advertiser-metadata relevance screen.
+ *
+ *   node scripts/rakutenAdvertiserScreen.js --probe
+ *       Tier 1 + Tier 2: probe Product Search per category per candidate.
+ *       Rate-limited. See the PRODUCT SEARCH CAVEAT below.
+ *
+ *   node scripts/rakutenAdvertiserScreen.js --sftp-listing=listing.txt
+ *       Tier 3: parse an SFTP directory listing you captured yourself, to get
+ *       raw catalog size + freshness WITHOUT downloading any catalog.
+ *
+ *   node scripts/rakutenAdvertiserScreen.js --probe --json out.json
+ *
+ * PRODUCT SEARCH CAVEAT, established empirically and load-bearing here:
+ * Product Search returned ZERO results for Highwood USA while its Product
+ * Catalog held 2,213 records. Product Search and Product Catalog therefore do
+ * NOT have equivalent coverage. This tool treats a zero-result probe as
+ * INCONCLUSIVE, never as evidence of an empty catalog, and reports the
+ * divergence explicitly wherever a known catalog size contradicts a probe.
+ */
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// ---------------------------------------------------------------------------
+// Configuration. Endpoints are overridable because the operator has already
+// validated a working auth + partnership flow; if these defaults disagree with
+// what was validated, override rather than edit, and the tool fails loudly on
+// a 404 instead of silently reporting "no advertisers".
+// ---------------------------------------------------------------------------
+const ENV_FILE = path.join(os.homedir(), ".uncluttrd-rakuten.env");
+const DEFAULTS = {
+  RAKUTEN_TOKEN_URL: "https://api.linksynergy.com/token",
+  RAKUTEN_ADVERTISERS_URL: "https://api.linksynergy.com/v2/advertisers",
+  RAKUTEN_PRODUCTSEARCH_URL: "https://api.linksynergy.com/productsearch/1.0",
+};
+const PROBE_DELAY_MS = 1200;   // conservative; Rakuten's published limits vary by endpoint
+const PROBE_MAX_ADVERTISERS = 25;
+
+// ---------------------------------------------------------------------------
+// THE RELEVANCE TAXONOMY.
+//
+// These fifteen categories are NOT invented. They are the measured demand
+// profile of Uncluttrd, derived from 1,053 real product recommendations across
+// production (684 legacy tier products) and staging (54 approach-format
+// recommendations + 315 legacy). Percentages are that measurement, retained so
+// a future reader can see WHY these categories and not some tidier list.
+//
+// `weight` is that measured share. It is used ONLY to weight a merchant's
+// relevance score toward what Uncluttrd recommends most — it is never used to
+// rank products, which this tool does not do.
+//
+// `negative` exists because the single most likely failure of a keyword screen
+// is a false positive on a merchant that sells the wrong version of the right
+// word: "outdoor furniture", "garden lighting", "auto floor mat". Highwood USA
+// is precisely that case and is used as the negative control in --self-test.
+// ---------------------------------------------------------------------------
+const CATEGORIES = [
+  { id: "furniture",         label: "Furniture",              weight: 13.5,
+    keywords: ["furniture", "cabinet", "console", "dresser", "nightstand", "bookcase", "credenza", "sideboard", "ottoman", "bench", "desk", "chair", "table"] },
+  { id: "lighting",          label: "Lighting",               weight: 12.8,
+    // " led " is space-padded deliberately: a bare "led" substring matches
+    // "handled", "sled" and "bundled" and would quietly poison the screen.
+    keywords: ["lighting", "lamp", "sconce", "pendant", "chandelier", "picture light", "led strip", "led accent", " led ", "puck light", "light fixture", "accent light", "lights"] },
+  { id: "shelving",          label: "Shelving / risers",      weight: 12.0,
+    keywords: ["shelving", "shelf", "shelves", "bookshelf", "riser", "rack", "etagere", "wall shelf", "floating shelf"] },
+  { id: "cable",             label: "Cable management",       weight: 10.1,
+    keywords: ["cable management", "cable", "cord", "wire management", "cable box", "cable sleeve", "cord organizer", "power strip"] },
+  { id: "drawer",            label: "Drawer organizers",      weight: 9.4,
+    keywords: ["drawer organizer", "drawer divider", "drawer insert", "utensil tray", "organizer tray", "compartment organizer"] },
+  { id: "storage",           label: "Storage / bins / baskets", weight: 8.4,
+    keywords: ["storage bin", "storage box", "storage container", "basket", "bin", "tote", "cube storage", "storage cube", "fabric bin", "lidded box"] },
+  { id: "decor",             label: "Decor objects / vases",  weight: 8.0,
+    keywords: ["vase", "decorative object", "home decor", "sculpture", "figurine", "decorative bowl", "centerpiece", "bookend", "candle holder"] },
+  { id: "tray",              label: "Trays",                  weight: 6.9,
+    keywords: ["tray", "serving tray", "decorative tray", "vanity tray", "catchall", "valet tray"] },
+  { id: "wallart",           label: "Wall art / mirrors",     weight: 6.0,
+    keywords: ["wall art", "framed art", "art print", "wall decor", "mirror", "picture frame", "gallery wall", "canvas print"] },
+  { id: "textiles",          label: "Textiles",               weight: 4.1,
+    keywords: ["towel", "rug", "bath mat", "blanket", "throw", "pillow", "cushion", "curtain", "linen", "textile", "runner"] },
+  { id: "hooks",             label: "Hooks / hardware",       weight: 2.7,
+    keywords: ["hook", "wall hook", "hanger", "closet rod", "command hook", "pegboard", "bracket", "rail system"] },
+  { id: "plants",            label: "Plants",                 weight: 2.4,
+    keywords: ["planter", "plant stand", "pot", "faux plant", "artificial plant", "succulent", "greenery"] },
+  { id: "barware",           label: "Barware / glassware",    weight: 2.0,
+    keywords: ["barware", "glassware", "decanter", "bar cart", "wine rack", "coaster", "tumbler", "stemware"] },
+  { id: "labels",            label: "Labels",                 weight: 1.8,
+    keywords: ["label maker", "labels", "adhesive label", "chalkboard label", "label holder"] },
+  { id: "kitchen",           label: "Kitchen / pantry organization", weight: 1.6,
+    keywords: ["pantry", "canister", "lazy susan", "turntable", "spice rack", "food storage", "kitchen organizer", "countertop organizer", "counter organizer", "under sink", "under-sink"] },
+];
+
+// Words that indicate the RIGHT keyword attached to the WRONG product. Applied
+// per-match, not per-merchant, so "outdoor furniture" scores nothing while a
+// merchant selling both indoor and outdoor still scores on its indoor lines.
+const NEGATIVE_CONTEXT = [
+  "outdoor", "patio", "garden", "lawn", "deck", "poolside", "adirondack",
+  "automotive", "auto ", "car ", "truck", "rv ", "marine", "boat",
+  "industrial", "warehouse", "commercial kitchen", "restaurant supply",
+  "playground", "pet ", "dog ", "cat ", "aquarium",
+  "apparel", "clothing", "footwear", "jewelry", "cosmetic",
+];
+
+const REDACT = [];                                   // filled with secret values at load
+const redact = (s) => REDACT.reduce((acc, v) => (v ? acc.split(v).join("[REDACTED]") : acc), String(s));
+const say = (s = "") => console.log(redact(s));
+
+// ---------------------------------------------------------------------------
+// Relevance classification. Pure, deterministic, no network — which is what
+// lets --self-test validate it against real recommendation text.
+// ---------------------------------------------------------------------------
+function classifyText(text) {
+  const hay = ` ${String(text || "").toLowerCase().replace(/\s+/g, " ")} `;
+  if (!hay.trim()) return { categories: [], score: 0, negatives: [] };
+  const negatives = NEGATIVE_CONTEXT.filter((n) => hay.includes(n));
+  const hits = [];
+  for (const cat of CATEGORIES) {
+    for (const kw of cat.keywords) {
+      const at = hay.indexOf(kw);
+      if (at === -1) continue;
+      // Window the negative test around the match so a merchant that sells
+      // "outdoor furniture" and "storage bins" is not disqualified wholesale.
+      const window = hay.slice(Math.max(0, at - 40), at + kw.length + 25);
+      const negated = NEGATIVE_CONTEXT.some((n) => window.includes(n));
+      if (!negated) { hits.push({ id: cat.id, label: cat.label, weight: cat.weight, matched: kw }); break; }
+    }
+  }
+  const score = hits.reduce((n, h) => n + h.weight, 0);
+  return { categories: hits, score: Math.round(score * 10) / 10, negatives };
+}
+
+// A merchant is a CANDIDATE only on breadth, never on a single lucky keyword.
+// One category hit is noise; the Awin screen's whole lesson was that a
+// high-EPC merchant with one relevant product is worthless.
+function tierFor(score, categoryCount) {
+  if (categoryCount >= 4 && score >= 25) return "STRONG";
+  if (categoryCount >= 2 && score >= 10) return "POSSIBLE";
+  if (categoryCount >= 1) return "WEAK";
+  return "IRRELEVANT";
+}
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+function loadEnv() {
+  if (!fs.existsSync(ENV_FILE)) {
+    console.error(`\n  Missing credential file: ${ENV_FILE}`);
+    console.error("  Create it with (no quotes, one per line):");
+    console.error("    RAKUTEN_CLIENT_ID=...");
+    console.error("    RAKUTEN_CLIENT_SECRET=...");
+    console.error("    RAKUTEN_SID=...            # publisher/site id used as the token scope");
+    console.error("  Optional overrides if your validated endpoints differ:");
+    Object.keys(DEFAULTS).forEach((k) => console.error(`    ${k}=...`));
+    console.error("\n  Then restrict it:");
+    console.error(`    icacls "${ENV_FILE}" /inheritance:r /grant:r "%USERNAME%:R"\n`);
+    process.exit(1);
+  }
+  const env = { ...DEFAULTS };
+  fs.readFileSync(ENV_FILE, "utf8").split(/\r?\n/).forEach((line) => {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+    if (m) env[m[1]] = m[2].trim();
+  });
+  ["RAKUTEN_CLIENT_ID", "RAKUTEN_CLIENT_SECRET", "RAKUTEN_SID"].forEach((k) => {
+    if (!env[k]) { console.error(`  ${ENV_FILE} is missing ${k}`); process.exit(1); }
+    REDACT.push(env[k]);
+  });
+  return env;
+}
+
+async function getToken(env) {
+  const basic = Buffer.from(`${env.RAKUTEN_CLIENT_ID}:${env.RAKUTEN_CLIENT_SECRET}`).toString("base64");
+  REDACT.push(basic);
+  const r = await fetch(env.RAKUTEN_TOKEN_URL, {
+    method: "POST",
+    headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "client_credentials", scope: env.RAKUTEN_SID }),
+  });
+  const text = await r.text();
+  if (r.status !== 200) {
+    say(`  token request failed: HTTP ${r.status} ${text.slice(0, 200)}`);
+    say("  If this is a 404, your validated token endpoint differs from the default -");
+    say("  set RAKUTEN_TOKEN_URL in the env file rather than editing this script.");
+    process.exit(1);
+  }
+  const j = JSON.parse(text);
+  const tok = j.access_token || j.token;
+  if (!tok) { say("  token response contained no access_token"); process.exit(1); }
+  REDACT.push(tok);
+  return tok;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 — partnerships + advertiser metadata
+// ---------------------------------------------------------------------------
+async function fetchAdvertisers(env, token) {
+  const out = []; let page = 1;
+  while (page <= 40) {
+    const url = `${env.RAKUTEN_ADVERTISERS_URL}?page=${page}&limit=100`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+    if (r.status === 404) { say(`  advertisers endpoint 404 at ${redact(url)} - set RAKUTEN_ADVERTISERS_URL`); process.exit(1); }
+    if (r.status !== 200) { say(`  advertisers HTTP ${r.status} on page ${page}; stopping pagination`); break; }
+    const j = await r.json().catch(() => null);
+    if (!j) break;
+    // Shape-tolerant: Rakuten has shipped several envelopes over time.
+    const batch = j.advertisers || j.data || j.results || (Array.isArray(j) ? j : []);
+    if (!batch.length) break;
+    out.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return out;
+}
+
+function normalizeAdvertiser(a) {
+  const mid = a.mid || a.id || a.advertiser_id || a.merchant_id || null;
+  const name = a.name || a.advertiser_name || a.merchant_name || "(unnamed)";
+  const status = (a.partnership_status || a.status || a.relationship_status || "unknown");
+  const cats = []
+    .concat(a.categories || a.category || a.primary_category || [])
+    .map((c) => (typeof c === "string" ? c : c?.name || c?.category || ""))
+    .filter(Boolean);
+  const desc = a.description || a.overview || "";
+  return { mid, name, status: String(status).toLowerCase(), categories: cats, description: desc,
+           text: [name, cats.join(" "), desc].join(" ") };
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2 — Product Search probes. INCONCLUSIVE on zero, never negative.
+// ---------------------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function probeAdvertiser(env, token, adv) {
+  const perCategory = {};
+  let total = 0, errors = 0;
+  for (const cat of CATEGORIES) {
+    const kw = cat.keywords[0];
+    const url = `${env.RAKUTEN_PRODUCTSEARCH_URL}?keyword=${encodeURIComponent(kw)}&mid=${encodeURIComponent(adv.mid)}&max=1`;
+    try {
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+      if (r.status !== 200) { errors++; perCategory[cat.id] = null; await sleep(PROBE_DELAY_MS); continue; }
+      const body = await r.text();
+      // Rakuten Product Search has historically returned XML; tolerate both.
+      let n = 0;
+      const j = (() => { try { return JSON.parse(body); } catch { return null; } })();
+      if (j) n = Number(j.total_matches ?? j.totalMatches ?? (j.items ? j.items.length : 0)) || 0;
+      else { const m = body.match(/TotalMatches="(\d+)"/i) || body.match(/<TotalMatches>(\d+)</i); n = m ? Number(m[1]) : 0; }
+      perCategory[cat.id] = n; total += n;
+    } catch (e) { errors++; perCategory[cat.id] = null; }
+    await sleep(PROBE_DELAY_MS);
+  }
+  return { perCategory, total, errors };
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 — parse an SFTP directory listing the operator captured themselves.
+// No SFTP connection is made here, by design: this tool must not grow into
+// half an ingestion pipeline. Accepts `ls -l`-style lines.
+// ---------------------------------------------------------------------------
+function parseSftpListing(file) {
+  const rows = [];
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(.+?)\s+(\S+)\s*$/);
+    if (!m) continue;
+    const [, size, when, name] = m;
+    const mid = (name.match(/(\d{4,6})/) || [])[1] || null;
+    const kind = /delta/i.test(name) ? (/template/i.test(name) ? "delta-template" : "delta")
+              : /template/i.test(name) ? "template"
+              : /categor/i.test(name) ? "category" : "full";
+    rows.push({ file: name, bytes: Number(size), modified: when, mid, kind });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// --self-test: validate the taxonomy against REAL recommendation text before
+// it is ever pointed at a merchant. The negative control is Highwood USA.
+// ---------------------------------------------------------------------------
+const FIXTURE = [
+  // real Uncluttrd approach-format productType values (staging, 2026-08)
+  ["countertop tray", "tray"], ["framed wall art", "wallart"], ["hand towel", "textiles"],
+  ["tiered countertop organizer", "kitchen"], ["decorative bookends", "decor"],
+  ["fabric storage bins or cubes", "storage"], ["cable management box or organizer", "cable"],
+  ["floating shelf or niche shelf", "shelving"], ["small potted plant or succulent", "plants"],
+  ["battery-powered LED accent lights", "lighting"], ["label maker or adhesive labels", "labels"],
+  ["woven or wire baskets", "storage"], ["bar cabinet or liquor cabinet", "furniture"],
+  ["drawer organizer or divided tray", "drawer"], ["lazy susan turntable", "kitchen"],
+  ["decorative mirror", "wallart"], ["wine rack", "barware"], ["wall hook rail", "hooks"],
+  // negative controls - the right words on the wrong products
+  ["outdoor patio furniture set", null], ["adirondack deck chair", null],
+  ["garden planter for the lawn", null], ["automotive floor mat", null],
+];
+
+function selfTest() {
+  let pass = 0, fail = 0;
+  say("  RELEVANCE TAXONOMY SELF-TEST (no credentials required)\n");
+  for (const [text, expected] of FIXTURE) {
+    const r = classifyText(text);
+    const ids = r.categories.map((c) => c.id);
+    const ok = expected === null ? ids.length === 0 : ids.includes(expected);
+    ok ? pass++ : fail++;
+    say(`    ${ok ? "PASS" : "FAIL"}  ${String(text).padEnd(38)} -> [${ids.join(", ") || "none"}]${expected === null ? "  (negative control)" : `  expected ${expected}`}`);
+  }
+  say(`\n    ${pass} passed, ${fail} failed`);
+  say("\n  HIGHWOOD USA CONTROL — the merchant that validated mechanics, not coverage:");
+  const hw = classifyText("Highwood USA - outdoor patio furniture, adirondack chairs, deck and garden furnishings for the lawn");
+  say(`    categories: [${hw.categories.map((c) => c.id).join(", ") || "none"}]   score ${hw.score}   tier ${tierFor(hw.score, hw.categories.length)}`);
+  say("    A merchant whose only signal is negated context must screen as IRRELEVANT,");
+  say("    even though its catalog is large and its feed mechanics are perfect.");
+  return fail === 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+(async () => {
+  const argv = process.argv.slice(2);
+  const arg = (k) => { const a = argv.find((x) => x.startsWith(`--${k}=`)); return a ? a.split("=").slice(1).join("=") : null; };
+  const has = (k) => argv.includes(`--${k}`);
+
+  if (has("self-test")) process.exit(selfTest());
+
+  const sftpFile = arg("sftp-listing");
+  const jsonOut = arg("json");
+  const doProbe = has("probe");
+
+  say(`\nRAKUTEN ADVERTISER SCREEN — read-only   ${new Date().toISOString()}`);
+  say(`  relevance taxonomy: ${CATEGORIES.length} measured Uncluttrd demand categories\n`);
+
+  const env = loadEnv();
+  const token = await getToken(env);
+  say("  auth: OK (token acquired, redacted)\n");
+
+  const raw = await fetchAdvertisers(env, token);
+  const advs = raw.map(normalizeAdvertiser).filter((a) => a.mid);
+  say(`  advertisers visible to this account: ${advs.length}`);
+
+  const scored = advs.map((a) => {
+    const c = classifyText(a.text);
+    return { ...a, relevance: c, tier: tierFor(c.score, c.categories.length) };
+  }).sort((x, y) => y.relevance.score - x.relevance.score);
+
+  const byTier = { STRONG: [], POSSIBLE: [], WEAK: [], IRRELEVANT: [] };
+  scored.forEach((s) => byTier[s.tier].push(s));
+  const byStatus = {};
+  scored.forEach((s) => { byStatus[s.status] = (byStatus[s.status] || 0) + 1; });
+
+  say(`  partnership status: ${Object.entries(byStatus).map(([k, v]) => `${k}:${v}`).join("  ")}`);
+  say(`\n  RELEVANCE TIERS (metadata-based, Tier 1)`);
+  say(`    STRONG     ${String(byTier.STRONG.length).padStart(4)}   >=4 categories and score >=25`);
+  say(`    POSSIBLE   ${String(byTier.POSSIBLE.length).padStart(4)}   >=2 categories and score >=10`);
+  say(`    WEAK       ${String(byTier.WEAK.length).padStart(4)}   1 category`);
+  say(`    IRRELEVANT ${String(byTier.IRRELEVANT.length).padStart(4)}   no category signal`);
+
+  const candidates = [...byTier.STRONG, ...byTier.POSSIBLE];
+  say(`\n  CANDIDATES (${candidates.length})`);
+  say(`  ${"MID".padEnd(8)}${"status".padEnd(12)}${"tier".padEnd(10)}${"score".padStart(6)}  ${"cats".padStart(4)}  name / matched categories`);
+  candidates.slice(0, 60).forEach((c) => {
+    say(`  ${String(c.mid).padEnd(8)}${c.status.slice(0, 11).padEnd(12)}${c.tier.padEnd(10)}${String(c.relevance.score).padStart(6)}  ${String(c.relevance.categories.length).padStart(4)}  ${c.name.slice(0, 34)}`);
+    say(`  ${" ".repeat(40)}${c.relevance.categories.map((x) => x.id).join(", ")}`);
+  });
+  if (!candidates.length) {
+    say("    none. Metadata alone shows no home-organization depth on this account.");
+    say("    That is a RESULT, not a failure - it is the Awin outcome repeating (5 of 974).");
+  }
+
+  // ---- Tier 2 ----
+  let probes = null;
+  if (doProbe && candidates.length) {
+    const targets = candidates.slice(0, PROBE_MAX_ADVERTISERS);
+    say(`\n  PRODUCT SEARCH PROBE — ${targets.length} advertiser(s) x ${CATEGORIES.length} categories`);
+    say(`  Zero results are INCONCLUSIVE, not negative: Product Search returned 0 for`);
+    say(`  Highwood USA (MID 50730) while its Product Catalog held 2,213 records.\n`);
+    probes = [];
+    for (const t of targets) {
+      const p = await probeAdvertiser(env, token, t);
+      const nonZero = Object.entries(p.perCategory).filter(([, v]) => v > 0);
+      probes.push({ mid: t.mid, name: t.name, ...p });
+      say(`    ${String(t.mid).padEnd(8)} ${t.name.slice(0, 30).padEnd(32)} matches=${String(p.total).padStart(6)}  categories>0=${String(nonZero.length).padStart(2)}  errors=${p.errors}`);
+      if (p.total === 0) say(`    ${" ".repeat(8)} INCONCLUSIVE - probe found nothing; catalog may still be populated`);
+      else say(`    ${" ".repeat(8)} ${nonZero.sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}:${v}`).join("  ")}`);
+    }
+  } else if (doProbe) {
+    say("\n  --probe requested but there are no candidates to probe.");
+  }
+
+  // ---- Tier 3 ----
+  let sftp = null;
+  if (sftpFile) {
+    if (!fs.existsSync(sftpFile)) { say(`\n  --sftp-listing file not found: ${sftpFile}`); }
+    else {
+      sftp = parseSftpListing(sftpFile);
+      const byKind = {}; sftp.forEach((r) => { byKind[r.kind] = (byKind[r.kind] || 0) + 1; });
+      say(`\n  SFTP CATALOG LISTING (parsed, nothing downloaded) — ${sftp.length} file(s)`);
+      say(`    file kinds: ${Object.entries(byKind).map(([k, v]) => `${k}:${v}`).join("  ")}`);
+      sftp.sort((a, b) => b.bytes - a.bytes).slice(0, 25).forEach((r) => {
+        say(`    ${String(r.mid || "?").padEnd(8)}${r.kind.padEnd(16)}${(r.bytes / 1048576).toFixed(1).padStart(8)} MB   ${r.modified}   ${r.file.slice(0, 46)}`);
+      });
+      say(`\n    Byte size is a proxy for RECORD count, and records are VARIANT ROWS.`);
+      say(`    Awin's King Koil feed was 29 rows = 1 distinct product. Never quote a`);
+      say(`    record count as a product count without a distinct-product rollup.`);
+    }
+  }
+
+  say(`\n  WHAT THIS DOES AND DOES NOT ESTABLISH`);
+  say(`    Establishes : which advertisers are worth a partnership application,`);
+  say(`                  and which are large-but-irrelevant (the Highwood pattern).`);
+  say(`    Does NOT    : distinct-product counts, field population, rankability, or`);
+  say(`                  whether a catalog can actually answer a real recommendation.`);
+  say(`                  Those require ingestion, which is deliberately not built.`);
+
+  if (jsonOut) {
+    fs.writeFileSync(jsonOut, JSON.stringify({
+      capturedAt: new Date().toISOString(),
+      taxonomy: CATEGORIES.map(({ id, label, weight }) => ({ id, label, weight })),
+      counts: { advertisers: advs.length, strong: byTier.STRONG.length, possible: byTier.POSSIBLE.length,
+                weak: byTier.WEAK.length, irrelevant: byTier.IRRELEVANT.length },
+      advertisers: scored.map((s) => ({ mid: s.mid, name: s.name, status: s.status, tier: s.tier,
+        score: s.relevance.score, categories: s.relevance.categories.map((c) => c.id) })),
+      probes, sftp,
+    }, null, 1));
+    say(`\n  wrote ${jsonOut}`);
+  }
+  say("");
+})();
