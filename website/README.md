@@ -99,15 +99,31 @@ targets.
 
 ---
 
-## Step 8 — flagged for removal (2026-08-17)
+## Step 8 — COMPLETED 2026-08-17
 
-`website/recovered-site/` in this repo is a **duplicate** of the standalone
-website repo at `C:\uncluttrd-website`, which is the source of truth.
+`website/recovered-site/` has been **removed**. The standalone repo at
+`C:\uncluttrd-website` is the sole source of truth for the website.
 
-**Remove this folder once the standalone repo is pushed to GitHub and a
-Git-backed Netlify deploy is proven byte-identical to the pre-migration
-baseline.** Keeping two copies invites the exact ambiguity the recovery was done
-to eliminate.
+Removed only after all three conditions were met:
 
-Not removed yet — the migration is blocked on credentials (see
-`C:\uncluttrd-website\MIGRATION.md`).
+1. Every file was confirmed present in the standalone repo — 18 assets
+   byte-identical; the 4 HTML pages differ only because the standalone copies
+   are *newer*, carrying the `/disclosure` footer links.
+2. The app-repo copies were confirmed **byte-identical to the standalone repo's
+   recovery baseline at commit `0ef6531`**, so the original production snapshot
+   is preserved in git history and nothing is lost by deleting the duplicate.
+3. A deploy from the standalone repo was verified against live:
+   **39/39 checks pass** (`node verify-deploy.js`).
+
+### Where the website lives now
+
+| | |
+|---|---|
+| Source of truth | `C:\uncluttrd-website` (local git, not yet pushed to GitHub) |
+| Deployable files | `public/` — drag this folder to Netlify |
+| Recovery baseline | commit `0ef6531` — byte-exact pre-migration production |
+| Verification | `node verify-deploy.js` |
+
+The two files remaining in this folder — `disclosure.html` and
+`footer-snippet.html` — are the **original drafts**, retained for provenance.
+The live versions are in the standalone repo. **Edit there, not here.**
