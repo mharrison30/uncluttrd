@@ -4683,6 +4683,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // Synchronous tap guard for the Room confirmation actions. See
   // completeRoomConfirmation for why this is a ref and not state.
   const roomConfirmationInFlightRef = useRef(false);
+  // Synchronous tap guards for the three remaining unguarded async commits
+  // (ProcessingFeedbackAudit.md, HIGH/MEDIUM findings 1-3). Same contract as
+  // the ref above and classifyInFlightRef: a ref flips synchronously, so a
+  // second tap in the SAME frame loses the race - which a state flag cannot
+  // do, because setState does not apply until React re-renders.
+  //   mergeRoomsInFlightRef  - rename-duplicate "move plans into existing"
+  //   vizInFlightRef         - keyed by vizKey, so the three approach images
+  //                            stay independently generatable
+  //   deleteAccountInFlightRef - irreversible, so it gets the same treatment
+  const mergeRoomsInFlightRef = useRef(false);
+  const vizInFlightRef = useRef(new Set());
+  const deleteAccountInFlightRef = useRef(false);
   // Area Identity, Phase B (AreaRecognitionPhaseBImplementation.md): the
   // Area-level analog of roomConfirmation above - null when not showing,
   // else { status: "MATCH_FOUND" | "RECOGNITION_FAILED", candidates,
@@ -8002,6 +8014,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // "elevated", which is what makes the three independent: generating
     // one writes vizImages.<thatId> and cannot touch the other two.
     const vizKey = isApproach ? target.approachId : target.id;
+    // Synchronous re-entry guard (ProcessingFeedbackAudit.md finding 1, the
+    // highest-value one). This had NO guard whatsoever - not even a check of
+    // vizLoading - and it calls a Cloud Function with a 300 SECOND timeout.
+    // A double-tap meant two real image generations: double spend, and a
+    // genuine late-write race where the slower call's image overwrites the
+    // one the user actually waited for.
+    //
+    // A Set keyed by vizKey, not a single boolean, mirroring
+    // detailInFlightRef: the three approach images are independent by design
+    // (each writes only vizImages.<its own id>), so generating Polished must
+    // not lock out Elevated. Released in the same finally that clears
+    // vizLoading.
+    if (vizInFlightRef.current.has(vizKey)) return;
+    vizInFlightRef.current.add(vizKey);
     // The known-good image, captured BEFORE anything is attempted. It is
     // what the thumbnail keeps showing throughout a regeneration, and the
     // object deleted at the very end - only once its replacement is
@@ -8156,6 +8182,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       }
     } finally {
       stopVizTips();
+      vizInFlightRef.current.delete(vizKey);
       setVizLoading(prev => ({ ...prev, [vizKey]: false }));
     }
   };
@@ -8753,6 +8780,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // screen showing.
   const handleMovePlansIntoExisting = async () => {
     if (!renameDuplicateDialog) return;
+    // Synchronous re-entry guard (2026-08-17, production freeze diagnostic).
+    // mergeRoomIntoRoom is a multi-second, multi-phase operation - the real
+    // production run took ~2.5s - and the confirm button had no guard at all,
+    // not even a state check. A second tap started a second full merge whose
+    // Phase 1 snapshot reads plans the first run had already moved.
+    if (mergeRoomsInFlightRef.current) return;
+    mergeRoomsInFlightRef.current = true;
     setMergeRoomsSaving(true);
     setMergeRoomsError(null);
     try {
@@ -8765,12 +8799,34 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         setRoomDetailRoomId(null);
         setShowHistory(true);
       }
-      setRenamePlanTarget(null);
-      setRenameSheetValue("");
+      // STACKED MODAL DISMISSAL - the production freeze (2026-08-17).
+      //
+      // The duplicate-name branch of handleSaveRename deliberately leaves
+      // renamePlanTarget set while it opens renameDuplicateDialog, so BOTH
+      // sibling Modals are mounted at once: the rename sheet
+      // (animationType="slide") underneath, the duplicate dialog
+      // (animationType="fade") on top. Clearing both in this one commit
+      // dismissed two stacked RN Modals in a single frame, which on iOS
+      // leaves an invisible, undismissed overlay swallowing every touch -
+      // the app keeps rendering but is dead to input. The Firestore writes
+      // had already completed ~2.5s earlier, which is why the merge landed
+      // perfectly while the UI was unusable.
+      //
+      // Dismissed in sequence instead: the top (fade) modal first, then the
+      // sheet underneath only after its exit animation has run. setTimeout
+      // rather than Modal's onDismiss because onDismiss is iOS-only, and this
+      // ordering must hold on Android too. 400ms comfortably clears RN's
+      // ~300ms modal transition without being perceptible as a delay - the
+      // dialog is already gone by then.
       setRenameDuplicateDialog(null);
+      setTimeout(() => {
+        setRenamePlanTarget(null);
+        setRenameSheetValue("");
+      }, 400);
     } catch (e) {
       setMergeRoomsError(e.message || "Something went wrong moving your plans. Please try again.");
     } finally {
+      mergeRoomsInFlightRef.current = false;
       setMergeRoomsSaving(false);
     }
   };
@@ -10061,6 +10117,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setDeleteError("Please enter your password.");
       return;
     }
+    // Synchronous re-entry guard (ProcessingFeedbackAudit.md finding 2). The
+    // overlay here was already good, but an overlay that has not painted yet
+    // protects nothing - and this is the one irreversible operation in the
+    // app. A double-tap re-authenticated and called deleteAccount twice, the
+    // second against a session the first had already torn down.
+    if (deleteAccountInFlightRef.current) return;
+    deleteAccountInFlightRef.current = true;
     setDeleteLoading(true);
     setDeleteError("");
     try {
@@ -10111,6 +10174,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // calls this same idempotent flow again).
         setDeleteError("Something went wrong. Please try again.");
       }
+    } finally {
+      // Released on every path, including the bare `if (!currentUser) return;`
+      // above - without a finally that early return would leave the guard
+      // stuck true and permanently disable the button. The retry path noted
+      // in the catch above depends on this being released.
+      deleteAccountInFlightRef.current = false;
     }
   };
 
