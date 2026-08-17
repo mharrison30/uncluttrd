@@ -1,25 +1,65 @@
 #!/usr/bin/env node
 /**
- * Rakuten advertiser/category screening tool — BD, not a product feature.
+ * Rakuten partnership portfolio + (deprecated) advertiser screen — BD tooling,
+ * not a product feature.
  *
- * It answers ONE question, and deliberately not the next one:
- *   "Does Rakuten have advertisers whose catalogs are relevant to what
- *    Uncluttrd actually recommends?"
+ * ---------------------------------------------------------------------------
+ * WHAT WE PROVED, 2026-08-17, AND WHY THIS TOOL CHANGED SHAPE
+ * ---------------------------------------------------------------------------
+ * The original intent was a network-wide advertiser relevance screen. Endpoint
+ * investigation established that Rakuten cannot support one:
  *
- * It does NOT ingest, normalize, store, or rank anything. There is no adapter,
- * no canonical catalog, and no change to the app. Building ingestion before
- * this question is answered is the mistake this tool exists to prevent —
- * AwinProductFeedPOC.md §12 reached the same conclusion for Awin, and Highwood
- * USA (MID 50730) is the same lesson again: a 2,213-record catalog that is
- * overwhelmingly outdoor furniture validates MECHANICS, not COVERAGE.
+ *   /v2/advertisers  returns 2,159 advertisers with EXACTLY 8 fields —
+ *                    network, id, name, url, policies, features, contact,
+ *                    logo_url. Zero descriptions. Zero categories. 100% of
+ *                    records carry name only (mean 13 chars of usable text).
  *
- * THE DISTINCTION THIS TOOL IS BUILT AROUND:
+ *   linklocator/getMerchByID  DOES return categories + applicationStatus, but
+ *                    ONLY for merchants we already partner with. Every
+ *                    non-partner MID returns HTTP 500.
  *
- *   catalog size            = how many records a merchant has
- *   relevant catalog size   = how many of them Uncluttrd would ever recommend
+ *   getMerchByCategory  enumerates OUR partnerships, not the network — every
+ *                    category id returns exactly our approved merchants.
  *
- * The first is easy and misleading. The second is the decision input. Every
- * output below reports them separately and never blends them into one score.
+ *   advertisersearch/1.0  ignores every parameter (category, categoryid, cat,
+ *                    category_id, name, mid, appstatus, page, limit all return
+ *                    the byte-identical 2,131-merchant list) and exposes only
+ *                    <mid> and <merchantname>.
+ *
+ *   /v1/categories, /v2/categories, /categories/1.0  404. getCategories 500s.
+ *
+ * CONCLUSION: Rakuten exposes useful human-readable categories ONLY AFTER a
+ * partnership exists. Network-wide, it offers eligibility/capability metadata
+ * (product_feed, deep_links, ships_to) but NO merchandising taxonomy. The
+ * information needed to decide whether to apply is released only once you have
+ * applied — structurally the same gate as Amazon's Creators API.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS TOOL DOES NOW
+ * ---------------------------------------------------------------------------
+ *   --portfolio (DEFAULT)  Read-only view of merchants we have ALREADY
+ *                          engaged, from /v1/partnerships, joined to
+ *                          /v2/advertisers for capability flags.
+ *
+ *                          *** THIS IS NOT A COVERAGE MEASUREMENT. ***
+ *                          It describes six merchants we chose. It says
+ *                          NOTHING about Rakuten-wide category coverage and
+ *                          must never be quoted as though it did.
+ *
+ *   --name-screen          DEPRECATED. The original merchant-name relevance
+ *                          classification. Retained only for reproducibility;
+ *                          see the deprecation banner below for why its output
+ *                          is not a decision input.
+ *
+ *   --self-test            Validates the 15-category Uncluttrd taxonomy. Still
+ *                          worth running: the taxonomy is deliberately
+ *                          PRESERVED for future PRODUCT-level coverage
+ *                          analysis, where it will be applied to catalog rows
+ *                          rather than to merchant names.
+ *
+ * It does NOT ingest, normalize, store, or rank anything. No adapter, no
+ * canonical catalog, no change to the app. It does not crawl merchant
+ * websites, apply to advertisers, touch SFTP, or download catalogs.
  *
  * STRICTLY READ-ONLY:
  *   - GETs against the Rakuten Publisher API only
@@ -34,29 +74,21 @@
  * Every value is redacted from all output, including error paths.
  *
  * Usage:
- *   node scripts/rakutenAdvertiserScreen.js --self-test
- *       Validates the relevance taxonomy against a labeled fixture drawn from
- *       real Uncluttrd recommendations. Needs NO credentials. Run this first.
- *
  *   node scripts/rakutenAdvertiserScreen.js
- *       Tier 1 only: partnership + advertiser-metadata relevance screen.
+ *   node scripts/rakutenAdvertiserScreen.js --portfolio          # same, explicit
+ *   node scripts/rakutenAdvertiserScreen.js --portfolio --json out.json
  *
- *   node scripts/rakutenAdvertiserScreen.js --probe
- *       Tier 1 + Tier 2: probe Product Search per category per candidate.
- *       Rate-limited. See the PRODUCT SEARCH CAVEAT below.
- *
+ *   node scripts/rakutenAdvertiserScreen.js --self-test          # no credentials
+ *   node scripts/rakutenAdvertiserScreen.js --name-screen        # deprecated
  *   node scripts/rakutenAdvertiserScreen.js --sftp-listing=listing.txt
- *       Tier 3: parse an SFTP directory listing you captured yourself, to get
- *       raw catalog size + freshness WITHOUT downloading any catalog.
  *
- *   node scripts/rakutenAdvertiserScreen.js --probe --json out.json
- *
- * PRODUCT SEARCH CAVEAT, established empirically and load-bearing here:
- * Product Search returned ZERO results for Highwood USA while its Product
- * Catalog held 2,213 records. Product Search and Product Catalog therefore do
- * NOT have equivalent coverage. This tool treats a zero-result probe as
- * INCONCLUSIVE, never as evidence of an empty catalog, and reports the
- * divergence explicitly wherever a known catalog size contradicts a probe.
+ * PRODUCT SEARCH CAVEAT, established empirically: Product Search returned ZERO
+ * results for Highwood USA while its Product Catalog held 2,213 records. The
+ * two do NOT have equivalent coverage, so a zero-result probe is INCONCLUSIVE
+ * rather than evidence of an empty catalog. `--probe` is therefore retained
+ * only behind `--name-screen`, whose candidate list is itself discredited; it
+ * is not a supported path and issues zero requests when there are no
+ * candidates.
  */
 const fs = require("fs");
 const os = require("os");
@@ -79,6 +111,26 @@ const PROBE_MAX_ADVERTISERS = 25;
 
 // ---------------------------------------------------------------------------
 // THE RELEVANCE TAXONOMY.
+//
+// *** DEPRECATED AS AN ADVERTISER SIGNAL. PRESERVED FOR PRODUCT-LEVEL USE. ***
+//
+// Applying this taxonomy to ADVERTISER metadata is disqualified. Proven, not
+// suspected: /v2/advertisers carries no description and no category for any of
+// 2,159 records, so classifyText() was in practice matching MERCHANT NAMES —
+// mean 13 characters of text. That measures naming conventions, not
+// inventory. The 26 "matches" it produced were roughly 11 plausible and 15
+// false positives: six Cordis HOTELS matched "cord" -> cable management; Bath
+// Depot, Card Depot, SpotHero and Apotheke matched "pot" -> plants; Easy
+// Plumbing, Cabin Zero and Anine Bing matched "bin" -> storage. It is also
+// blind in the other direction — Wayfair, Target, IKEA and The Container Store
+// would all score zero, exactly as Highwood USA did.
+//
+// The taxonomy itself is NOT the problem and is deliberately retained. It is
+// the measured Uncluttrd demand profile and remains the right instrument for
+// PRODUCT-level coverage analysis, where it will be applied to catalog rows
+// (product titles, categories, descriptions) that actually describe inventory.
+// --self-test continues to validate it against real recommendation text so it
+// stays honest until that work begins.
 //
 // These fifteen categories are NOT invented. They are the measured demand
 // profile of Uncluttrd, derived from 1,053 real product recommendations across
@@ -265,6 +317,82 @@ function normalizeAdvertiser(a) {
 }
 
 // ---------------------------------------------------------------------------
+// PARTNERSHIP PORTFOLIO — /v1/partnerships
+//
+// The ONLY Rakuten surface that carries human-readable advertiser categories,
+// and it carries them only for merchants we have already engaged. That is the
+// entire reason this is a portfolio view and not a screen: it is a description
+// of six merchants WE chose, not a sample of the network.
+//
+// Joined to /v2/advertisers on MID for capability flags. The join key is
+// handed to us by the API itself — each partnership carries
+// `advertiser.details: "/v2/advertisers/{mid}"`.
+// ---------------------------------------------------------------------------
+async function fetchPartnerships(env, token) {
+  const base = env.RAKUTEN_ADVERTISERS_URL.replace(/\/v2\/advertisers.*$/, "");
+  const out = []; let page = 1; let meta = null;
+  while (page <= 20) {
+    const r = await fetch(`${base}/v1/partnerships?page=${page}&limit=100`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+    if (r.status !== 200) { if (page === 1) say(`  /v1/partnerships HTTP ${r.status}`); break; }
+    const j = await r.json().catch(() => null);
+    if (!j) break;
+    meta = j._metadata || meta;
+    const batch = j.partnerships || [];
+    out.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return { partnerships: out, meta };
+}
+
+function renderPortfolio({ partnerships, meta }, advByMid) {
+  say(`\n  ===== RAKUTEN PARTNERSHIP PORTFOLIO =====`);
+  say(`  Source: /v1/partnerships${meta ? `  (${meta.api_name_version}, total ${meta.total})` : ""}`);
+  say("");
+  say("  *** SCOPE WARNING — read before quoting any of this ***");
+  say("  These are merchants we have ALREADY ENGAGED. This view describes our own");
+  say("  application portfolio. It is NOT a sample of Rakuten's network and is NOT");
+  say("  evidence of Rakuten-wide category coverage. Rakuten exposes categories only");
+  say("  after a partnership exists; the other ~2,150 advertisers have none exposed.");
+  say("");
+
+  if (!partnerships.length) { say("  no partnerships returned"); return; }
+
+  const flag = (b) => (b === true ? "yes" : b === false ? "no " : " ? ");
+  say(`  ${"MID".padEnd(8)}${"merchant".padEnd(24)}${"partnership".padEnd(14)}${"advertiser".padEnd(12)}${"feed".padEnd(6)}${"deep".padEnd(6)}${"US".padEnd(5)}categories`);
+  say(`  ${"-".repeat(8)}${"-".repeat(24)}${"-".repeat(14)}${"-".repeat(12)}${"-".repeat(6)}${"-".repeat(6)}${"-".repeat(5)}${"-".repeat(10)}`);
+
+  const statusCount = {};
+  for (const p of partnerships) {
+    const a = p.advertiser || {};
+    const mid = a.id;
+    const cap = advByMid.get(mid) || null;
+    const f = cap?.features || {};
+    const ships = cap?.policies?.international_capabilities?.ships_to || null;
+    const cats = (a.categories || []).map((c) => String(c).trim()).filter(Boolean);
+    statusCount[p.status] = (statusCount[p.status] || 0) + 1;
+    say(`  ${String(mid).padEnd(8)}${String(a.name || "").slice(0, 22).padEnd(24)}${String(p.status || "?").padEnd(14)}${String(a.status || "?").padEnd(12)}${flag(f.product_feed).padEnd(6)}${flag(f.deep_links).padEnd(6)}${(ships ? (ships.includes("US") ? "yes" : "no ") : " ? ").padEnd(5)}${cats.join(", ")}`);
+    if (!cap) say(`  ${" ".repeat(8)}(not present in /v2/advertisers — capability flags unavailable)`);
+  }
+
+  say("");
+  say(`  partnership status: ${Object.entries(statusCount).map(([k, v]) => `${k}:${v}`).join("  ")}`);
+
+  // Category vocabulary actually observed — useful, but only across OUR six.
+  const vocab = {};
+  partnerships.forEach((p) => (p.advertiser?.categories || []).forEach((c) => {
+    const k = String(c).trim(); if (k) vocab[k] = (vocab[k] || 0) + 1; }));
+  say(`\n  Rakuten category vocabulary observed across these partnerships:`);
+  Object.entries(vocab).sort((a, b) => b[1] - a[1])
+    .forEach(([k, v]) => say(`    ${k.padEnd(28)}${v}`));
+  say(`\n  These are RAKUTEN's advertiser categories, not the Uncluttrd product`);
+  say(`  taxonomy. They describe a merchant's general sector, not whether its`);
+  say(`  catalog contains the specific items Uncluttrd recommends. Establishing`);
+  say(`  that still requires product-level evidence.`);
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2 — Product Search probes. INCONCLUSIVE on zero, never negative.
 // ---------------------------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -362,15 +490,71 @@ function selfTest() {
   const sftpFile = arg("sftp-listing");
   const jsonOut = arg("json");
   const doProbe = has("probe");
+  // Portfolio is the DEFAULT. The name screen is opt-in because its output is
+  // not a decision input - see the deprecation notice on CATEGORIES.
+  const nameScreen = has("name-screen");
+  const portfolio = has("portfolio") || !nameScreen;
 
-  say(`\nRAKUTEN ADVERTISER SCREEN — read-only   ${new Date().toISOString()}`);
-  say(`  relevance taxonomy: ${CATEGORIES.length} measured Uncluttrd demand categories\n`);
+  say(`\nRAKUTEN — read-only   ${new Date().toISOString()}`);
 
   const env = loadEnv();
   const token = await getToken(env);
-  say("  auth: OK (token acquired, redacted)\n");
+  say("  auth: OK (token acquired, redacted)");
 
   const raw = await fetchAdvertisers(env, token);
+  const advByMid = new Map(raw.filter((a) => a && a.id != null).map((a) => [a.id, a]));
+  say(`  /v2/advertisers: ${raw.length} advertisers visible (eligibility/capability metadata only — no categories)`);
+
+  let portfolioData = null;
+  if (portfolio) {
+    portfolioData = await fetchPartnerships(env, token);
+    renderPortfolio(portfolioData, advByMid);
+    if (!nameScreen) {
+      say(`\n  ===== WHY THERE IS NO NETWORK-WIDE SCREEN HERE =====`);
+      say(`  Rakuten exposes no category, vertical, description or keyword field for`);
+      say(`  the ${raw.length} discoverable advertisers. Category data appears only after a`);
+      say(`  partnership exists. Network-wide, only eligibility/capability filters are`);
+      say(`  available:`);
+      const feed = raw.filter((a) => a?.features?.product_feed === true).length;
+      const us = raw.filter((a) => a?.policies?.international_capabilities?.ships_to?.includes("US")).length;
+      const both = raw.filter((a) => a?.features?.product_feed === true && a?.policies?.international_capabilities?.ships_to?.includes("US")).length;
+      say(`    product_feed = true            : ${feed}`);
+      say(`    ships to US                    : ${us}`);
+      say(`    product_feed AND ships US      : ${both}`);
+      say(`  Those are ELIGIBILITY filters, not relevance filters. Narrowing them`);
+      say(`  further requires product-level evidence, which this tool does not gather.`);
+      if (jsonOut) {
+        fs.writeFileSync(jsonOut, JSON.stringify({
+          capturedAt: new Date().toISOString(),
+          scope: "PARTNERSHIP PORTFOLIO ONLY - not evidence of Rakuten-wide coverage",
+          advertisersVisible: raw.length,
+          eligibility: { productFeed: feed, shipsUS: us, both },
+          partnerships: (portfolioData.partnerships || []).map((p) => ({
+            mid: p.advertiser?.id, name: p.advertiser?.name,
+            partnershipStatus: p.status, advertiserStatus: p.advertiser?.status,
+            categories: (p.advertiser?.categories || []).map((c) => String(c).trim()),
+            productFeed: advByMid.get(p.advertiser?.id)?.features?.product_feed ?? null,
+            deepLinks: advByMid.get(p.advertiser?.id)?.features?.deep_links ?? null,
+            shipsUS: advByMid.get(p.advertiser?.id)?.policies?.international_capabilities?.ships_to?.includes("US") ?? null,
+            applyDatetime: p.apply_datetime, approveDatetime: p.approve_datetime,
+          })),
+        }, null, 1));
+        say(`\n  wrote ${jsonOut}`);
+      }
+      say("");
+      return;
+    }
+  }
+
+  // ---- DEPRECATED PATH BELOW ----
+  say(`\n  ${"!".repeat(74)}`);
+  say(`  DEPRECATED: merchant-name relevance classification.`);
+  say(`  /v2/advertisers has no description and no category for any of the ${raw.length}`);
+  say(`  records, so this classifies MERCHANT NAMES (mean ~13 chars). It measures`);
+  say(`  naming conventions, not inventory. Six Cordis HOTELS matched "cord" ->`);
+  say(`  cable management. Wayfair, Target and The Container Store would all score`);
+  say(`  zero, exactly as Highwood USA did. NOT a decision input.`);
+  say(`  ${"!".repeat(74)}\n`);
   const advs = raw.map(normalizeAdvertiser).filter((a) => a.mid);
   say(`  advertisers visible to this account: ${advs.length}`);
 

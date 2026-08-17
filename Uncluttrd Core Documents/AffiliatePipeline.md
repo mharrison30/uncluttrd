@@ -58,9 +58,54 @@ storage/retention rights under Rakuten's publisher terms. Amazon's 24-hour
 retention restriction is an Amazon rule and must not be assumed to apply here —
 but neither may durable storage be assumed permitted until verified.
 
-**Status:** validated on mechanics, **gated on category coverage.** Screening
-is in progress via `scripts/rakutenAdvertiserScreen.js`; no ingestion pipeline,
-adapter, or canonical catalog has been built.
+**Status:** validated on mechanics, **gated on category coverage.** No ingestion
+pipeline, adapter, or canonical catalog has been built.
+
+### Endpoint capability map (investigated 2026-08-17, read-only)
+
+The finding that matters: **Rakuten exposes human-readable advertiser
+categories only AFTER a partnership exists.** Network-wide it offers
+eligibility/capability metadata but no merchandising taxonomy.
+
+| Endpoint | Access | Carries categories? |
+|---|---|---|
+| `GET /v2/advertisers` | 2,159 advertisers | **No.** 8 fields: `network`, `id`, `name`, `url`, `policies`, `features`, `contact`, `logo_url`. Zero descriptions, zero categories |
+| `GET /v2/advertisers/{mid}` | single | No — adds only `can_partner` |
+| `GET /v1/partnerships` | our 6 | **Yes** — human-readable, plus partnership + advertiser status |
+| `GET /linklocator/1.0/getMerchByID/{mid}` | **partners only** | Yes (numeric ids) + `applicationStatus`. **HTTP 500 for every non-partner** |
+| `GET /linklocator/1.0/getMerchByCategory/{id}` | partners only | Enumerates *our* merchants, not the network |
+| `GET /advertisersearch/1.0` | 2,131 | No — `<mid>` + `<merchantname>` only, and **ignores every parameter** (`category`, `categoryid`, `name`, `mid`, `page`, `limit` all return a byte-identical list) |
+| `/v1/categories`, `/v2/categories`, `/categories/1.0` | 404 | — |
+| `getCategories` | 500 | — |
+
+**Consequence:** a network-wide advertiser relevance screen is not buildable
+from Rakuten's own metadata. The information needed to decide whether to apply
+is released only once you have applied — structurally the same gate as Amazon's
+Creators API.
+
+Network-wide, only eligibility filters exist: `product_feed = true` (1,753),
+ships to US (1,416), **both (1,200)**. These narrow the list but say nothing
+about whether a merchant sells what Uncluttrd recommends.
+
+### What the tool does now
+
+`scripts/rakutenAdvertiserScreen.js` defaults to `--portfolio`: a read-only
+view of merchants we have **already engaged**, from `/v1/partnerships`, joined
+to `/v2/advertisers` on MID for capability flags.
+
+**It is a portfolio, not a screen.** It describes six merchants we chose and is
+never evidence of Rakuten-wide category coverage.
+
+The merchant-name relevance classification is **deprecated** and now requires
+`--name-screen`. It was proven to measure naming conventions rather than
+inventory: with no descriptions or categories in `/v2/advertisers`, it was
+classifying merchant names (mean 13 characters). Six Cordis *hotels* matched
+"cord" → cable management; Wayfair, Target and The Container Store would all
+score zero, exactly as Highwood USA did.
+
+The 15-category Uncluttrd taxonomy is **retained deliberately** — it is the
+right instrument for future *product-level* coverage analysis against catalog
+rows, and `--self-test` keeps it validated against real recommendation text.
 
 ---
 

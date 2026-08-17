@@ -11,6 +11,62 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-08
 
+### 2026-08-17 — Rakuten exposes advertiser categories only after partnership; the name-based screen is deprecated
+
+**Discovery:** Rakuten provides **no merchandising taxonomy for the ~2,159
+advertisers discoverable network-wide**. `/v2/advertisers` returns exactly eight
+fields — `network`, `id`, `name`, `url`, `policies`, `features`, `contact`,
+`logo_url` — with **zero descriptions and zero categories** on 100% of records.
+Human-readable categories exist only via `/v1/partnerships`, and only for
+merchants we have already engaged. `linklocator/getMerchByID` returns categories
+and `applicationStatus` but **HTTP 500 for every non-partner**;
+`getMerchByCategory` enumerates our own partnerships rather than the network;
+`advertisersearch/1.0` ignores every parameter and exposes only mid + name;
+every `/categories` route 404s.
+
+**Decision:** the merchant-name relevance classification is **deprecated as a
+decision-making signal** and now requires an explicit `--name-screen` flag. The
+default is a **partnership portfolio view** built on `/v1/partnerships`, joined
+to `/v2/advertisers` on MID for capability flags.
+
+**Reason:** with no description or category text available, the screen was
+classifying **merchant names** — a mean of 13 characters. That measures naming
+conventions, not inventory. Its 26 "matches" were roughly 11 plausible and 15
+false positives: six Cordis *hotels* matched "cord" → cable management; Bath
+Depot, Card Depot, SpotHero and Apotheke matched "pot" → plants. It is equally
+blind in reverse — Wayfair, Target, IKEA and The Container Store would all score
+zero, exactly as Highwood USA did.
+
+**Explicitly recorded so it is not misread later:** the portfolio view describes
+six merchants *we chose*. It is **not** a sample of Rakuten's network and must
+never be quoted as evidence of Rakuten-wide category coverage.
+
+**Preserved, not discarded:** the 15-category Uncluttrd demand taxonomy. It was
+never the faulty component — the input was. It remains the right instrument for
+**product-level** coverage analysis against catalog rows, and `--self-test`
+keeps it validated (22/22 against real recommendation text).
+
+**Alternatives considered:**
+- *Fix the screen with better keywords.* Rejected — no amount of tuning helps
+  when the input is a 13-character brand name.
+- *Crawl merchant homepages* (`url` is 100% populated). Real signal, but ~1,200
+  outbound fetches against third-party sites; not authorised.
+- *Probe Product Search per merchant.* Rejected — its candidate list came from
+  the discredited screen, and Search returned zero for Highwood while that
+  merchant's catalog held 2,213 records, so a zero result is uninterpretable.
+
+**Consequence:** Rakuten cannot self-serve advertiser relevance. Narrowing the
+1,200 `product_feed` + ships-US merchants requires product-level evidence —
+website classification or catalog sampling — both deferred. The five pending
+applications already cover Bed/Bath, Kitchen, Home Office, Art and Improvement,
+so letting them resolve yields real category and catalog access at zero
+engineering cost.
+
+**Outcome:** Approved. Portfolio view shipped; no App.js change, no adapter, no
+canonical catalog, no ingestion. `ProductIntelligenceDesign.md` still unmodified.
+
+---
+
 ### 2026-08-17 — Rakuten is validated on mechanics and gated on category coverage; screen before ingesting
 
 **Decision:** Rakuten Advertising is adopted as a validated *access route*, not
