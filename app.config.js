@@ -12,7 +12,7 @@ module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
     slug: "cluttrd",
-    version: "1.0.4",
+    version: "2.0.0",
     orientation: "portrait",
     icon: IS_PRODUCTION ? "./assets/icon.png" : "./assets/icon-staging.png",
     userInterfaceStyle: "light",
