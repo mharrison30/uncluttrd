@@ -8,6 +8,12 @@
 const APP_ENV = process.env.APP_ENV || "staging";
 const IS_PRODUCTION = APP_ENV === "production";
 
+// Tracks the store release. Bump for every App Store / Play submission.
+const PRODUCTION_VERSION = "2.0.0";
+// PINNED to whichever staging binary is installed on the test device - see the
+// long note on `version` below. Bumping this orphans the installed staging app.
+const STAGING_VERSION = "2.0.0";
+
 module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
@@ -29,10 +35,18 @@ module.exports = {
     // still moves both fingerprints, which is correct: staging genuinely needs
     // rebuilding then.
     //
-    // Consequence to remember: staging will report "1.0.4" forever. That is
-    // cosmetic on an internal-distribution build, and cheaper than the
-    // alternative.
-    version: IS_PRODUCTION ? "2.0.0" : "1.0.4",
+    // THE PINNED VALUE MUST MATCH THE STAGING BINARY THAT IS ACTUALLY
+    // INSTALLED. It is not arbitrary. Pin it to 1.0.4 and staging fingerprints
+    // to 194c6294; pin it to 2.0.0 and it fingerprints to a491de68. Whichever
+    // build is on the test device is the value that belongs here - get it
+    // wrong and every staging OTA silently lands on a runtime no device runs.
+    // That happened once already: preview build 24 (a491de68) was installed
+    // while this was pinned to 1.0.4, so an OTA published to 194c6294 could
+    // never arrive.
+    //
+    // Currently 2.0.0, matching preview build 24.
+    // Only change it when a new staging binary is built AND installed.
+    version: IS_PRODUCTION ? PRODUCTION_VERSION : STAGING_VERSION,
     orientation: "portrait",
     icon: IS_PRODUCTION ? "./assets/icon.png" : "./assets/icon-staging.png",
     userInterfaceStyle: "light",
