@@ -2695,6 +2695,31 @@ const BRAND = {
   ink: "#0F2A52",
   slate: "#64748B",
   mist: "#B0B8BF",
+
+  // --- TEXT tokens, WCAG 2.1 AA (ColorContrastAudit.md) ------------------
+  // `green`, `slate` and `mist` above remain unchanged: they are correct as
+  // BACKGROUNDS, BORDERS and fills, which is most of their use. They are not
+  // safe as small TEXT, and these three tokens are the text-safe counterparts.
+  //
+  // There is no single green that works on both light and dark surfaces, which
+  // is why there are two. Darkening green for light backgrounds makes it worse
+  // on dark ones, and vice versa:
+  //
+  //                        on white   on offWhite   on navy   AA normal (4.5:1)
+  //   green    #1E9E52       3.46        2.84        4.12     fails everywhere
+  //   greenText #166E38      6.32        5.19        2.25     light only
+  //   greenOnDark #10B43E    2.76        2.26        5.17     dark only
+  //
+  // greenOnDark is sampled FROM THE LOGO - the modal pixel of the "U" left
+  // panel in assets/icon.png. The panel is a gradient (#2DBD4E brightest ->
+  // #0F873F in the shadowed base, 5.77:1 -> 3.09:1 on navy), so the value is
+  // taken from the upper/mid panel where the brand colour actually reads;
+  // sampling the shadowed base would fail AA. Same brand, same visual
+  // language, and it explains why `green` never worked on dark: BRAND.green
+  // is itself a darkened derivative of the logo, tuned for light backgrounds.
+  greenText: "#166E38",    // text on white/offWhite   - 6.32:1 / 5.19:1
+  greenOnDark: "#10B43E",  // text on navy             - 5.17:1
+  slateText: "#54607A",    // secondary text on light  - 6.30:1 / 5.18:1
 };
 
 // Module-level, not defined inside a component - Animated.createAnimatedComponent
@@ -13826,11 +13851,20 @@ const s = StyleSheet.create({
   hdrName: { fontSize: 22, fontFamily: "Inter_700Bold", color: BRAND.white },
   hdrTag: { fontSize: 11, fontFamily: "Inter_400Regular", color: "rgba(255,255,255,0.6)", marginTop: 2 },
   hdrPageName: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: "rgba(255,255,255,0.85)", marginTop: 1 },
-  freeBadge: { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(30,158,82,0.2)", borderRadius: 20, paddingHorizontal: 10, paddingVertical: 4, marginTop: 6, alignSelf: "flex-start" },
-  freeBadgeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: BRAND.green },
-  freeBadgeText: { fontSize: 11, fontFamily: "Inter_700Bold", color: BRAND.green },
+  // The translucent green fill was REMOVED, not recoloured. rgba(30,158,82,0.2)
+  // over navy composites to #124152, which lifts the background toward the text
+  // and cost 0.93 of contrast ratio - green on it measured 3.19:1 against 4.12:1
+  // for the same green on plain navy. A tint behind same-hue text always works
+  // against legibility. Transparent fill + a green border keeps the badge
+  // visually distinct while letting the text sit on plain navy (5.17:1).
+  freeBadge: { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "transparent", borderWidth: 1.5, borderColor: BRAND.greenOnDark, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 4, marginTop: 6, alignSelf: "flex-start" },
+  freeBadgeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: BRAND.greenOnDark },
+  freeBadgeText: { fontSize: 11, fontFamily: "Inter_700Bold", color: BRAND.greenOnDark },
   freeBadgeUpgrade: { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: BRAND.tan, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 4, marginTop: 4, alignSelf: "flex-start" },
-  freeBadgeUpgradeText: { fontSize: 11, fontFamily: "Inter_700Bold", color: "white" },
+  // white on tan #C8A97A was 2.23:1 - the worst interactive element in the app,
+  // and it is the paid-conversion affordance. ink on tan is 6.39:1. None of the
+  // three new text tokens apply here: the surface is tan, not light or dark.
+  freeBadgeUpgradeText: { fontSize: 11, fontFamily: "Inter_700Bold", color: BRAND.ink },
   signOutBtn: { marginLeft: "auto", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, borderWidth: 1, borderColor: "rgba(255,255,255,0.3)" },
   signOutText: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: "rgba(255,255,255,0.7)" },
   welcomeText: { fontSize: 16, fontFamily: "Inter_700Bold", color: BRAND.green, marginTop: 8, marginBottom: 4 },
@@ -13873,7 +13907,7 @@ const s = StyleSheet.create({
   tcardIcon: { fontSize: 16 },
   tcardPill: { borderWidth: 1, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 10 },
   tcardPillText: { fontSize: 12, fontFamily: "Inter_700Bold" },
-  tcardRange: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist },
+  tcardRange: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slateText },
   step: { flexDirection: "row", gap: 10, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: BRAND.offWhite },
   stepChk: { width: 18, height: 18, borderRadius: 5, alignItems: "center", justifyContent: "center", marginTop: 2 },
   stepChkText: { fontSize: 9, fontWeight: "800" },
@@ -13895,10 +13929,10 @@ const s = StyleSheet.create({
   recIcon: { width: 48, height: 48, borderRadius: 10, alignItems: "center", justifyContent: "center", overflow: "hidden" },
   recBody: { flex: 1, minWidth: 0 },
   recName: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
-  recReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slate, marginTop: 2 },
-  recLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.green, marginTop: 4 },
+  recReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slateText, marginTop: 2 },
+  recLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.greenText, marginTop: 4 },
   amznBadge: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 },
-  amznText: { fontSize: 9, fontFamily: "Inter_700Bold", color: BRAND.mist },
+  amznText: { fontSize: 9, fontFamily: "Inter_700Bold", color: BRAND.slateText },
   approachCard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderRadius: 16, padding: 16, marginBottom: 12 },
   approachCardHead: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
   approachPill: { borderWidth: 1, borderRadius: 20, paddingVertical: 3, paddingHorizontal: 10 },
@@ -13967,7 +14001,7 @@ const s = StyleSheet.create({
   reviewItemBtnPrimary: { flex: 1, backgroundColor: BRAND.green, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
   reviewItemBtnPrimaryText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: "white", textAlign: "center" },
   reviewItemBtnOutline: { flex: 1, backgroundColor: "transparent", borderWidth: 1.5, borderColor: BRAND.green, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center" },
-  reviewItemBtnOutlineText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green, textAlign: "center" },
+  reviewItemBtnOutlineText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.greenText, textAlign: "center" },
   wrapUpCelebrationTitle: { fontSize: 20, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 8 },
   wrapUpCelebrationRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
   wrapUpCelebrationText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: BRAND.green },
@@ -14145,7 +14179,7 @@ const s = StyleSheet.create({
   planSaveText: { fontSize: 9, fontFamily: "Inter_700Bold", color: "white" },
   paywallCta: { backgroundColor: BRAND.green, borderRadius: 14, padding: 17, alignItems: "center", width: "100%", marginBottom: 8 },
   paywallCtaText: { color: "white", fontSize: 16, fontFamily: "Inter_700Bold" },
-  paywallCtaSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.mist, marginBottom: 16 },
+  paywallCtaSub: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slateText, marginBottom: 16 },
   paywallSkip: { padding: 12 },
   paywallSkipText: { fontSize: 14, fontFamily: "Inter_400Regular", color: "#A8AFBC" },
   shareBtnIcon: { fontSize: 26, color: BRAND.green },
