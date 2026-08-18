@@ -601,6 +601,12 @@ described a rematch and is superseded: staleness triggers a **refresh**.
 A stored price remains indicative and must be labelled as such, never as a
 quote.
 
+**Refined by Section 10.** Two Amazon-established requirements land directly on
+this option: the staleness threshold is **per-source, not global** (Amazon caps
+retention at 24 hours), and matching runs **asynchronously after plan
+completion**, never inside it. "Precompute at plan creation" means *at*, not
+*within* — see Section 10a and 10b.
+
 **Not (a)** — it puts the slowest path in front of the most engaged user action.
 **Not (c)** — building refresh infrastructure before a single match has been
 validated is investment ahead of evidence.
@@ -719,6 +725,11 @@ badly this reads as broken. Three principles:
 3. **Never fabricate parity.** Do not show an estimated price on a fallback
    card. An invented price is the one thing here that damages trust
    irrecoverably.
+
+**Card design requirement, Section 10d:** any Amazon-sourced price must carry an
+adjacent date/time stamp and Amazon's fixed disclaimer. It belongs only on cards
+actually showing an Amazon price — never on fallback cards, which show none,
+which is principle 3 above applied in the other direction.
 
 Worth stating plainly: today **100%** of recommendations are fallback, and that
 is the current shipped experience. Every matched product is an improvement on
@@ -1055,6 +1066,120 @@ Re-run the Section 1 analysis against `productNeed`-era recommendations and
 compare to this document's baseline: **53/54 distinct phrases, 52% disjunctive,
 82 intents, 13% underspecified.** Decision #5 sets the target at ~3%
 underspecified.
+
+---
+
+## 10. Architectural requirements established by the Amazon audit
+
+**Added 2026-08-18** from `AmazonCreatorsAPIAudit.md`. These are **requirements,
+not preferences** — Amazon's Operating Agreement and access model force them,
+and three of the four generalise to every source. They change the architecture;
+they do **not** change the matcher implementation, which waits for real
+credentials.
+
+### a. Per-source freshness policy, declared on the interface
+
+**Each source defines its own retention and freshness rules.** `staleDays`
+becomes **per-source configuration, not a global default.**
+
+| Source | Freshness | Why |
+|---|---|---|
+| **Amazon Creators** | **24 hours** | Program Policies: non-image content may be cached *"for up to 24 hours"*, after which it must be refreshed by an API call |
+| Feed-based (Awin, Rakuten) | 7 days or longer | Feed cadence, no comparable contractual cap |
+| Fixture | n/a | No commercial terms |
+
+**Images: store the URL or reference only, never the asset.** Amazon prohibits
+persistent image storage outright — *"You will not store or cache Product
+Advertising Content consisting of an image, but you may store a link… for up to
+24 hours."* `CatalogProduct.imageUrl` is already a link, which is the compliant
+shape; what changes is that the link itself expires and the asset must never be
+mirrored, proxied or re-hosted.
+
+This extends the `CatalogSource` contract: `metadata` gains a freshness
+declaration, and `planRefresh()` reads the policy from the source rather than
+from a constant. A global default is not merely coarse here — for an
+Amazon-backed candidate it is **non-compliant**.
+
+### b. Matching is asynchronous and never blocks plan creation
+
+Decision #3 chose precompute "at plan creation". **That is refined here: at
+plan creation, not *within* it.**
+
+```
+photo -> Call 1 -> Call 2 -> PLAN COMPLETE, results shown
+                                   |
+                                   +--> Product Intelligence runs ASYNCHRONOUSLY
+                                          |
+                                          +--> matched products populate as they arrive
+```
+
+The user sees the **generic recommendation card ("Find options →")
+immediately** — today's shipped experience, unchanged. When matching completes,
+a card **acquires** a specific commerce match. Nothing regresses if matching is
+slow, and nothing waits on it.
+
+Amazon's measured latency makes this non-negotiable rather than merely tidy:
+~9–12 requests per plan at the initial **1 TPS** is **~12 seconds, serial**.
+Inside the analysis path that is a 12-second regression on the app's most
+important flow. Outside it, it is invisible.
+
+This also falls out of Section 0 for free: because the commerce candidate is
+**stored separately** from the recommendation, it can arrive later without
+rewriting anything. A design that embedded matches in the plan document would
+have to block, because the document could not be written until matching
+finished.
+
+### c. Source availability is a runtime health check, not a build-time assumption
+
+**Product Intelligence does not fail when a source does.** An unavailable
+source is **skipped**, and the resolver falls through to the next source, and
+ultimately to the Amazon search-link fallback that always works.
+
+Sources become unavailable for ordinary reasons, not exceptional ones:
+
+- **Amazon access lapses** after 30 consecutive days without qualified sales
+  (regained within two days once sales ship) — established in the audit, and
+  the reason this item exists.
+- A network partnership expires or an advertiser terminates.
+- An API is down, rate-limited (HTTP 429), or credentials rotate.
+
+So **source eligibility must be evaluated at runtime.** Concretely, a source's
+`canResolve` fails closed on auth failure, quota exhaustion or timeout, and the
+existing `PRODUCT_SOURCES` fall-through in `resolveProductDestination` handles
+the rest — it already selects the first source whose `canResolve` returns true
+and defaults to `AmazonSearchSource`.
+
+The consequence worth stating plainly: **Amazon appears twice in the source
+list, in two different roles.** `AmazonCreatorsSource` is gated, rich, and may
+revoke itself. `AmazonSearchSource` is ungated, thin, and never fails. The
+second is not a degraded version of the first — it is the floor the whole
+system stands on, and it must never be removed on the strength of the first
+working.
+
+### d. Required price disclaimer — a product card design requirement
+
+**Any displayed price sourced from Amazon must carry an adjacent disclaimer**,
+per the Associates Program Operating Agreement:
+
+- A **date/time stamp adjacent to the price**, whenever data is refreshed less
+  frequently than hourly. Our model refreshes daily at best, so this always
+  applies.
+- The fixed notice: *"Product prices and availability are accurate as of the
+  date/time indicated and are subject to change. Any price and availability
+  information displayed on [relevant Amazon Site(s), as applicable] at the time
+  of purchase will apply to the purchase of this product."*
+
+**This is recorded as a card design requirement for future implementation.**
+Nothing in the current compact card (`recCard` / `recName` / `recReason` /
+`recLink`) accounts for it, and the redesign deliberately optimised for ~70–90px
+cards — a timestamp plus a two-sentence notice does not fit that budget as
+drawn.
+
+It is a **shipping blocker for displaying Amazon prices**, and therefore worth
+resolving before the price is treated as a settled part of the card. Note the
+interaction with Section 6d's third principle, "never fabricate parity": the
+disclaimer belongs only on cards that actually show an Amazon price, not on
+fallback cards, which show none.
 
 ---
 
