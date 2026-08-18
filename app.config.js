@@ -12,7 +12,27 @@ module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
     slug: "cluttrd",
-    version: "2.0.0",
+    // Staging's version is FROZEN, and that is the whole point.
+    //
+    // `version` is a fingerprint input, so bumping it for a store release
+    // changes the runtime fingerprint of EVERY environment that shares this
+    // file - including staging, which has no store, no version ordering and no
+    // reason to care. The 1.0.4 -> 2.0.0 bump forced four builds: two
+    // production ones that were genuinely needed for the release, and two
+    // staging ones that were pure collateral. Measured directly: setting this
+    // back to "1.0.4" recomputes the staging fingerprint to 194c6294..., byte
+    // for byte the runtime already installed on the staging device.
+    //
+    // Freezing the staging value decouples the two. Production bumps no longer
+    // invalidate staging binaries, so a store release costs two builds instead
+    // of four. A real native change - new plugin, permission, SDK upgrade -
+    // still moves both fingerprints, which is correct: staging genuinely needs
+    // rebuilding then.
+    //
+    // Consequence to remember: staging will report "1.0.4" forever. That is
+    // cosmetic on an internal-distribution build, and cheaper than the
+    // alternative.
+    version: IS_PRODUCTION ? "2.0.0" : "1.0.4",
     orientation: "portrait",
     icon: IS_PRODUCTION ? "./assets/icon.png" : "./assets/icon-staging.png",
     userInterfaceStyle: "light",

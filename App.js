@@ -10531,7 +10531,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} />
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(false)} style={{ padding: 8 }}>
             <X size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -12392,7 +12392,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} />
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -13234,7 +13234,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} />
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -13341,19 +13341,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => { if (!isPro && (analyses || 0) >= 3) setShowPaywall(true); }}>
-            {isPro ? (
-              <Text style={s.hdrTag}>Pro member</Text>
-            ) : (analyses || 0) >= 3 ? (
-              <View style={s.freeBadgeUpgrade}>
-                <Zap size={11} color="white" strokeWidth={2.5} />
-                <Text style={s.freeBadgeUpgradeText}>Upgrade to Pro</Text>
-              </View>
-            ) : (
-              <View style={s.freeBadge}>
-                <View style={s.freeBadgeDot} />
-                <Text style={s.freeBadgeText}>{Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining</Text>
-              </View>
-            )}
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} showUpgrade />
           </TouchableOpacity>
         </View>
         <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }}>
@@ -13839,6 +13827,42 @@ export default function App() {
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// FREE ROOMS HEADER INDICATOR
+// ---------------------------------------------------------------------------
+// One component, four call sites. It previously existed as four separate inline
+// copies - Home, Results, Companion and the menu drawer - which is how they
+// drifted: Home was given the bordered badge treatment and the other three were
+// left as plain `hdrTag` text at rgba(255,255,255,0.6). Same string, same data,
+// two different designs depending on which screen you were on.
+//
+// Declared at module level rather than inside MainApp on purpose. A component
+// defined inside a render function is a NEW component type on every render, so
+// React unmounts and remounts it each time instead of updating it.
+//
+// `showUpgrade` is Home-only, and deliberately so: only Home wraps this in a
+// TouchableOpacity that opens the paywall, so only Home can honestly offer an
+// "Upgrade to Pro" affordance. On the other three screens the surrounding tap
+// target navigates home, and a button that says Upgrade but goes home is worse
+// than no button.
+function FreeRoomsBadge({ isPro, analyses, showUpgrade = false }) {
+  if (isPro) return <Text style={s.hdrTag}>Pro member</Text>;
+  if (showUpgrade && (analyses || 0) >= 3) {
+    return (
+      <View style={s.freeBadgeUpgrade}>
+        <Zap size={11} color={BRAND.ink} strokeWidth={2.5} />
+        <Text style={s.freeBadgeUpgradeText}>Upgrade to Pro</Text>
+      </View>
+    );
+  }
+  return (
+    <View style={s.freeBadge}>
+      <View style={s.freeBadgeDot} />
+      <Text style={s.freeBadgeText}>{Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining</Text>
+    </View>
+  );
+}
 
 const s = StyleSheet.create({
   stagingBanner: { backgroundColor: "#F59E0B", alignItems: "center", justifyContent: "center", paddingVertical: 4 },
