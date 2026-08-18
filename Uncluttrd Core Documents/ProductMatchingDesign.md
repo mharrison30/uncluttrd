@@ -415,6 +415,46 @@ Guard: with fewer than ~5 candidates, percentiles are noise. Below that
 threshold, drop the price term and renormalize rather than ranking on a
 two-element distribution.
 
+### Price outliers — ADDED 2026-08-18, validated by the MVI build
+
+Candidate-relative price percentile **remains** the approach signal. Nothing
+above changes. But percentile ranking has no notion of *out of distribution*,
+and the MVI found the hole by hitting it:
+
+> Intent `"decorative sculpture"`, approach Elevated, 16 candidates priced
+> $19.99–$189 **plus a $2,400 limited-edition art piece — 41x the median.**
+> The Elevated target of the 75th percentile landed **on the outlier**, giving
+> it a high `price_fit`. It then scored 0.771 against 0.782 for a $134
+> sculpture — **inside epsilon** — so the **commission tiebreak promoted it**,
+> because the outlier carried a 10% rate against the default 5%.
+
+**That is exactly the outcome decision #2 forbids.** The tiebreak obeyed its
+own rule; the fault was upstream, in letting an out-of-distribution price
+define what "elevated" means. Two decisions, each correct alone, combining into
+an outcome neither intended.
+
+The rule, now part of the ranking design:
+
+1. **Exclude extreme price outliers from the percentile distribution**, using a
+   **loose `Q3 + 3 x IQR` fence** — validated in the MVI build. Deliberately
+   looser than the conventional 1.5x so it only ever catches the genuinely
+   absurd. A merely expensive product must stay reachable, or Elevated stops
+   working.
+2. **Outliers may remain candidates** if otherwise relevant. They are ranked
+   normally on relevance, availability and context — excluding them outright
+   would impose a band, which is the thing Section 3c exists to avoid. What
+   they may not do is **redefine the approach-relative price target**: an
+   out-of-fence product scores `price_fit = 0` and is absent from the basis.
+3. **Commission remains tiebreak-only** and **may never rescue an outlier
+   created by distorted price normalization.** Fixing the basis is what makes
+   this hold in practice: an out-of-fence product can no longer land within
+   epsilon of the top, so the tiebreak is never consulted on it.
+
+The general principle worth carrying: **an epsilon-width tiebreak sitting on
+top of a distorted signal will faithfully amplify the distortion.** Whenever a
+ranking term can be skewed by a single candidate, fix the term rather than
+tightening epsilon.
+
 ### b. Context fit
 
 `approachId` gives ambition directly. The product side is weak: most feeds
@@ -697,10 +737,42 @@ preserves the resolver architecture.
 
 **1. Deterministic query rewriter — no model.**
 Handles the measured structure directly: split on `or` (52% of the corpus,
-1.52x intent expansion), strip purpose clauses (19%), strip room words using
-the `QUERY_STOPWORDS` set **that already exists in `App.js`**, map the head
-noun to a catalog category. This alone addresses most of the 87% translation
-problem and is pure string handling.
+1.52x intent expansion), strip purpose clauses (19%), strip room words, map the
+head noun to a catalog category. This alone addresses most of the 87%
+translation problem and is pure string handling.
+
+**CORRECTED 2026-08-18 by the MVI build.** This originally said to strip room
+words "using the `QUERY_STOPWORDS` set **that already exists in `App.js`**".
+Implemented literally, that is **wrong**, and the correction is now part of the
+design rather than a note on it.
+
+In `App.js`, `QUERY_STOPWORDS` never strips anything. Its only use is inside
+`buildAmazonSearchQuery`, as a filter on words being **appended** as context
+hints:
+
+```js
+if (tokens.every((t) => seen.has(t) || QUERY_STOPWORDS.has(t))) return;
+```
+
+The base query is never touched. The set therefore conflates two different
+jobs, and reusing it as a strip-list damages real product categories: it
+contains `"wall"`, which appears **7 times** in corpus `productType` values,
+every occurrence load-bearing. `"framed wall art"` would become
+`"framed art"` — a strictly worse catalog query.
+
+The rewriter splits the set **by job** rather than reusing it **by name**:
+
+| Set | Rule |
+|---|---|
+| **`FUNCTION_WORDS`** | Pure syntax (`the`, `and`, `or`, `for`, `with`, `of`, …). **Always** strippable, no exceptions |
+| **`LOCATION_WORDS`** | Room / spatial words (`bathroom`, `pantry`, `niche`, `wall`, `credenza`, …). Strippable **only outside a protected compound** |
+| **`PROTECTED_COMPOUNDS`** | Explicit bigram list where a location word is part of the category itself (`wall art`, `bath mat`, `table lamp`, `picture light`, `bar cabinet`, …). Checked before any location stripping |
+
+`PROTECTED_COMPOUNDS` is deliberately an explicit list rather than a heuristic:
+a heuristic here fails silently and invisibly, and the list is short enough to
+read and argue with. Measured effect on the corpus: **12 location tokens
+protected** that naive stripping would have removed, against 18 tokens
+correctly stripped.
 
 **2. A catalog-source interface — not a source.** *(revised per decision #1)*
 Define the contract every source must satisfy — `search(intent) -> candidates[]`
@@ -745,6 +817,60 @@ scorable offline with no user present. Concretely: run the rewriter over all
 54, confirm 82 intents, retrieve, rank, and hand-score top-3 relevance. The
 measured baseline — 20% clean-matchable, 87% translation, 13% irreducible —
 gives a target to beat that was derived before anything was built.
+
+### MVI results — BUILT AND MEASURED 2026-08-18
+
+Implemented in `shared/productMatching/` against a 202-product fixture
+catalog. **26 assertions, 0 failures.** Full detail in
+`ProductMatchingImplementation.md`.
+
+| Measure | Result |
+|---|---|
+| **Intents from 54 recommendations** | **82** — exactly the 1.52x this document predicted |
+| **Coverage, AND-semantics** (meaningful figure) | **69%** (37/54) |
+| Coverage, OR-semantics (forgiving) | 100% (54/54) |
+| **Effective underspecified rate** | **~4%** (2/54), down from the 13% measured here |
+| **Distractors selected** | **0** — and 0 reached any intent's top 3 |
+| Selection changed by rewriting | **23 of 51** shared matches chose a *different* product |
+
+**Retrieval semantics dominate every other variable, and 69% is the figure to
+quote.** Running the rewriter against both retrieval models:
+
+| | no rewrite | with rewriter | delta |
+|---|---|---|---|
+| **OR-semantics** (forgiving) | 94% (51/54) | 100% (54/54) | +3 |
+| **AND-semantics** (realistic) | 37% (20/54) | 69% (37/54) | **+17** |
+
+Under OR-semantics the rewriter looks nearly worthless — raw `productType`
+already reaches 94%. That reading is an artifact of a generous fixture. A
+structured catalog API with a real category tree behaves closer to
+AND-semantics, and this document already says relevance "degrades with query
+length" for exactly that reason. **Under realistic retrieval the rewriter
+nearly doubles coverage.**
+
+Two consequences:
+
+1. **69% is the meaningful current result.** The 100% figure is an upper bound
+   measured under the friendliest possible retrieval, against a fixture
+   authored alongside the matcher. Real coverage will land between the two and
+   nearer the bottom.
+2. **Retrieval semantics must be established for any real source before its
+   numbers mean anything.** It is worth roughly 30 points of coverage, which
+   makes it the single largest unknown remaining.
+
+Coverage alone also understates the rewriter: of the 51 recommendations matched
+by **both** arms, **23 selected a different product**. Rewriting changes match
+*quality*, not only whether a match exists — something a binary metric cannot
+see.
+
+**The ~4% effective underspecified rate is evidence for decision #5.**
+Disjunction splitting partially dissolves the class: when `"decorative objects"`
+is paired with a concrete alternative (`"or vases"`, `"or sculptural pieces"`),
+the concrete branch is matchable and matches sensibly. Only the two with *no*
+concrete branch fall back. Better structure at the intent layer cut the rate
+from 13% to 4% **before structured `productNeed` exists at all**, which is
+direct support for the thesis that underspecification is a schema problem
+rather than a reasoning one — and suggests the ~3% target is reachable.
 
 **The hard precondition is removed by decision #1.** The original text here
 said one catalog source must be commercially live before this was worth

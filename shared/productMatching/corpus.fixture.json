@@ -1,0 +1,434 @@
+[
+ {
+  "idx": 1,
+  "approachId": "polished",
+  "productType": "countertop tray",
+  "searchTerms": "bathroom countertop tray organizer vanity",
+  "shortReason": "Corrals bottles to reduce counter clutter",
+  "icon": "tray"
+ },
+ {
+  "idx": 2,
+  "approachId": "polished",
+  "productType": "framed wall art",
+  "searchTerms": "small bathroom wall art framed print",
+  "shortReason": "Makes bare walls feel more finished",
+  "icon": "art"
+ },
+ {
+  "idx": 3,
+  "approachId": "polished",
+  "productType": "hand towel",
+  "searchTerms": "bathroom hand towel neutral beige brown",
+  "shortReason": "Ties color palette together visually",
+  "icon": "textile"
+ },
+ {
+  "idx": 4,
+  "approachId": "elevated",
+  "productType": "tiered countertop organizer",
+  "searchTerms": "bathroom countertop organizer tiered tray",
+  "shortReason": "Creates elevated spa-like counter display",
+  "icon": "tray"
+ },
+ {
+  "idx": 5,
+  "approachId": "elevated",
+  "productType": "matching soap dispenser set",
+  "searchTerms": "bathroom soap dispenser set matching ceramic",
+  "shortReason": "Create cohesive, high-end counter display",
+  "icon": "decor"
+ },
+ {
+  "idx": 6,
+  "approachId": "elevated",
+  "productType": "framed wall art set",
+  "searchTerms": "bathroom wall art set framed prints neutral",
+  "shortReason": "Creates gallery feel for bare walls",
+  "icon": "art"
+ },
+ {
+  "idx": 7,
+  "approachId": "elevated",
+  "productType": "luxury bath towel set",
+  "searchTerms": "luxury bath towel set plush neutral",
+  "shortReason": "Spa-like feel with coordinated towels",
+  "icon": "textile"
+ },
+ {
+  "idx": 8,
+  "approachId": "elevated",
+  "productType": "plush bath mat",
+  "searchTerms": "plush bath mat neutral beige",
+  "shortReason": "Completes spa-like feel with soft comfort",
+  "icon": "textile"
+ },
+ {
+  "idx": 9,
+  "approachId": "elevated",
+  "productType": "small potted plant or candle",
+  "searchTerms": "small bathroom plant succulent candle",
+  "shortReason": "Adds natural warmth and finishing touch",
+  "icon": "plant"
+ },
+ {
+  "idx": 10,
+  "approachId": "elevated",
+  "productType": "bar cabinet or liquor cabinet",
+  "searchTerms": "bar cabinet liquor cabinet drinks cabinet",
+  "shortReason": "Conceal bottles while keeping them accessible",
+  "icon": "other"
+ },
+ {
+  "idx": 11,
+  "approachId": "elevated",
+  "productType": "LED picture light or niche lighting",
+  "searchTerms": "picture light LED art light niche lighting",
+  "shortReason": "Transform niche into gallery-worthy focal point",
+  "icon": "other"
+ },
+ {
+  "idx": 12,
+  "approachId": "elevated",
+  "productType": "decorative sculpture or art object",
+  "searchTerms": "decorative sculpture art object statement vase",
+  "shortReason": "Creates finished look for architectural niche",
+  "icon": "other"
+ },
+ {
+  "idx": 13,
+  "approachId": "polished",
+  "productType": "decorative tray",
+  "searchTerms": "bar tray serving tray decorative tray",
+  "shortReason": "Corrals bottles to define bar area",
+  "icon": "other"
+ },
+ {
+  "idx": 14,
+  "approachId": "polished",
+  "productType": "floating shelf or niche shelf",
+  "searchTerms": "floating shelf small display shelf niche shelf",
+  "shortReason": "Add depth with second display level",
+  "icon": "shelf"
+ },
+ {
+  "idx": 15,
+  "approachId": "polished",
+  "productType": "Clear storage bins",
+  "searchTerms": "clear pantry bins stackable",
+  "shortReason": "Corral snacks into pull-out containers",
+  "icon": "bin"
+ },
+ {
+  "idx": 16,
+  "approachId": "polished",
+  "productType": "Lazy Susan turntable",
+  "searchTerms": "lazy susan pantry corner turntable",
+  "shortReason": "Spin hidden corner items to front",
+  "icon": "storage"
+ },
+ {
+  "idx": 17,
+  "approachId": "polished",
+  "productType": "Woven or wire baskets",
+  "searchTerms": "pantry baskets wire woven",
+  "shortReason": "Contain snacks for easy browsing access",
+  "icon": "basket"
+ },
+ {
+  "idx": 18,
+  "approachId": "polished",
+  "productType": "Label maker or adhesive labels",
+  "searchTerms": "label maker pantry labels",
+  "shortReason": "Keep whole household organized and clear",
+  "icon": "label"
+ },
+ {
+  "idx": 19,
+  "approachId": "elevated",
+  "productType": "Matching clear canisters set",
+  "searchTerms": "airtight clear pantry canisters set",
+  "shortReason": "Keep dry goods fresh and visible",
+  "icon": "storage"
+ },
+ {
+  "idx": 20,
+  "approachId": "elevated",
+  "productType": "Tiered shelf risers",
+  "searchTerms": "tiered pantry shelf risers expandable",
+  "shortReason": "Make all pantry labels visible",
+  "icon": "shelf"
+ },
+ {
+  "idx": 21,
+  "approachId": "elevated",
+  "productType": "Lazy Susan turntables, multiple",
+  "searchTerms": "lazy susan turntable set pantry",
+  "shortReason": "Easy access to deep corner items",
+  "icon": "storage"
+ },
+ {
+  "idx": 22,
+  "approachId": "elevated",
+  "productType": "Pull-out bins or drawers",
+  "searchTerms": "pull out pantry bins sliding drawer",
+  "shortReason": "Access deep shelf items easily",
+  "icon": "bin"
+ },
+ {
+  "idx": 23,
+  "approachId": "elevated",
+  "productType": "Adhesive LED strip lighting",
+  "searchTerms": "adhesive LED strip lights battery pantry",
+  "shortReason": "Illuminate deep areas for item visibility",
+  "icon": "lighting"
+ },
+ {
+  "idx": 24,
+  "approachId": "elevated",
+  "productType": "Label maker with custom font options",
+  "searchTerms": "label maker custom fonts pantry",
+  "shortReason": "Professional labels for cohesive pantry finish",
+  "icon": "label"
+ },
+ {
+  "idx": 25,
+  "approachId": "elevated",
+  "productType": "Matching storage cubes or bins",
+  "searchTerms": "storage cube set bookshelf organizer bins",
+  "shortReason": "Unify cubbies with concealed storage",
+  "icon": "bin"
+ },
+ {
+  "idx": 26,
+  "approachId": "elevated",
+  "productType": "Battery-powered LED accent lights",
+  "searchTerms": "battery LED puck lights shelf lighting",
+  "shortReason": "Highlight display zone with ambient glow",
+  "icon": "lighting"
+ },
+ {
+  "idx": 27,
+  "approachId": "elevated",
+  "productType": "Decorative objects for display styling",
+  "searchTerms": "decorative objects shelf styling accent decor",
+  "shortReason": "Complete upper shelf with curated display",
+  "icon": "decor"
+ },
+ {
+  "idx": 28,
+  "approachId": "elevated",
+  "productType": "Cable management box or organizer",
+  "searchTerms": "cable management box cord organizer",
+  "shortReason": "Keep cords contained and tangle-free",
+  "icon": "cable"
+ },
+ {
+  "idx": 29,
+  "approachId": "elevated",
+  "productType": "Decorative bookends",
+  "searchTerms": "decorative bookends modern",
+  "shortReason": "Keep books aligned with styled touch",
+  "icon": "decor"
+ },
+ {
+  "idx": 30,
+  "approachId": "polished",
+  "productType": "Fabric storage bins or cubes",
+  "searchTerms": "fabric storage cube bin bookshelf",
+  "shortReason": "Conceal cords and items in cubbies",
+  "icon": "bin"
+ },
+ {
+  "idx": 31,
+  "approachId": "polished",
+  "productType": "Decorative bookends",
+  "searchTerms": "decorative bookends",
+  "shortReason": "Keep books upright with polish",
+  "icon": "decor"
+ },
+ {
+  "idx": 32,
+  "approachId": "polished",
+  "productType": "Small accent decor objects",
+  "searchTerms": "small decorative objects shelf decor",
+  "shortReason": "Balance pennant with curated shelf display",
+  "icon": "decor"
+ },
+ {
+  "idx": 33,
+  "approachId": "polished",
+  "productType": "Cable organizer box or pouch",
+  "searchTerms": "cable organizer box cord management pouch",
+  "shortReason": "Keeps cables neat and untangled inside",
+  "icon": "cable"
+ },
+ {
+  "idx": 34,
+  "approachId": "polished",
+  "productType": "Decorative storage basket or fabric bin",
+  "searchTerms": "small decorative basket fabric storage bin shelf",
+  "shortReason": "Conceal flat items while adding texture",
+  "icon": "basket"
+ },
+ {
+  "idx": 35,
+  "approachId": "polished",
+  "productType": "Framed wall art or print",
+  "searchTerms": "framed print wall art bedroom",
+  "shortReason": "Anchors bookshelf corner, finishes bare wall",
+  "icon": "art"
+ },
+ {
+  "idx": 36,
+  "approachId": "polished",
+  "productType": "Small potted plant or succulent",
+  "searchTerms": "small potted plant succulent shelf decor",
+  "shortReason": "Adds organic life to shelf displays",
+  "icon": "plant"
+ },
+ {
+  "idx": 37,
+  "approachId": "elevated",
+  "productType": "Cable management system with organizer",
+  "searchTerms": "cable management system organizer charging station",
+  "shortReason": "Prevents cable tangling with designated slots",
+  "icon": "cable"
+ },
+ {
+  "idx": 38,
+  "approachId": "elevated",
+  "productType": "Drawer organizer or divided tray",
+  "searchTerms": "drawer organizer divided tray cabinet storage",
+  "shortReason": "Organize flat items in structured compartments",
+  "icon": "drawer-organizer"
+ },
+ {
+  "idx": 39,
+  "approachId": "elevated",
+  "productType": "Set of decorative objects or sculptural pieces",
+  "searchTerms": "decorative objects shelf decor sculptural accents",
+  "shortReason": "Add curatorial interest to shelves",
+  "icon": "decor"
+ },
+ {
+  "idx": 40,
+  "approachId": "elevated",
+  "productType": "Book risers or small display pedestals",
+  "searchTerms": "book risers display pedestals shelf stands",
+  "shortReason": "Create depth with varied display heights",
+  "icon": "decor"
+ },
+ {
+  "idx": 41,
+  "approachId": "elevated",
+  "productType": "Gallery wall art set or coordinated frames",
+  "searchTerms": "gallery wall art set coordinated frames wall decor",
+  "shortReason": "Anchors bookshelf corner with cohesive story",
+  "icon": "art"
+ },
+ {
+  "idx": 42,
+  "approachId": "elevated",
+  "productType": "Battery-powered picture light or LED accent strip",
+  "searchTerms": "battery picture light LED strip shelf lighting",
+  "shortReason": "Highlight display without visible cords",
+  "icon": "lighting"
+ },
+ {
+  "idx": 43,
+  "approachId": "polished",
+  "productType": "Pendant light fixture or chandelier",
+  "searchTerms": "dining room pendant light chandelier",
+  "shortReason": "Define and illuminate the dining space",
+  "icon": "other"
+ },
+ {
+  "idx": 44,
+  "approachId": "polished",
+  "productType": "Wall art or framed artwork",
+  "searchTerms": "dining room wall art framed prints",
+  "shortReason": "Fill bare wall with focal point",
+  "icon": "other"
+ },
+ {
+  "idx": 45,
+  "approachId": "elevated",
+  "productType": "Designer pendant light or chandelier with professional installation",
+  "searchTerms": "designer dining chandelier pendant installation",
+  "shortReason": "Transforms space with statement lighting",
+  "icon": "other"
+ },
+ {
+  "idx": 46,
+  "approachId": "elevated",
+  "productType": "Large-scale wall art or gallery wall collection",
+  "searchTerms": "large dining room art gallery wall set",
+  "shortReason": "Fill bare focal wall with art",
+  "icon": "other"
+ },
+ {
+  "idx": 47,
+  "approachId": "elevated",
+  "productType": "Framed artwork or decorative mirror",
+  "searchTerms": "dining room wall art mirror",
+  "shortReason": "Balance bare wall beside windows",
+  "icon": "other"
+ },
+ {
+  "idx": 48,
+  "approachId": "elevated",
+  "productType": "Decorative objects and accent lamp for credenza styling",
+  "searchTerms": "credenza decor vignette styling objects table lamp",
+  "shortReason": "Complete credenza with decorative styling",
+  "icon": "other"
+ },
+ {
+  "idx": 49,
+  "approachId": "elevated",
+  "productType": "accent lighting for niche",
+  "searchTerms": "battery picture light LED accent light",
+  "shortReason": "Illuminate niche to create focal point",
+  "icon": "other"
+ },
+ {
+  "idx": 50,
+  "approachId": "elevated",
+  "productType": "sculptural vases and decorative objects for niche",
+  "searchTerms": "modern sculptural vase set art objects",
+  "shortReason": "Create layered gallery display in niche",
+  "icon": "other"
+ },
+ {
+  "idx": 51,
+  "approachId": "elevated",
+  "productType": "table lamp or decorative lighting for cabinet",
+  "searchTerms": "small table lamp modern accent light",
+  "shortReason": "Adds ambient light and visual interest",
+  "icon": "other"
+ },
+ {
+  "idx": 52,
+  "approachId": "elevated",
+  "productType": "statement centerpiece bowl or vase",
+  "searchTerms": "modern centerpiece bowl low vase",
+  "shortReason": "Creates polished look on cluttered table",
+  "icon": "other"
+ },
+ {
+  "idx": 53,
+  "approachId": "polished",
+  "productType": "decorative objects or vases for niche styling",
+  "searchTerms": "modern vase set decorative objects",
+  "shortReason": "Create finished focal point with height",
+  "icon": "other"
+ },
+ {
+  "idx": 54,
+  "approachId": "polished",
+  "productType": "decorative tray for cabinet surface",
+  "searchTerms": "decorative tray black or wood",
+  "shortReason": "Corral items and create visual order",
+  "icon": "other"
+ }
+]
