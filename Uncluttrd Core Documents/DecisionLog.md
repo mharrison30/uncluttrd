@@ -11,6 +11,51 @@ Status: Living document. Add an entry whenever a meaningful architectural, produ
 
 ## 2026-08
 
+### 2026-08-18 — RevenueCat production webhook verification COMPLETE, iOS and Android
+
+**Verified:** Synthetic TEST deliveries on both platforms passed signature
+verification and payload validation, hit the expected fabricated-user
+`active_entitlements` 404, returned HTTP 200, and created **no** stray
+Firestore data. iOS `E4E6430B-...` at 01:45:12Z, Android `5A0472B2-...` at
+01:51:31Z. Zero occurrences of every failure marker across the full life of
+revision `revenuecatwebhook-00004-leh`.
+
+**End-to-end:** TEST events cannot exercise the entitlement/write path — the
+fabricated uid has no entitlement. That path was proven instead by **Shirley
+Howard's real purchase**, the first production Pro conversion:
+`NON_RENEWING_PURCHASE` at 00:23:31Z returned `entl16a5fcafc4` (matching
+`PRO_ENTITLEMENT_ID`), wrote `isPro=true`, and left a correct idempotency
+record. Signup to purchase: 5 minutes.
+
+**Known limitation:** the handler validates with `.some()` across both signing
+secrets and does not log which matched. Signature *authenticity* is proven;
+that the Android delivery used the **Android** secret specifically is not
+observable. Both secrets are configured, 64 chars, and cryptographically
+distinct. A per-platform misconfiguration would pass silently.
+
+**Held, unchanged:** the Firestore `isPro` rule tightening remains deferred for
+the soak period. Full record in `RevenueCatProductionVerification.md`.
+
+---
+
+### 2026-08-18 — Log assertions use the Cloud Logging REST API, not `firebase functions:log`
+
+**Decision:** any claim about production function logs ("no errors in window X")
+must come from Cloud Logging `entries:list` with an explicit `timestamp>=`
+filter, paged to exhaustion.
+
+**Reason:** `firebase functions:log -n N` returned **inconsistent windows** on
+repeated calls against the same function — `-n 200` gave recent entries, `-n 80`
+gave only 16 entries from three weeks earlier. `N` does not reliably mean "most
+recent N", so a grep over its output can report a clean sweep having never seen
+the relevant window. An earlier "0 errors across 200 log lines" claim in this
+session rested on it and was withdrawn.
+
+**Alternatives considered:** `gcloud logging read` — unusable, the bundled
+Python launcher is broken on this machine.
+
+---
+
 ### 2026-08-17 — Rakuten exposes advertiser categories only after partnership; the name-based screen is deprecated
 
 **Discovery:** Rakuten provides **no merchandising taxonomy for the ~2,159
