@@ -24,6 +24,8 @@
 //      other. Commission must never rescue a mediocre product.
 // ===========================================================================
 
+const { productTokens, matchToken, matchPhrase, tokenizeText } = require("./lexical");
+
 const WEIGHTS = { relevance: 0.55, price: 0.20, availability: 0.15, context: 0.10 };
 const EPSILON = 0.02;
 
@@ -129,17 +131,18 @@ function percentileRank(value, sortedAsc) {
  */
 function relevanceScore(product, tokens) {
   if (!tokens || !tokens.length) return 0;
-  const name = product.name.toLowerCase();
-  const cat = String(product.category || "").toLowerCase().replace(/-/g, " ");
-  const desc = String(product.description || "").toLowerCase();
+  // WORD-BOUNDARY MATCHING. Previously these three were String.includes(),
+  // which matched inside words: "bin" scored a hit on "combination" and "art"
+  // on "lighthearted". See lexical.js for the measurement that forced this.
+  const F = productTokens(product);
 
   let hits = 0;
   let weighted = 0;
   const maxPerToken = 3 + 2 + 1;
   for (const t of tokens) {
-    const inName = name.includes(t);
-    const inCat = cat.includes(t);
-    const inDesc = desc.includes(t);
+    const inName = matchToken(F.name, t);
+    const inCat = matchToken(F.category, t);
+    const inDesc = matchToken(F.description, t);
     if (inName || inCat || inDesc) hits++;
     weighted += (inName ? 3 : 0) + (inCat ? 2 : 0) + (inDesc ? 1 : 0);
   }
@@ -148,8 +151,8 @@ function relevanceScore(product, tokens) {
 
   // The head noun is the last token - the rewriter preserves phrase order.
   const head = tokens[tokens.length - 1];
-  const headScore = (name.includes(head) || cat.includes(head)) ? 1
-    : (desc.includes(head) ? 0.6 : 0);
+  const headScore = (matchToken(F.name, head) || matchToken(F.category, head)) ? 1
+    : (matchToken(F.description, head) ? 0.6 : 0);
 
   return Math.min(1, 0.45 * headScore + 0.35 * coverage + 0.20 * density);
 }
@@ -170,8 +173,12 @@ function availabilityScore(product) {
 function contextFitScore(product, approachId) {
   const words = APPROACH_STYLE_WORDS[approachId];
   if (!words) return 0.5; // no approach known - neutral, not zero
-  const hay = `${product.name} ${product.description}`.toLowerCase();
-  const hitCount = words.filter((w) => hay.includes(w)).length;
+  // Word-boundary too: "limited" must not match "unlimited", "solid" must not
+  // match "solidly". Style words may be hyphenated ("hand-blown"), so each is
+  // tokenized and matched as a contiguous phrase rather than a bare token.
+  const F = productTokens(product);
+  const hay = F.name.concat(F.description);
+  const hitCount = words.filter((w) => matchPhrase(hay, tokenizeText(w))).length;
   if (!hitCount) return 0.4;              // neutral-ish, not a penalty
   return Math.min(1, 0.5 + 0.25 * hitCount);
 }

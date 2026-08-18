@@ -835,22 +835,32 @@ Implemented in `shared/productMatching/` against a 202-product fixture
 catalog. **26 assertions, 0 failures.** Full detail in
 `ProductMatchingImplementation.md`.
 
+**Figures below are post-word-boundary-hardening (2026-08-18).** The original
+MVI used `String.includes()` for lexical comparison, which matched inside words
+and inflated every arm. Superseded numbers are shown struck through.
+
 | Measure | Result |
 |---|---|
 | **Intents from 54 recommendations** | **82** — exactly the 1.52x this document predicted |
-| **Coverage, AND-semantics** (meaningful figure) | **69%** (37/54) |
+| **Coverage, AND-semantics** (meaningful figure) | **67%** (36/54) — *was 69%* |
 | Coverage, OR-semantics (forgiving) | 100% (54/54) |
 | **Effective underspecified rate** | **~4%** (2/54), down from the 13% measured here |
-| **Distractors selected** | **0** — and 0 reached any intent's top 3 |
-| Selection changed by rewriting | **23 of 51** shared matches chose a *different* product |
+| **Distractors selected** | **0** (1 of 82 intents now shows one at rank 2, never rank 1) |
+| Selection changed by rewriting | **21 of 52** shared matches chose a *different* product |
 
-**Retrieval semantics dominate every other variable, and 69% is the figure to
+**Retrieval semantics dominate every other variable, and 67% is the figure to
 quote.** Running the rewriter against both retrieval models:
 
 | | no rewrite | with rewriter | delta |
 |---|---|---|---|
-| **OR-semantics** (forgiving) | 94% (51/54) | 100% (54/54) | +3 |
-| **AND-semantics** (realistic) | 37% (20/54) | 69% (37/54) | **+17** |
+| **OR-semantics** (forgiving) | 96% (52/54) | 100% (54/54) | +2 |
+| **AND-semantics** (realistic) | **19% (10/54)** | **67% (36/54)** | **+26** |
+
+**Word-boundary hardening barely moved the rewriter arm but halved the naive
+baseline** (37% → 19% under AND). Substring matching had been propping up the
+un-rewritten queries far more than the rewritten ones, because a long raw
+`productType` has more tokens available to collide accidentally. The rewriter's
+measured contribution therefore *grew*, from +17 to **+26**.
 
 Under OR-semantics the rewriter looks nearly worthless — raw `productType`
 already reaches 94%. That reading is an artifact of a generous fixture. A

@@ -46,6 +46,9 @@
 // location word is part of the product category itself.
 // ===========================================================================
 
+const { tokenizeRaw, normalizeToken, singularize, TOKEN_SYNONYMS,
+        IRREGULAR_SINGULARS } = require("./lexical");
+
 // Always safe to drop. Pure syntax, never a product category.
 const FUNCTION_WORDS = new Set([
   "the", "a", "an", "and", "or", "for", "with", "of", "to", "in", "on",
@@ -83,16 +86,6 @@ const PROTECTED_COMPOUNDS = [
   "drawer organizer", "drawer divider", "drawer tray",
   "pantry bin", "pantry label", "pantry organizer",
 ];
-
-// Irregular plurals where naive "-s" removal produces a token that matches
-// nothing. Retailer titles favour singular head nouns ("Floating Wall Shelf",
-// "Serving Tray"), so singularizing improves recall under substring matching.
-const IRREGULAR_SINGULARS = {
-  shelves: "shelf", boxes: "box", dishes: "dish", brushes: "brush",
-  glasses: "glass", vases: "vase", leaves: "leaf", knives: "knife",
-  candles: "candle", supplies: "supply", accessories: "accessory",
-  canisters: "canister", turntables: "turntable", baskets: "basket",
-};
 
 // Words that mean "more than one of the same thing" rather than naming a
 // product. They add nothing to a catalog query and actively narrow it.
@@ -132,45 +125,38 @@ const MULTIWORD_SYNONYMS = [
   [/\blazy\s+susan\b/gi, "turntable"],
 ];
 
-const TOKEN_SYNONYMS = {
-  artwork: "art",
-  art: "art",
-  turntables: "turntable",
-  organiser: "organizer",
-  bin: "bin",
-};
 
-function singularize(word) {
-  if (IRREGULAR_SINGULARS[word]) return IRREGULAR_SINGULARS[word];
-  if (word.length <= 3) return word;
-  if (/(ss|us|is|as|os)$/.test(word)) return word;      // glass, status, axis
-  if (/ies$/.test(word)) return word.slice(0, -3) + "y"; // caddies -> caddy
-  if (/(ches|shes|xes|zes)$/.test(word)) return word.slice(0, -2);
-  if (/s$/.test(word)) return word.slice(0, -1);
-  return word;
-}
-
+// Surface-form tokens (no normalization) - normalizeToken is applied at the
+// end of the rewrite, after stripping, so diagnostics report real words.
 function tokenize(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .split(/[\s-]+/)
-    .filter(Boolean);
+  return tokenizeRaw(text);
 }
 
 // Marks token positions covered by a protected compound so location stripping
 // can skip them.
 function protectedPositions(tokens) {
-  const joined = tokens.join(" ");
+  // CONTIGUOUS TOKEN-SEQUENCE MATCHING, not string containment.
+  //
+  // This previously pre-filtered with `tokens.join(" ").includes(compound)`,
+  // which was wrong in BOTH directions:
+  //   over-permissive - ["small","wall","artistic"] joins to
+  //     "small wall artistic", which contains the substring "wall art",
+  //     so an unrelated phrase looked like the protected compound;
+  //   under-permissive - ["walls","art"] joins to "walls art", which does
+  //     NOT contain "wall art", so the guard skipped a compound that the
+  //     singularizing loop below would have matched correctly.
+  //
+  // The inner loop was always right. The pre-filter was the bug, so it is
+  // gone rather than patched.
+  const norm = tokens.map(normalizeToken);
   const protectedIdx = new Set();
   for (const compound of PROTECTED_COMPOUNDS) {
-    if (!joined.includes(compound)) continue;
-    const parts = compound.split(" ");
-    for (let i = 0; i + parts.length <= tokens.length; i++) {
+    const parts = compound.split(" ").map(normalizeToken);
+    if (parts.length > norm.length) continue;
+    for (let i = 0; i + parts.length <= norm.length; i++) {
       let match = true;
       for (let j = 0; j < parts.length; j++) {
-        // Compare singularized so "wall shelves" still protects "wall".
-        if (singularize(tokens[i + j]) !== singularize(parts[j])) { match = false; break; }
+        if (norm[i + j] !== parts[j]) { match = false; break; }
       }
       if (match) for (let j = 0; j < parts.length; j++) protectedIdx.add(i + j);
     }
@@ -280,7 +266,7 @@ function rewriteRecommendation(rec) {
     // Singularize, then de-duplicate while preserving order.
     const seen = new Set();
     const norm = [];
-    for (const t of kept.map(singularize).map((x) => TOKEN_SYNONYMS[x] || x)) {
+    for (const t of kept.map(normalizeToken)) {
       if (seen.has(t)) continue;
       seen.add(t);
       norm.push(t);
@@ -293,7 +279,7 @@ function rewriteRecommendation(rec) {
     // too: degrade visibly, not invisibly.
     if (!norm.length) {
       diagnostics.emptyAfterRewrite = true;
-      const fallback = raw.filter((t) => !FUNCTION_WORDS.has(t)).map(singularize);
+      const fallback = raw.filter((t) => !FUNCTION_WORDS.has(t)).map(normalizeToken);
       const s2 = new Set();
       fallback.forEach((t) => { if (!s2.has(t)) { s2.add(t); norm.push(t); } });
     }

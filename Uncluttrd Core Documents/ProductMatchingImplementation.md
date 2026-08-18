@@ -45,14 +45,21 @@ under both semantics:
 | **OR-semantics** (forgiving) | 51/54 (94%) | 54/54 (100%) | **+3** |
 | **AND-semantics** (realistic) | 20/54 (37%) | 37/54 (69%) | **+17** |
 
+> **SUPERSEDED 2026-08-18.** These were measured with `String.includes()`
+> lexical matching, which matched inside words and inflated every arm. After
+> word-boundary hardening (§10) the corrected figures are **OR 52→54 (+2)** and
+> **AND 10→36, i.e. 19% → 67% (+26)**. The conclusion strengthened rather than
+> changed: the rewriter's contribution *grew*. Numbers below are left as
+> originally measured, with §10 carrying the corrections.
+
 **Under realistic retrieval the rewriter nearly doubles coverage.** The +1 was
 the fixture flattering the baseline, not a fact about the rewriter.
 
 Two consequences worth carrying forward:
 
-1. **Quote 69%, not 96%.** The pipeline's headline "52/54 matched (96%)" is an
+1. **Quote 67%, not 96%.** The pipeline's headline "52/54 matched (96%)" is an
    upper bound measured under the friendliest possible retrieval. Real
-   coverage will land between 69% and 96%, nearer the bottom.
+   coverage will land between 67% and 96%, nearer the bottom.
 2. **Retrieval semantics must be a known property of any real source** before
    its numbers mean anything. `search()` now takes `strict` for exactly this,
    and both modes are evaluated on every run.
@@ -277,6 +284,109 @@ merging, no background refresh, no visual matching.
 functions/index.js` returns 0. Both 2.0.0 runtime fingerprints verified
 unchanged after the work — iOS `ba713790…`, Android `620988bd…` — so the
 TestFlight and Play alpha builds remain OTA-updatable.
+
+## 10. Word-boundary hardening — 2026-08-18
+
+The Mosaic Awin validation (`AwinMosaicFeedValidation.md`) exposed a defect in
+the committed matcher: every lexical comparison used `String.includes()`, which
+matches **anywhere inside a word**.
+
+Measured over the corpus against 491 real Mosaic product rows:
+
+| | |
+|---|---|
+| Token-product hits, substring | **4,080** |
+| Token-product hits, word-boundary | **1,063** |
+| **False hits** | **3,017 — 74%** |
+
+Colliding tokens were the corpus's most common head nouns, not edge cases:
+`bin`→com**bin**ation, `out`→r**out**ine, `art`→light**heart**ed,
+`mat`→ulti**mat**e, `light`→de**light**ful, `table`→sui**table**.
+
+### Sites fixed — six, all of them
+
+| File | Site |
+|---|---|
+| `ranking.js` | `relevanceScore` name/category/description |
+| `ranking.js` | `relevanceScore` head-noun check |
+| `ranking.js` | `contextFitScore` style-word matching |
+| `fixtureCatalog.js` | `search()` term matching |
+| `queryRewriter.js` | `protectedPositions` compound pre-filter |
+| *(new)* `lexical.js` | one shared definition of "this term appears here" |
+
+The `queryRewriter` site was subtler and wrong in **both** directions.
+`tokens.join(" ").includes(compound)` treated `["small","wall","artistic"]` as
+containing `"wall art"` (over-permissive), while `["walls","art"]` joined to
+`"walls art"`, which does **not** contain `"wall art"`, so a compound the
+singularizing loop would have matched was skipped (under-permissive). The inner
+loop was always correct; the pre-filter was the bug, so it was removed rather
+than patched.
+
+### Deliberate handling
+
+Tokenization is now shared and explicit: capitalization lowered, possessives
+stripped (`Mosaic's` → `mosaic`), every non-alphanumeric treated as a separator
+(hyphen, slash, comma, ampersand), numbers preserved as tokens, plurals
+normalized including irregulars, phrases matched as **contiguous token runs**.
+
+`singularize` and `TOKEN_SYNONYMS` moved from `queryRewriter.js` into
+`lexical.js`, because **both sides of a comparison must normalize identically**
+and a normalizer cannot belong to one side. That fixed a latent asymmetry:
+`artwork → art` had been applied to queries only, so a catalog saying "Artwork"
+no longer met a query saying "art" once substring matching stopped hiding it.
+
+### Tests
+
+`lexicalTests.js` — **48 cases, all passing**, run standalone or as section 0 of
+`evaluate.js`. Every required negative, each paired with a positive using the
+same term (a matcher that eliminates false positives by matching nothing is not
+fixed), plus capitalization/punctuation/separator/possessive/plural cases,
+phrase contiguity in both failure directions, and degenerate inputs.
+
+### Results
+
+| | before | after |
+|---|---|---|
+| MVI coverage, AND-semantics | 69% (37/54) | **67% (36/54)** |
+| MVI coverage, OR-semantics | 100% | 100% |
+| No-rewrite baseline, AND | 37% (20/54) | **19% (10/54)** |
+| **Rewriter delta, AND** | +17 | **+26** |
+| Scores computed | 1,748 | 1,443 |
+| **Mosaic matches** | **4/54, all wrong** | **0/54** |
+| Harness | 26/26 | **27/27** (+ 48 lexical) |
+
+**Precision improved sharply; recall barely moved.** A direct before/after over
+all 54 recommendations on first-intent match:
+
+```
+matched by BOTH        : 54       only LEGACY matched : 0   <- no false negatives
+   same product picked : 40       only NEW matched    : 0
+   DIFFERENT product   : 14       neither             : 0
+```
+
+**Zero false negatives introduced.** Nothing that legitimately matched stopped
+matching. 14 of 54 changed *which* product was selected — precision, not
+coverage.
+
+The naive baseline halving (37% → 19%) is the headline: substring noise was
+propping up un-rewritten queries far more than rewritten ones, because a long
+raw `productType` offers more tokens to collide accidentally. The rewriter's
+measured value therefore **grew**.
+
+**Mosaic now returns 0 of 54** — the ideal adversarial result. Retrieval still
+reaches 27/54 (the scratchpad harness's own search is unchanged), but ranking
+rejects every one, which is a stronger demonstration than filtering at
+retrieval would have been.
+
+### One residual, reported rather than tuned away
+
+Intent `"plush bath mat"` now ranks the **Yoga Mat** distractor 2nd (0.703)
+behind the correct Memory Foam Bath Mat (0.796). This is **not** a regression:
+`mat` genuinely *is* a whole word in "Yoga Mat", so word-boundary matching is
+behaving correctly. Substring noise previously buried it among false hits.
+Category is what separates a bath mat from a yoga mat, and the correct product
+still wins by a clear 0.093 margin. Left as-is — the honest fix is a category
+signal, not a threshold nudge.
 
 ## Honest limitations
 

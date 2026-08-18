@@ -42,7 +42,13 @@ console.log(`\n  PRODUCT MATCHING MVI - EVALUATION`);
 console.log(`  corpus: ${CORPUS.length} staging recommendations   catalog: ${ALL_PRODUCTS.length} fixture products\n`);
 
 // ---------------------------------------------------------------------------
-console.log("  === 1. CATALOG SOURCE INTERFACE CONFORMANCE ===");
+console.log("  === 0. LEXICAL REGRESSION TESTS ===");
+const lex = require("./lexicalTests").run(() => {}); // quiet; detail via lexicalTests.js
+ck(`lexical regression suite (${lex.pass + lex.fail} cases)`, lex.fail === 0,
+   lex.fail ? `${lex.fail} failing - run node shared/productMatching/lexicalTests.js` : "");
+
+// ---------------------------------------------------------------------------
+console.log("\n  === 1. CATALOG SOURCE INTERFACE CONFORMANCE ===");
 const srcProblems = validateSource(FixtureCatalogSource, "tray");
 ck("fixture implements CatalogSource", srcProblems.length === 0, srcProblems.join("; "));
 const badProducts = ALL_PRODUCTS.map((p) => validateProduct(p)).filter((x) => x.length);

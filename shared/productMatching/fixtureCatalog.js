@@ -27,6 +27,8 @@
 // assumed.
 // ===========================================================================
 
+const { tokenizeText, matchToken, productTokens } = require("./lexical");
+
 const CURRENCY = "USD";
 const MERCHANT = "fixture-home-goods";
 
@@ -337,7 +339,10 @@ function search(query, options = {}) {
   const maxResults = options.maxResults == null ? 50 : options.maxResults;
   const range = options.priceRange || {};
   const strict = !!options.strict;
-  const terms = String(query || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  // Tokenized and normalized through the same path the products are, so both
+  // sides of every comparison agree on what a word is. Previously this used
+  // String.includes(), which matched inside words - see lexical.js.
+  const terms = tokenizeText(query);
   if (!terms.length) return [];
 
   const scored = [];
@@ -345,16 +350,14 @@ function search(query, options = {}) {
     if (range.min != null && r.price < range.min) continue;
     if (range.max != null && r.price > range.max) continue;
 
-    const name = r.name.toLowerCase();
-    const desc = r.description.toLowerCase();
-    const cat = r.category.toLowerCase().replace(/-/g, " ");
+    const F = productTokens(r);
 
     let hits = 0;
     let weighted = 0;
     for (const t of terms) {
-      const inName = name.includes(t);
-      const inDesc = desc.includes(t);
-      const inCat = cat.includes(t);
+      const inName = matchToken(F.name, t);
+      const inDesc = matchToken(F.description, t);
+      const inCat = matchToken(F.category, t);
       if (inName || inDesc || inCat) hits++;
       // Title matches count for more than description matches, which is how
       // every retailer search engine behaves.
