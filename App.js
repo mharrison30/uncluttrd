@@ -10851,10 +10851,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               // only its child changes.
               const RoomIcon = getRoomTypeIcon(room.displayName);
               return (
-                {/* Swipe-to-delete on the Rooms list. The row keeps tap-to-open;
-                    the gesture only reveals the trash action, and handleDeleteRoom
-                    owns the confirmation. marginBottom moves to the swipe container
-                    so the red panel sits flush with the card. */}
+                // Swipe-to-delete on the Rooms list. The row keeps tap-to-open; the gesture
+                // only reveals the trash action, and handleDeleteRoom owns the
+                // confirmation. marginBottom moves to the swipe container so the red panel
+                // sits flush with the card.
                 <SwipeToDeleteRow
                   key={room.id}
                   accessibilityLabel={`Delete ${room.displayName}`}
@@ -11108,9 +11108,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // (the whole row), not split between a content area and a separate
     // icon anymore.
     const renderVisitRow = (plan) => (
-      {/* Same gesture and component as Room and Area rows. Deleting a
-          visit routes through handleDeleteVisit, which confirms first and
-          removes the plan from roomDetailPlans so the row disappears. */}
+      // Same gesture and component as Room and Area rows. Deleting a visit routes through
+      // handleDeleteVisit, which confirms first and removes the plan from roomDetailPlans
+      // so the row disappears.
       <SwipeToDeleteRow
         key={plan.id}
         accessibilityLabel="Delete this organizing session"
