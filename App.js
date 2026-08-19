@@ -9403,8 +9403,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
   const handleDeleteSession = (plan) => {
     Alert.alert(
-      "Delete this session?",
-      "This will remove this session and its organizing history. You can restore it from Recently Deleted within 30 days.",
+      "Delete this organizing session?",
+      // A session is a leaf - nothing cascades from it - so the body says only
+      // what recovery is available. Claiming it "removes organizing history"
+      // overstated the blast radius of deleting one session.
+      "You can restore it from Recently Deleted within 30 days.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -9850,7 +9853,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const handleDeleteRoom = (room) => {
     Alert.alert(
       `Delete ${room.displayName}?`,
-      "This will remove this room and all its organizing history. You can restore it from Recently Deleted within 30 days.",
+      // Names the CASCADE explicitly. The previous wording ("this room and
+      // all its organizing history") never told the user that every Area
+      // inside the Room goes with it - the part they cannot infer, and the
+      // part they would most regret. Deleting a Room is the widest
+      // destructive action in the app.
+      "This will also delete all areas and organizing sessions inside it. You can restore it from Recently Deleted within 30 days.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -9883,7 +9891,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const handleDeleteArea = (area, swipeableMethods) => {
     Alert.alert(
       `Delete ${area.displayName}?`,
-      "This will remove this area and its organizing history. You can restore it from Recently Deleted within 30 days.",
+      // Says "organizing sessions" rather than "organizing history": history
+      // is vague about what is actually destroyed, sessions are the thing
+      // the user recognises and has worked on.
+      "This will also delete all organizing sessions for this area. You can restore it from Recently Deleted within 30 days.",
       [
         // Cancel: close the swipe row back to its resting state, Area
         // stays exactly as it was - no delete call at all.
