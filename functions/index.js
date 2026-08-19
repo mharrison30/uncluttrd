@@ -802,7 +802,7 @@ exports.analyzePhotoCanary = onSchedule(
 // re-engagement scheduler must not let one user's failure abort the batch,
 // and the canary alert itself must not mask the original failure it's
 // reporting) - a send failure just logs a distinctly-tagged line instead.
-async function sendEmail({ from, to, subject, text }) {
+async function sendEmail({ from, to, subject, text, html, headers }) {
   try {
     const resp = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -810,7 +810,20 @@ async function sendEmail({ from, to, subject, text }) {
         "Authorization": `Bearer ${RESEND_API_KEY.value()}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ from, to: Array.isArray(to) ? to : [to], subject, text }),
+      body: JSON.stringify({
+        from,
+        to: Array.isArray(to) ? to : [to],
+        subject,
+        ...(text ? { text } : {}),
+        ...(html ? { html } : {}),
+        // List-Unsubscribe / List-Unsubscribe-Post, when supplied, give Gmail
+        // and Outlook their native one-click unsubscribe control. That control
+        // materially improves deliverability for bulk mail, and it is the
+        // difference between a recipient unsubscribing and a recipient marking
+        // the message as spam - the latter damages sender reputation for
+        // everyone else on the list.
+        ...(headers ? { headers } : {}),
+      }),
     });
     if (!resp.ok) {
       console.error(`[sendEmail] Resend send failed (to=${JSON.stringify(to)}, subject="${subject}"): HTTP ${resp.status} - ${await resp.text()}`);
@@ -1372,3 +1385,93 @@ exports.hardDeleteAccount = onCall(
     return { outcome: result.outcome };
   }
 );
+
+// ---------------------------------------------------------------------------
+// UNSUBSCRIBE  (CAN-SPAM)
+// ---------------------------------------------------------------------------
+// Public, unauthenticated, token-addressed. The token is a per-user UUID stored
+// on the user document; it is the only credential, so it is never logged and
+// never echoed in an error message.
+//
+// WHY GET DOES NOT UNSUBSCRIBE
+// A bare GET that mutates is the classic mistake here. Outlook Safe Links,
+// Gmail's prefetcher and corporate mail scanners all fetch links in received
+// mail with no human involved. If GET performed the opt-out, some recipients
+// would be silently unsubscribed for the crime of receiving the message. So:
+//
+//   GET  -> renders a confirmation page with a single button
+//   POST -> performs the opt-out
+//
+// That is still one human click, which CAN-SPAM allows, and it survives
+// scanners. The exception is RFC 8058 one-click, where Gmail and Outlook POST
+// from their own UI - a genuine human action, honoured immediately.
+exports.handleUnsubscribe = onRequest(async (req, res) => {
+  const token = String((req.query && req.query.token) || (req.body && req.body.token) || "").trim();
+
+  const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title><style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#F7F8FA;color:#0F2A52;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+.card{background:#fff;border-radius:16px;padding:32px;max-width:440px;box-shadow:0 2px 16px rgba(15,42,82,.08);text-align:center}
+h1{font-size:20px;margin:0 0 12px}p{font-size:15px;line-height:1.55;color:#54607A;margin:0 0 20px}
+button{background:#1E9E52;color:#fff;border:0;border-radius:10px;padding:13px 26px;font-size:15px;font-weight:600;cursor:pointer}
+a{color:#166E38}</style></head><body><div class="card">${body}</div></body></html>`;
+
+  // Deliberately identical for "no token" and "unknown token" - a
+  // distinguishable response would let someone test tokens for validity.
+  const genericDone = () => res.status(200).send(page("Unsubscribed",
+    `<h1>You're unsubscribed</h1><p>You won't receive further product emails from Uncluttrd.
+     If that was a mistake, reply to any earlier email and we'll put you back on.</p>
+     <p><a href="https://uncluttrd.app">uncluttrd.app</a></p>`));
+
+  try {
+    if (!token) return genericDone();
+
+    // GET: confirm first, never mutate.
+    if (req.method === "GET") {
+      const safe = token.replace(/[^A-Za-z0-9-]/g, "");
+      return res.status(200).send(page("Unsubscribe",
+        `<h1>Unsubscribe from Uncluttrd emails?</h1>
+         <p>You'll stop receiving product and feature emails. Account and purchase
+            emails will still reach you.</p>
+         <form method="POST"><input type="hidden" name="token" value="${safe}">
+         <button type="submit">Unsubscribe</button></form>`));
+    }
+
+    if (req.method !== "POST") {
+      res.set("Allow", "GET, POST");
+      return res.status(405).send("Method not allowed");
+    }
+
+    const snap = await db.collection("users").where("unsubscribeToken", "==", token).limit(1).get();
+    if (snap.empty) return genericDone(); // unknown token - same response, no probe signal
+
+    await snap.docs[0].ref.update({
+      emailOptOut: true,
+      emailOptOutAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`[handleUnsubscribe] opted out uid=${snap.docs[0].id}`); // uid, never the token
+    return genericDone();
+  } catch (err) {
+    console.error(`[handleUnsubscribe] ${err.message}`);
+    // Still report success: someone who clicked unsubscribe must never be told
+    // to try again. The retry path is a resend, and the error is in the log.
+    return genericDone();
+  }
+});
+
+// Marketing sends must consult this. Deliberately NOT applied to the welcome or
+// Pro-purchase emails: those are transactional, CAN-SPAM does not require
+// opt-out for them, and suppressing a purchase confirmation because someone
+// declined feature announcements would be worse than the problem this solves.
+async function isOptedOutOfMarketing(uid) {
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    return snap.exists && snap.data().emailOptOut === true;
+  } catch (e) {
+    // Fail CLOSED - if opt-out state cannot be read, do not send.
+    console.error(`[isOptedOutOfMarketing] ${uid}: ${e.message}`);
+    return true;
+  }
+}

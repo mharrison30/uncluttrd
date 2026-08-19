@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<title>Uncluttrd 2.0 is here</title>
+</head>
+<!--
+  DRAFT - NOT SENT. Placeholders substituted per recipient at send time:
+    {{FirstName}}       from users/{uid}.displayName, first word, "there" if absent
+    {{UnsubscribeUrl}}  https://us-central1-cluttrd-3e335.cloudfunctions.net/handleUnsubscribe?token={unsubscribeToken}
+
+  Email-client constraints this template deliberately respects:
+    - tables, not flexbox or grid (Outlook renders with Word's engine)
+    - every style inline (Gmail strips <style> in many contexts)
+    - no web fonts, no background images, no JavaScript
+    - a real text/plain alternative is sent alongside; HTML-only mail scores
+      badly with spam filters
+-->
+<body style="margin:0;padding:0;background-color:#E6E9EE;">
+
+<!-- preheader: shows next to the subject line in most inboxes, then hides -->
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;">
+  Rooms, three organizing approaches, faster results, and previews of what your space could look like.
+</div>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#E6E9EE;">
+<tr><td align="center" style="padding:24px 12px;">
+
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:#FFFFFF;border-radius:16px;overflow:hidden;">
+
+    <!-- header -->
+    <tr>
+      <td style="background-color:#0F2A52;padding:28px 32px;">
+        <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:20px;font-weight:700;color:#FFFFFF;letter-spacing:-0.2px;">Uncluttrd</span>
+      </td>
+    </tr>
+
+    <!-- headline -->
+    <tr>
+      <td style="padding:36px 32px 0 32px;">
+        <h1 style="margin:0 0 18px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:26px;line-height:1.25;font-weight:700;color:#0F2A52;">
+          Uncluttrd 2.0 is here.<br>Your home just got easier to organize.
+        </h1>
+        <p style="margin:0 0 12px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.6;color:#54607A;">
+          Hi {{FirstName}},
+        </p>
+        <p style="margin:0 0 28px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.6;color:#54607A;">
+          A lot has changed since you first tried Uncluttrd. Version 2.0 makes it easier to turn a photo of a cluttered space into something you can actually tackle.
+        </p>
+      </td>
+    </tr>
+
+    <!-- what's new -->
+    <tr>
+      <td style="padding:0 32px;">
+        <p style="margin:0 0 16px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:#166E38;">
+          What's new
+        </p>
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr><td style="padding:0 0 18px 0;">
+            <p style="margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#0F2A52;">Rooms &amp; Areas</p>
+            <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#54607A;">Keep your spaces organized with a structure that matches how your home actually works.</p>
+          </td></tr>
+
+          <tr><td style="padding:0 0 18px 0;">
+            <p style="margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#0F2A52;">Three organizing approaches</p>
+            <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#54607A;">Choose Keep It Simple, Polished &amp; Practical, or Elevated Finish based on how far you want to take it.</p>
+          </td></tr>
+
+          <tr><td style="padding:0 0 18px 0;">
+            <p style="margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#0F2A52;">Faster results</p>
+            <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#54607A;">Your first organizing plan now appears in seconds, with the full detail filling in behind it.</p>
+          </td></tr>
+
+          <tr><td style="padding:0 0 18px 0;">
+            <p style="margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#0F2A52;">Approach-aware previews</p>
+            <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#54607A;">See what your space could look like under each approach before you start.</p>
+          </td></tr>
+
+          <tr><td style="padding:0 0 28px 0;">
+            <p style="margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#0F2A52;">Smarter product recommendations</p>
+            <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#54607A;">Find organization products that fit your specific space, with a line explaining why each one helps.</p>
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- CTA -->
+    <tr>
+      <td align="center" style="padding:4px 32px 8px 32px;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+          <tr><td align="center" bgcolor="#1E9E52" style="border-radius:12px;">
+            <a href="https://uncluttrd.app" style="display:inline-block;padding:15px 40px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:12px;">Open Uncluttrd</a>
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" style="padding:12px 32px 36px 32px;">
+        <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.6;color:#54607A;">
+          Already have it? Make sure you're on 2.0 &mdash;
+          <a href="https://apps.apple.com/us/app/uncluttrd/id6781513811" style="color:#166E38;text-decoration:underline;">App&nbsp;Store</a>
+          &nbsp;·&nbsp;
+          <a href="https://play.google.com/store/apps/details?id=com.mharrison.uncluttrd" style="color:#166E38;text-decoration:underline;">Google&nbsp;Play</a>
+        </p>
+      </td>
+    </tr>
+
+    <!-- footer -->
+    <tr>
+      <td style="background-color:#E6E9EE;padding:22px 32px;">
+        <p style="margin:0 0 6px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.6;color:#54607A;">
+          Questions? Just reply &mdash; it comes straight to us.
+        </p>
+        <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:1.6;color:#54607A;">
+          <a href="mailto:hello@uncluttrd.app" style="color:#54607A;text-decoration:underline;">hello@uncluttrd.app</a>
+          &nbsp;|&nbsp;
+          <a href="{{UnsubscribeUrl}}" style="color:#54607A;text-decoration:underline;">Unsubscribe</a>
+        </p>
+      </td>
+    </tr>
+
+  </table>
+
+</td></tr>
+</table>
+</body>
+</html>
