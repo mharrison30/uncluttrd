@@ -6419,6 +6419,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const cropDoneRef = useRef(null);
 
   const requestCrop = (asset, done) => {
+    dlog(`[CROP] requestCrop uri=${asset?.uri?.slice(-28)} ${asset?.width}x${asset?.height}`);
     cropDoneRef.current = done;
     // The crop rectangle is converted back into source pixels on confirm, so
     // the modal cannot open without real dimensions. The picker supplies them;
@@ -6436,6 +6437,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
 
   const finishCrop = (asset) => {
+    dlog(`[CROP] finishCrop uri=${asset?.uri?.slice(-28)} ${asset?.width}x${asset?.height}`);
     const done = cropDoneRef.current;
     cropDoneRef.current = null;
     setCropSource(null);
@@ -10723,6 +10725,21 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
+  // Ahead of every other gate on purpose. Whatever screen the photo was
+  // started from, the crop is what renders next - which is the whole reason
+  // it is a gate and not something mounted inside one screen's return.
+  if (cropSource) {
+    return (
+      <PhotoCropScreen
+        key={cropSource.uri}
+        source={cropSource}
+        onCancel={() => { cropDoneRef.current = null; setCropSource(null); }}
+        onUseOriginal={() => finishCrop(cropSource)}
+        onConfirm={(cropped) => finishCrop(cropped)}
+      />
+    );
+  }
+
   // PAYWALL SCREEN
   if (showPaywall) {
     return (
@@ -13895,18 +13912,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </View>
         )}
       </ScrollView>
-      {/* Outside the ScrollView on purpose: a Modal rendered inside a
-          ScrollView's content inflates the scrollable area, which is the
-          defect that made the Results screen scroll past its own content. */}
-      {cropSource && (
-        <PhotoCropModal
-          key={cropSource.uri}
-          source={cropSource}
-          onCancel={() => { cropDoneRef.current = null; setCropSource(null); }}
-          onUseOriginal={() => finishCrop(cropSource)}
-          onConfirm={(cropped) => finishCrop(cropped)}
-        />
-      )}
     </SafeAreaView>
   );
 
@@ -14385,11 +14390,28 @@ function SwipeToDeleteRow({ onDelete, accessibilityLabel, children }) {
 // the editor it opens is the OS one: a forced square on iOS. Rooms are not
 // square, which is what this screen is for, so allowsEditing is turned off on
 // the three calls that feed it and the full frame arrives here instead.
-const CROP_MIN = 48;      // smallest crop side, in fitted-image px
+// It is a SCREEN, not a Modal mounted inside one. The first version rendered
+// a <Modal> at the end of the Home screen's return, which meant it could only
+// ever appear while Home was the screen being rendered. MainApp returns early
+// per screen - thirteen gates ahead of Home - so any photo started while one
+// of those was showing set cropSource against a modal that was not mounted,
+// and the crop was silently skipped. Making it its own gate ahead of all the
+// others means every caller reaches it, whatever screen they came from, and
+// there is no second place to remember to mount it.
+//
+// Dropping the <Modal> wrapper also removes a re-presentation hazard: an iOS
+// Modal being unmounted and remounted in quick succession can miss its second
+// presentation entirely, which is a strong candidate for the crop appearing
+// once and then not again.
+const CROP_MIN = 72;      // smallest crop side, in fitted-image px - two
+                          // corner handles wide, so they meet but never
+                          // overlap. Edge midpoints hide before that point
+                          // rather than forcing a larger minimum on everyone.
 const CROP_HANDLE = 34;   // corner touch target
+const CROP_EDGE = 30;     // edge-midpoint touch target
 const CROP_ZOOM_MAX = 4;
 
-function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
+function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   const win = Dimensions.get("window");
   const stageW = win.width - 32;
   const stageH = Math.max(220, win.height * 0.56);
@@ -14437,9 +14459,11 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
     },
   })).current;
 
-  // One responder per corner. cx/cy of 0 means the handle drags the left/top
-  // edge, which moves the origin as well as the size; 1 means the right/bottom
-  // edge, which only changes the size.
+  // One responder per grab point. cx/cy of 0 drags the left/top edge, which
+  // moves the origin as well as the size; 1 drags the right/bottom edge, which
+  // only changes the size; null leaves that axis alone. Corners pass two
+  // numbers, edge midpoints pass one number and one null, so pulling the top
+  // edge down crops the ceiling without touching the sides.
   const cornersRef = useRef(null);
   if (!cornersRef.current) {
     const mk = (cx, cy) => PanResponder.create({
@@ -14452,8 +14476,8 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
         const dx = g.dx / k;
         const dy = g.dy / k;
         let { x, y, w, h } = a;
-        if (cx === 0) { x = a.x + dx; w = a.w - dx; } else { w = a.w + dx; }
-        if (cy === 0) { y = a.y + dy; h = a.h - dy; } else { h = a.h + dy; }
+        if (cx === 0) { x = a.x + dx; w = a.w - dx; } else if (cx === 1) { w = a.w + dx; }
+        if (cy === 0) { y = a.y + dy; h = a.h - dy; } else if (cy === 1) { h = a.h + dy; }
         // Pin the near edge when the frame hits its minimum, so dragging past
         // the limit stops the handle instead of pushing the opposite edge.
         if (w < CROP_MIN) { if (cx === 0) x = a.x + a.w - CROP_MIN; w = CROP_MIN; }
@@ -14465,7 +14489,10 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
         applyRect({ x, y, w, h });
       },
     });
-    cornersRef.current = { tl: mk(0, 0), tr: mk(1, 0), bl: mk(0, 1), br: mk(1, 1) };
+    cornersRef.current = {
+      tl: mk(0, 0), tr: mk(1, 0), bl: mk(0, 1), br: mk(1, 1),
+      top: mk(null, 0), bottom: mk(null, 1), left: mk(0, null), right: mk(1, null),
+    };
   }
 
   // Two fingers zoom and pan the stage. Claimed on the CAPTURE phase so the
@@ -14503,6 +14530,15 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
     onPanResponderRelease: () => { pinchRef.current = null; },
     onPanResponderTerminate: () => { pinchRef.current = null; },
   })).current;
+
+  // Now that this is a screen rather than a Modal it no longer gets
+  // onRequestClose, so Android's back gesture is wired up explicitly - it
+  // cancels, exactly as the header's Cancel does.
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => { onCancel(); return true; });
+    return () => sub.remove();
+  }, [onCancel]);
 
   const reset = () => {
     applyRect({ x: 0, y: 0, w: fitW, h: fitH });
@@ -14542,17 +14578,21 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
     }
   };
 
-  const handle = (key, left, top, style) => (
+  const handle = (key, left, top, style, size) => (
     <View
-      style={[s.cropHandle, style, { left, top }]}
+      key={key}
+      style={[s.cropHandle, { width: size, height: size }, style, { left, top }]}
       {...cornersRef.current[key].panHandlers}
       accessibilityLabel={"Resize crop, " + key}
     />
   );
+  // Edge midpoints are hidden while a side is too short to hold one without
+  // covering its own corners - at that size the corners do the same job.
+  const roomAcross = rect.w > CROP_HANDLE * 2 + CROP_EDGE;
+  const roomDown = rect.h > CROP_HANDLE * 2 + CROP_EDGE;
 
   return (
-    <Modal visible={true} animationType="slide" onRequestClose={onCancel} transparent={false}>
-      <SafeAreaView style={s.cropSafe}>
+    <SafeAreaView style={s.cropSafe}>
         <View style={s.cropHead}>
           <TouchableOpacity onPress={onCancel} style={s.cropCancel} accessibilityRole="button">
             <Text style={s.cropCancelText}>Cancel</Text>
@@ -14562,7 +14602,7 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
             <Text style={s.cropCancelText}>Reset</Text>
           </TouchableOpacity>
         </View>
-        <Text style={s.cropHint}>Drag the corners to crop. Pinch with two fingers to zoom.</Text>
+      <Text style={s.cropHint}>Drag the corners or edges to crop. Pinch with two fingers to zoom.</Text>
 
         <View style={[s.cropStage, { width: stageW, height: stageH }]} {...stageResponder.panHandlers}>
           <View style={{
@@ -14582,10 +14622,14 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
             {/* Handles sit INSIDE the frame corners. Half-overlapping the edge
                 reads better but Android clips anything outside the parent, and
                 a handle you cannot press at the image edge is worse. */}
-            {handle("tl", rect.x, rect.y, s.cropHandleTL)}
-            {handle("tr", rect.x + rect.w - CROP_HANDLE, rect.y, s.cropHandleTR)}
-            {handle("bl", rect.x, rect.y + rect.h - CROP_HANDLE, s.cropHandleBL)}
-            {handle("br", rect.x + rect.w - CROP_HANDLE, rect.y + rect.h - CROP_HANDLE, s.cropHandleBR)}
+            {handle("tl", rect.x, rect.y, s.cropHandleTL, CROP_HANDLE)}
+            {handle("tr", rect.x + rect.w - CROP_HANDLE, rect.y, s.cropHandleTR, CROP_HANDLE)}
+            {handle("bl", rect.x, rect.y + rect.h - CROP_HANDLE, s.cropHandleBL, CROP_HANDLE)}
+            {handle("br", rect.x + rect.w - CROP_HANDLE, rect.y + rect.h - CROP_HANDLE, s.cropHandleBR, CROP_HANDLE)}
+            {roomAcross && handle("top", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y, s.cropEdgeTop, CROP_EDGE)}
+            {roomAcross && handle("bottom", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y + rect.h - CROP_EDGE, s.cropEdgeBottom, CROP_EDGE)}
+            {roomDown && handle("left", rect.x, rect.y + rect.h / 2 - CROP_EDGE / 2, s.cropEdgeLeft, CROP_EDGE)}
+            {roomDown && handle("right", rect.x + rect.w - CROP_EDGE, rect.y + rect.h / 2 - CROP_EDGE / 2, s.cropEdgeRight, CROP_EDGE)}
           </View>
         </View>
 
@@ -14598,9 +14642,8 @@ function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
           <TouchableOpacity style={s.cropSecondary} onPress={onUseOriginal} disabled={busy} accessibilityRole="button">
             <Text style={s.cropSecondaryText}>Use Original</Text>
           </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    </Modal>
+      </View>
+    </SafeAreaView>
   );
 }
 
@@ -14632,11 +14675,15 @@ const s = StyleSheet.create({
   cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden" },
   cropDim: { position: "absolute", backgroundColor: "rgba(0,0,0,0.55)" },
   cropFrame: { position: "absolute", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.95)" },
-  cropHandle: { position: "absolute", width: CROP_HANDLE, height: CROP_HANDLE, borderColor: BRAND.green },
+  cropHandle: { position: "absolute", borderColor: BRAND.green },
   cropHandleTL: { borderLeftWidth: 4, borderTopWidth: 4 },
   cropHandleTR: { borderRightWidth: 4, borderTopWidth: 4 },
   cropHandleBL: { borderLeftWidth: 4, borderBottomWidth: 4 },
   cropHandleBR: { borderRightWidth: 4, borderBottomWidth: 4 },
+  cropEdgeTop: { borderTopWidth: 4 },
+  cropEdgeBottom: { borderBottomWidth: 4 },
+  cropEdgeLeft: { borderLeftWidth: 4 },
+  cropEdgeRight: { borderRightWidth: 4 },
   cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, gap: 10 },
   cropPrimary: { backgroundColor: BRAND.green, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
   cropPrimaryText: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
