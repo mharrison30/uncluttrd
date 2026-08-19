@@ -7888,26 +7888,80 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <div class="body">${escHtml(results.overview)}</div>
             </div>`;
 
-        // A short bold title per step, with the FULL guidance sentence as the
-        // description. An earlier version cut the sentence in two and used the
-        // remainder as the body, which produced broken grammar - "Add
-        // coordinating framed art or" / "Decorative mirrors so the room..." -
-        // because a fixed word count lands mid-phrase.
+        // A short bold title per step, and a description that CONTINUES from
+        // the title instead of restating it.
         //
-        // shortDisplayReason already solves exactly this: it trims to a clean
-        // phrase at a word boundary and backs off weak endings (prepositions,
-        // conjunctions, attributive adjectives) rather than stopping on one.
-        // Reusing it means the title is always a whole thought. The cost is
-        // that the title repeats the opening words of the description, which
-        // reads far better than a severed clause.
+        // shortDisplayReason supplies the title: it trims to a clean phrase at
+        // a word boundary and backs off endings that read as unfinished. Two
+        // things it does not cover on its own.
+        //
+        // First, its weak-ending set is tuned for in-app reason text and misses
+        // forward-pointing words that show up in guidance sentences - "like"
+        // most visibly, in "Introduce decorative touches like". The extra set
+        // below is scoped to PDF titles, so in-app display is untouched, and
+        // the trim runs to a fixed point rather than once, because dropping one
+        // weak word routinely exposes another underneath it.
+        //
+        // Second, the title is a prefix of the guidance sentence, so handing
+        // the full sentence back as the description repeated the title word for
+        // word on the line below it. The body now starts where the title
+        // stopped.
+        const TITLE_WEAK_EXTRA = new Set([
+          "like", "via", "per", "toward", "towards", "unlike", "throughout",
+          "along", "beneath", "beyond", "amid", "despite", "versus", "until",
+          "unless", "although", "though", "since", "whether", "either",
+          "neither", "onto", "atop", "regarding", "concerning",
+        ]);
+        // Only these connectors are dropped, and dropping one promotes the
+        // body to its own sentence: "...display by replacing the bottles"
+        // becomes "Replacing the bottles". Everything else stays exactly as
+        // written and the body reads on from the title in lower case, because
+        // removing it changes what the sentence says. Stripping the "so" from
+        // "so the counter reads as one surface" turns the purpose of the step
+        // into a claim about the room; stripping "with" from "with a
+        // coordinated arrangement" leaves a noun phrase attached to nothing.
+        const BODY_RESUMPTIVE = /^(?:by|in order to|thereby|and then|then)\s+/i;
+
         const stepTitle = (text) => {
-          // /\s+/, NOT /s+/. The backslash was lost when this block was
-          // written, so the "collapse whitespace" pass was deleting every
-          // letter s in the guidance text instead - "Replace mismatched
-          // bottles" printed as "Replace mi matched bottle ".
+          // /\s+/, NOT /s+/. The backslash was lost when this block was first
+          // written, so the "collapse whitespace" pass deleted every letter s
+          // in the text instead - "Replace mismatched bottles" printed as
+          // "Replace mi matched bottle ".
           const t = String(text || "").trim().replace(/\s+/g, " ");
-          const title = shortDisplayReason(t) || t;
-          return { title: title.replace(/[.,;:]+$/, ""), body: t };
+          let title = shortDisplayReason(t) || t;
+          const isPrefix = t.toLowerCase().startsWith(title.toLowerCase());
+
+          const bare = (w) => w.replace(/[^A-Za-z-]/g, "").toLowerCase();
+          const weakTail = (w) => {
+            const b = bare(w);
+            return !b || REASON_WEAK_ENDINGS.has(b) || TITLE_WEAK_EXTRA.has(b);
+          };
+          const words = title.split(" ").filter(Boolean);
+          // A title that stops mid-word - shortDisplayReason falls back to a
+          // hard character cut - loses the fragment before anything else.
+          if (isPrefix && title.length < t.length && /[A-Za-z]/.test(t.charAt(title.length))) {
+            words.pop();
+          }
+          while (words.length > 1 && weakTail(words[words.length - 1])) words.pop();
+          title = words.join(" ").replace(/[.,;:\-\u2013\u2014]+$/, "").trim();
+
+          // Resume the description from the end of the title. Matched
+          // case-insensitively: the title keeps the source casing but has been
+          // re-trimmed above, so it is a prefix in content, not identity.
+          let body = t.toLowerCase().startsWith(title.toLowerCase())
+            ? t.slice(title.length)
+            : t;
+          body = body.replace(/^[\s,;:.\-\u2013\u2014]+/, "").trim();
+          const resumed = body.replace(BODY_RESUMPTIVE, "");
+          // Promoted to a sentence only when a connector actually came off.
+          // Otherwise it stays lower case on purpose - it is the remainder of
+          // the title's sentence, and capitalising it would present a fragment
+          // as though it were a new thought.
+          if (resumed !== body) body = resumed.charAt(0).toUpperCase() + resumed.slice(1);
+          // What is left of a sentence the title already carried in full is
+          // noise, so the step runs as a title on its own.
+          if (body.length < 25) body = "";
+          return { title, body };
         };
 
         const stepsHtml = (items) => items.map((g, i) => {
@@ -7916,7 +7970,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <div class="stepno">${String(i + 1).padStart(2, "0")}</div>
               <div>
                 <div class="steptitle">${escHtml(title)}</div>
-                <div class="stepbody">${escHtml(body)}</div>
+                ${body ? `<div class="stepbody">${escHtml(body)}</div>` : ""}
               </div>
             </div>`;
         }).join("");
