@@ -13242,8 +13242,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </View>
           );
           })()}
-          {renderPhotoZoomModal()}
-
           {results.proTip && (
             <View style={s.tipBox}>
               <Text style={{ fontSize: 20 }}>✅</Text>
@@ -13270,6 +13268,13 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={s.startOverText}>Analyze Another Area</Text>
           </TouchableOpacity>
         </ScrollView>
+        {/* Rendered as a SIBLING of the ScrollView, not inside it. A <Modal>
+            in a scroll content container is a layout hazard: this one wraps a
+            GestureHandlerRootView with flex:1, and inside a flexGrow content
+            container that inflates the scrollable area, so the screen could be
+            dragged past its real content into blank space. My Rooms and Room
+            Detail already call this the same way; Results was the odd one out. */}
+        {renderPhotoZoomModal()}
         {renderRenameSheet()}
         {/* Shared processing overlay for PDF export and the restore actions.
             Same component every other flow uses. */}
