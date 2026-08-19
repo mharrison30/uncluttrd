@@ -8555,7 +8555,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           // that belongs in a message someone forwards.
           const products = (a.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
           if (products.length) {
-            text += "\nRecommended additions:\n";
+            text += "\nProducts for this space:\n";
             products.forEach((p) => {
               text += "• " + p.productType + " - " + resolveRecommendationReason(p, results.problemsFound) + "\n";
             });
