@@ -13483,8 +13483,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 // exceeds a single session). Only checked for production builds; staging
 // isn't distributed via the App Store/Play Store, so there's nothing
 // meaningful to compare against.
-const UPDATE_NUDGE_LAST_SHOWN_KEY = "lastVersionNudgeShownAt";
-const UPDATE_NUDGE_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// (The former UPDATE_NUDGE_LAST_SHOWN_KEY / _MIN_INTERVAL_MS pair is gone -
+// suppression is now the module-level once-per-cold-launch flag next to
+// checkForAppUpdate. The AsyncStorage key "lastVersionNudgeShownAt" may still
+// exist on devices that ran the old build; it is simply never read again.)
 // App Store URLs are keyed by numeric App ID, not bundle identifier - no way
 // to derive this at runtime, so it's hardcoded here. Must match eas.json's
 // submit.production.ios.ascAppId if that ever changes.
@@ -13509,27 +13511,39 @@ function isVersionBehind(current, latest) {
   return false;
 }
 
-async function checkForAppUpdate() {
-  if (!IS_PRODUCTION) return;
-  try {
-    const lastShown = await AsyncStorage.getItem(UPDATE_NUDGE_LAST_SHOWN_KEY);
-    if (lastShown && Date.now() - parseInt(lastShown, 10) < UPDATE_NUDGE_MIN_INTERVAL_MS) {
-      return; // shown within the last 24h (including earlier this session) - stay quiet
-    }
+// Guards "once per cold launch". Module-level, so it resets when the process
+// is killed and not before - which is exactly the requested behaviour. It
+// replaces the previous 24h AsyncStorage suppression; note that is a
+// DELIBERATE LOOSENING, since a user who cold-launches repeatedly in one day
+// will now be nudged each time rather than once. Tighten by restoring the
+// AsyncStorage floor if that proves annoying.
+let updateNudgeShownThisLaunch = false;
 
+async function checkForAppUpdate() {
+  // Runs in every environment. It used to be `if (!IS_PRODUCTION) return`,
+  // which made the feature untestable: staging already had a config doc set to
+  // 9.9.9 specifically to force the prompt, and it could never have fired.
+  // Each environment reads its own project's config doc, so staging nudging
+  // staging is correct.
+  if (updateNudgeShownThisLaunch) return;
+  try {
     const snap = await getDoc(doc(db, "config", "appVersion"));
     if (!snap.exists()) return;
     const data = snap.data();
-    const latest = Platform.OS === "ios" ? data.ios : data.android;
+
+    // Two accepted shapes. `currentVersion` is the single-value form; `ios` /
+    // `android` is the original per-platform form, kept because the staging
+    // document already uses it and because a store rollout can legitimately
+    // land on one platform before the other.
+    const latest = data.currentVersion
+      || (Platform.OS === "ios" ? data.ios : data.android);
+
     const current = Constants.expoConfig?.version;
     if (!isVersionBehind(current, latest)) return;
 
-    // Recorded before the alert is even shown, not just on "Not Now" - the
-    // 24h suppression is meant to apply regardless of which action the user
-    // takes (or if they dismiss without tapping either), per the "don't show
-    // more than once per day" requirement being a general rule, not a
-    // consequence of the "Not Now" button specifically.
-    await AsyncStorage.setItem(UPDATE_NUDGE_LAST_SHOWN_KEY, Date.now().toString());
+    // Set only once we know we are actually going to show something, so a
+    // launch that finds nothing to say does not burn the one-shot.
+    updateNudgeShownThisLaunch = true;
 
     const androidPackage = Constants.expoConfig?.android?.package || "com.mharrison.uncluttrd";
     const storeUrl = Platform.OS === "ios"
@@ -13537,9 +13551,15 @@ async function checkForAppUpdate() {
       : `https://play.google.com/store/apps/details?id=${androidPackage}`;
 
     Alert.alert(
-      "A new version of Uncluttrd is available",
-      "Update now for the latest features and fixes.",
+      "Update Available",
+      data.updateMessage
+        || "A new version of Uncluttrd is available. Update for the latest features and improvements.",
       [
+        // Never blocking: "Not Now" always dismisses and the user carries on.
+        // There is deliberately no forced-update path, and `minimumVersion` in
+        // the config document is NOT read here - it is stored for a possible
+        // future hard gate, and wiring it in now would quietly turn a nudge
+        // into a wall.
         { text: "Not Now", style: "cancel" },
         { text: "Update Now", onPress: () => Linking.openURL(storeUrl) },
       ]
