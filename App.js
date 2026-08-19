@@ -7713,10 +7713,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // The masthead is CSS, not an image. The previous base64 banner was 9KB
       // in every bundle and could not adapt to the per-page variant below.
       // `right` carries the page-2 room label; page 1 passes nothing.
+      // The real brand mark, rasterised from the canonical asset
+      // (uncluttrd-website/public/images/uncluttrd-logo.svg) rather than
+      // approximated. The previous revision drew two coloured bars in CSS,
+      // which read as a generic glyph and not as our logo. Baked onto its own
+      // white tile because the mark's base is #0F2A52 - the same navy as the
+      // masthead - so on the bar the base and the white pill inside it would
+      // simply vanish.
+      const PDF_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPwAAAD8CAYAAABTq8lnAAAI2ElEQVR42u3dv4scVQDA8fkPPNA6XG11nRYW1ynYHOnFBSvB4ghWgjCdP5otgggi2UIsUl1EG0FcUEG0WdAE0y3YpFEuSgJayJN3zIW7y2WzP2Zm5733+cL0s7Pz2Xnz9u1sVQ28EMJOCGE/hHAYQqhDCNNmmwdpO83PnId1c27Gc3Sn0srAd0MIoxDCBGol+mEwac7hXaKfjDx+Us6cL8qsWXNu75aOfKf5FIRcJeEfFTX0b67m4xDCsfdfhXbcGNjNHfrEey2da5IV/GboXntfpYXVyQ/1QwgHhu7SSkP9g1Sv6kfeP2mtjpK52ruqS4Vc7ZuZR0ntNR7qEH7qvZE6aTqYIX4IYc/iGanzorG9IWB3vy71d1+/B7sEPewS9LBL0K8wG2+CThpGs05n7331Jg2uqUU1UlmN28Z+4JhKg+6gzft2k3TSsDtu5X7er96kZDoylJcM7fMYyt/501Os1W+//v5PnkP7FB5LNZ7dDNe+u+4sVC+9deNe+PCLP1LY1XqdB06GFMBfuXEVevWC/bk37qYCPqz0YMxUni57Ch569YE9MfCTrK7uF8FDr66xJwZ+uat8SivqLoKHXl1iTxD8OKtFNpeBh15dYU8Q/OIZ++Z/r0Lq4KFXF9gTBB8bLQI/ywU89Gobe6LgZ8lP1i0LHnq1iT1R8OHSybsU//9tGfDQqy3sCYOvkx/OrwIeerWBPWHws+SH86uCh16bYk8Y/PlhfWqz8+uCh16bYE8c/Ci5pbRtgIde62JPHPzkLPh5SeChh30d7ImDn59dXRdKAw897IWBDyer7kII+6WChx72wsDvR/CHJYOHHvaCwB8mueCmbfDQw14I+Drpf5NpEzz0sBcAfgo89LAXBn4OPPSwFwF+XqW8912Bhx72TMEH4KGHHXjgoYcd+ALBQw878IWBhx524AsDDz3swBcGHvqysQNfIHjoy8UOfKHgoS8TO/AFg4e+POzAFw4e+rKwAw/8yfbjvds0dtwPdx9uHTvwwAMPPPDAC3jggRfwwAMv4IEHXsADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888MADDzzwwAMv4IEHXsADD7yABx54AQ888MADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888MADD7yABx54AQ888AIeeOAFPPDAAw888MADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888EQCDzzwAh544AU88MALeOCBF/DAAw888MADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888MALeOCBF/DAAy/ggQdewAMPPPDAAw888MADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAy/ggQdewAMPvIAHHngBDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888MADDzzwwAMPvIAHHngBDzzwAh544AU88MADDzzwwAMPPPDAAw888MADDzzwwAMPPPDAAw888MADDzzwAh544AU88MALeOCBF/DAAy/ggQceeOCBBx544IEHHnjggQceeOCBBx544IEHHnjggQceeOCBF/DAAy/ggQdewAMPvIAHHnjggQceeOCBBx544IEHHnjggQceeOCBBx544IEHHnjggQdewAMPvIAHHngBDzzwAh544IEHHnjggQceeOCBBx544IEHHnjggQceeOCBBx544IEHHngBDzzwAh544AU88MALeOCBBx544IEHHnjggQceeOCBBx544IEHHnjggQceeOCBBx544AU88MALeOCBF/DAAy/ggQceeOCBBx544IEHHnjggQceeOCBBx544IEHHnjggb9k+2T6Zfj+59u2DrePb90BvnTwf/37ILxy69rWwT/78tXwzPO2LredF9/eOvb9eh7uP/wP+NLRA58/+BywZwF+COiBzxt8LtizAb9t9MDnCz4n7FmB3yZ64PMEnxv27MBvCz3w+YHPEXuW4LeBHvi8wOeKPVvwfaMHPh/wOWPPGnyf6IHPA3zu2LMH3xf6vsC/+vq74fOjbwez+i3uS9ynHMCXgL0I8H2g7xr8lRdeC19989Ngj2/ct7iPqYIvBfsp+Dn0wwY/ZOxn0acIviTs0XoEPy3l1XaFvkvwccicSl0O77sAXxj22LQo8F2h7xL8ex/dTObYxn1NBXyB2B+Br0t71W2j7xJ8nBxLpbivKYAvFHusjuAPS3zlbaLvEnycCU+luK9DB18w9thhBL9f6qtvC32X4N9853oyxzPu65DBF449th/B75R8BNpA3/Us/S+/Df+LlLiPQ56lh/2knSpWyldzXaHvGvxLV6+F+38/GOzxi/sW93Go4GE/aV6dFkKYlH40NkHfx0q7uLAl3iMPCX7cl7hPXS+62QQ87I+anAU/cjzWR28t/TCX1sJ+rtFZ8LuOx/rogR8eeNgfa7c6Wwhh5pishx74YYGH/bFm1cVKXIDTFnrghwMe9kurLwNvWL8meuCHAR72JYfzhvWboQd+++BhX2E4b7Z+M/TAbxc87EvOzl8CPq66O3aMVkMP/PbAw76w40er6xagHztOq6EHfjvgYX9q4+ppmbxbHT3w/YOHfYPJukvQTxyr5dED3y942JdqUi2bq/xq6IHvDzzsLV/dLcRZHT3w/YCHfenqatXM2C+P/oPPbp48z83W3fb+p1/D3tbM/AL0B46flFQH1SaFEI4cQymJjqpNM7SXMh/KG9pLhQ3lrcCTkmlcdVFp/1IjJdC06qrmft5PaKVhNGvtvn0B+j2TeNLWiwb3qj6CXioEO/RSYdihlwrDfgG9iTyp22Zbx35h9t5XdlI3TTufjbc4RxpE42rINctw3ddLm9+vH1Qp1Azx/cpOWq+jQQ7hXe2lQq/qT7nae1yWtLg6yav6Ux6M6Wm40vkmKz9wMkH4Y0N9FT50H2cN/QlD/ZFFOyqoWXPO71Ql11z1a/iVKfK6qKv5GvhHzb3N3PmixJo35+4I8vWH/vshhMPmk3LabD4MtE3Up+dh3Zyb+ykM1f8HX414zjZU9aIAAAAASUVORK5CYII=";
+
       const makeHeader = (pageBreak, right) => `
         <div class="brandbar"${pageBreak ? ' style="page-break-before:always;"' : ""}>
           <div class="brandleft">
-            <div class="ulogo"><span class="ubar ug"></span><span class="ubar ub"></span></div>
+            <img class="ulogo" src="${PDF_LOGO}"/>
             <div>
               <div class="brandmark">Uncluttrd</div>
               <div class="tagline"><span class="t-green">MORE SPACE.</span> <span class="t-blue">MORE TIME.</span> <span class="t-white">MORE YOU.</span></div>
@@ -7746,17 +7755,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           p, li, div { orphans:3; widows:3; }
 
           /* ---- masthead ---- */
-          .brandbar { background:#0F2A52; padding:14px 18px; display:flex;
+          .brandbar { background:#0F2A52; padding:11px 18px; display:flex;
                       align-items:center; justify-content:space-between; }
-          .brandrule { height:4px; background:#3FC77A; margin-bottom:22px; }
+          .brandrule { height:4px; background:#3FC77A; margin-bottom:18px; }
           .brandleft { display:flex; align-items:center; }
-          /* The U mark, drawn rather than embedded: a white rounded tile with a
-             green and a blue upright. Cheaper than base64 and it stays sharp. */
-          .ulogo { width:34px; height:34px; background:#FFFFFF; border-radius:9px;
-                   margin-right:11px; position:relative; display:inline-block; }
-          .ubar { position:absolute; top:8px; width:6px; height:15px; border-radius:2px; }
-          .ug { left:9px; background:#10B43E; }
-          .ub { left:19px; background:#1463D8; }
+          /* 52px tile puts the mark itself at roughly 42px, the size Michael
+             asked for. The PNG is emitted at 252px, six times the display size,
+             so it stays sharp when the PDF is printed rather than viewed. */
+          .ulogo { width:52px; height:52px; margin-right:12px; display:block; }
           .brandmark { color:#FFFFFF; font-size:19px; font-weight:700; letter-spacing:-0.2px; line-height:1.1; }
           .tagline { margin-top:3px; font-size:7.5px; font-weight:600; letter-spacing:1.1px; }
           /* Brand colours lightened for the dark bar, the same adjustment the
@@ -7771,13 +7777,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           /* ---- page 1 ---- */
           .eyebrow { font-size:10px; font-weight:700; letter-spacing:1.4px;
                      text-transform:uppercase; color:#166E38; margin-bottom:6px; }
-          .h1 { font-size:30px; font-weight:700; color:#0F2A52; margin-bottom:18px; letter-spacing:-0.5px; }
-          .photo-section { margin:0 0 22px 0; }
-          /* Full content width, deliberately. An earlier revision capped this at
-             50%/250px to stop it dominating the page; the approved design wants
-             the photo as the hero, so the constraint is the border radius and
-             the aspect ratio, not the width. */
-          .photo { width:100%; display:block; border-radius:10px; border:1px solid #D7DCE3; }
+          .h1 { font-size:30px; font-weight:700; color:#0F2A52; margin-bottom:14px; letter-spacing:-0.5px; }
+          .photo-section { margin:0 0 18px 0; text-align:center; }
+          /* Constrained, NOT full width. The mockup shows the photo as a hero
+             and a previous pass took it to 100%, but in real plans that pushes
+             "What we noticed" and the approach card off page 1 entirely - worse
+             with a photo that carries a letterboxed black bar, which buys height
+             without adding any information. */
+          .photo { max-width:60%; max-height:300px; object-fit:cover; display:block;
+                   margin:0 auto; border-radius:10px; border:1px solid #D7DCE3; }
           .cap { font-size:8.5px; font-weight:700; letter-spacing:1.3px;
                  text-transform:uppercase; color:#8A94A6; text-align:center; margin-top:9px; }
 
