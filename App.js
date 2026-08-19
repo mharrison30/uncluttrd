@@ -2954,6 +2954,32 @@ const REASON_WEAK_ENDINGS = new Set([
 // the model might produce, and it only ever removes words - a false positive
 // costs one word of context, never correctness.
 const REASON_DANGLING_SUFFIX = /(ous|ial|ual|ative|itive|able|ible|ful|less|ish|ary|ory)$/;
+// Title-cases a productType for the PDF. Deliberately NOT displayProductName:
+// that one also TRUNCATES to two words for the compact in-app card, which would
+// turn "Matching Soap Dispenser Set" into "Matching Soap". A document has room
+// for the whole name.
+//
+// Small connector words stay lowercase unless they lead, so "Set of 3 Bins"
+// does not become "Set Of 3 Bins".
+const PDF_TITLE_MINOR = new Set(["a", "an", "and", "as", "at", "by", "for", "in",
+  "of", "on", "or", "the", "to", "with"]);
+function pdfTitleCase(text) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  return words
+    .map((w, i) => {
+      // Already-uppercase words are acronyms and are left exactly as written -
+      // otherwise "LED picture light" title-cases to "Led Picture Light", which
+      // is wrong and looks careless. The corpus is full of LED.
+      if (w.length >= 2 && w === w.toUpperCase() && /[A-Z]/.test(w)) return w;
+      const lower = w.toLowerCase();
+      if (i > 0 && PDF_TITLE_MINOR.has(lower)) return lower;
+      // Hyphenated compounds capitalise both halves: "pull-out" -> "Pull-Out".
+      return lower.split("-").map((part) =>
+        part ? part.charAt(0).toUpperCase() + part.slice(1) : part).join("-");
+    })
+    .join(" ");
+}
+
 function shortDisplayReason(reason) {
   const raw = typeof reason === "string" ? reason.trim().replace(/\s+/g, " ") : "";
   if (!raw) return "";
@@ -7675,14 +7701,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
 
 
-      const HEADER_IMG = "data:image/png;base64,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";
+      // (The base64 HEADER_IMG banner that used to live here is gone - the
+      // masthead is built from markup now, and the image was ~9KB of dead
+      // string shipped in every bundle.)
 
-      // Compact banner. It used to be width:100% against @page margin:0, so it
-      // ran edge to edge and read as a heavy dark bar above the photo. The page
-      // box now carries 0.75in margins and the header is height-capped, so it
-      // is branding rather than a masthead.
+      // The document's masthead, on every page. Previously an <img> - first
+      // edge-to-edge against margin:0, then capped so small it read as a
+      // watermark. Built from markup now, so it fills the content width exactly
+      // and the wordmark and tagline stay sharp.
       const makeHeader = (pageBreak) => `
-        <img src="${HEADER_IMG}" class="brand" style="${pageBreak ? 'page-break-before:always;' : ''}"/>`;
+        <div class="brandbar" style="${pageBreak ? 'page-break-before:always;' : ''}">
+          <div class="brandmark">Uncluttrd</div>
+          <div class="tagline"><span class="t-green">MORE SPACE.</span> <span class="t-blue">MORE TIME.</span> <span class="t-white">MORE YOU.</span></div>
+        </div>`;
 
       // ---- New-format (approaches) PDF ------------------------------------
       // A separate document, not a reskin of the tier one. The tier PDF is
@@ -7712,12 +7743,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
              section can never begin with a single dangling line at a page foot. */
           p, li, div { orphans: 3; widows: 3; }
 
-          .brand { display:block; width:auto; max-width:38%; max-height:34px; margin:0 0 14px 0; }
+          /* Full-width branded bar, rebuilt in CSS rather than as an image so
+             it always spans the content box and the type stays crisp at any
+             scale. It repeats at the top of every logical page - WebKit's
+             printToFileAsync does not support running @page headers, so the
+             element is emitted into the flow at each page start instead. */
+          .brandbar { background:#0F2A52; padding:16px 20px; margin:0 0 18px 0; }
+          .brandmark { color:#FFFFFF; font-size:25px; font-weight:700;
+                       letter-spacing:-0.3px; line-height:1.15; }
+          .tagline { margin-top:5px; font-size:9px; font-weight:700; letter-spacing:1.8px; }
+          /* Brand colours LIGHTENED for the dark bar, the same adjustment the
+             app makes with greenOnDark. Measured on #0F2A52: brand green
+             #1E9E52 is 4.12:1 and brand blue #1463D8 only 2.58:1, which is not
+             readable at 9px. These are 5.17:1 and 5.02:1. */
+          .t-green { color:#10B43E; }
+          .t-blue  { color:#5B9BF0; }
+          .t-white { color:#FFFFFF; }
           .eyebrow { font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px; }
           .h1 { font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:12px; }
           .note { background:#E6E9EE;border:1px solid #D7DCE3;border-radius:10px;padding:14px;font-size:13px;color:#64748B;line-height:1.6; }
           .summary-card { margin-bottom:16px; }
-          .lbl { font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;margin:14px 0 6px 0; }
+          .lbl { font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;margin:14px 0 4px 0; }
+          .sublbl { font-size:11px;color:#64748B;margin:0 0 8px 0;font-style:italic; }
 
           /* Product name and reason are one unit, never separated. */
           .product-card { padding:8px 10px;background:#F4F6F8;border-radius:8px;margin-bottom:5px;font-size:12px; }
@@ -7774,17 +7821,28 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         const productRows = (approach) => {
           const items = (approach.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
           if (!items.length) {
-            return `<div class="lbl">Recommended additions</div>
+            return `<div class="lbl">Products for this space</div>
+                    <div class="sublbl">Find options and shop for these in the Uncluttrd app.</div>
                     <div class="product-card"><span class="prodwhy">This approach uses what you already have.</span></div>`;
           }
           // Type + reason only. No price and no retailer link, deliberately:
           // a shared PDF outlives the prices in it, and the affiliate search
           // link is a live app affordance, not a document.
-          return `<div class="lbl">Recommended additions</div>` + items.map((item) => `
+          // shortReason first, the truncation fallback second, and the full
+          // reason never. The full reason is a whole sentence of visible
+          // evidence - correct on screen where one card is in view, but six of
+          // them stacked is the wall of text this section had become.
+          return `<div class="lbl">Products for this space</div>
+                  <div class="sublbl">Find options and shop for these in the Uncluttrd app.</div>`
+            + items.map((item) => {
+                const why = item.shortReason
+                  || shortDisplayReason(resolveRecommendationReason(item, results.problemsFound));
+                return `
             <div class="product-card">
-              <span class="prodname">${escHtml(item.productType)}</span>
-              <span class="prodwhy">${escHtml(resolveRecommendationReason(item, results.problemsFound))}</span>
-            </div>`).join("");
+              <span class="prodname">${escHtml(pdfTitleCase(item.productType))}</span>
+              <span class="prodwhy">${escHtml(why)}</span>
+            </div>`;
+              }).join("");
         };
 
         if (selectedId && results.approaches?.[selectedId]) {
