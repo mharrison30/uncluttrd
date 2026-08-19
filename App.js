@@ -2942,6 +2942,10 @@ const REASON_WEAK_ENDINGS = new Set([
   "electronic", "inanimate", "uncertain", "rectangular", "horizontal",
   "vertical", "overhead", "recessed", "upper", "lower", "middle", "current",
   "flat", "round", "square",
+  // Attributive participles that dangled in real PDF step titles: "with
+  // coordinated", "in a unified", "use a tiered". Same class as
+  // "coordinating" and "matching" above.
+  "coordinated", "unified", "tiered", "framed", "layered", "defined",
   // degree/frame adverbs that modify something still to come
   "entirely", "currently", "solely", "minimally", "largely", "mostly",
   // more transitive verbs observed dangling in real output
@@ -7705,174 +7709,256 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // masthead is built from markup now, and the image was ~9KB of dead
       // string shipped in every bundle.)
 
-      // The document's masthead, on every page. Previously an <img> - first
-      // edge-to-edge against margin:0, then capped so small it read as a
-      // watermark. Built from markup now, so it fills the content width exactly
-      // and the wordmark and tagline stay sharp.
-      const makeHeader = (pageBreak) => `
-        <div class="brandbar" style="${pageBreak ? 'page-break-before:always;' : ''}">
-          <div class="brandmark">Uncluttrd</div>
-          <div class="tagline"><span class="t-green">MORE SPACE.</span> <span class="t-blue">MORE TIME.</span> <span class="t-white">MORE YOU.</span></div>
-        </div>`;
+      // ---- Document chrome -------------------------------------------------
+      // The masthead is CSS, not an image. The previous base64 banner was 9KB
+      // in every bundle and could not adapt to the per-page variant below.
+      // `right` carries the page-2 room label; page 1 passes nothing.
+      const makeHeader = (pageBreak, right) => `
+        <div class="brandbar"${pageBreak ? ' style="page-break-before:always;"' : ""}>
+          <div class="brandleft">
+            <div class="ulogo"><span class="ubar ug"></span><span class="ubar ub"></span></div>
+            <div>
+              <div class="brandmark">Uncluttrd</div>
+              <div class="tagline"><span class="t-green">MORE SPACE.</span> <span class="t-blue">MORE TIME.</span> <span class="t-white">MORE YOU.</span></div>
+            </div>
+          </div>
+          ${right ? `<div class="brandright"><div class="br1">${right.top}</div><div class="br2">${right.sub}</div></div>` : ""}
+        </div>
+        <div class="brandrule"></div>`;
 
-      // ---- New-format (approaches) PDF ------------------------------------
-      // A separate document, not a reskin of the tier one. The tier PDF is
-      // a catalogue: three priced options, all shown, because choosing was
-      // what the old Results screen asked the user to do afterwards. An
-      // approach plan has already been chosen inside the app, so its PDF is
-      // a brief for the approach the user committed to - and only falls
-      // back to a three-way comparison when nothing has been chosen yet.
       const PDF_SHELL = {
-        css: `* { box-sizing:border-box; margin:0; padding:0; }
-          /* Real page margins. Previously margin:0 with a 24px .page padding,
-             which is why every image ran to the paper edge. */
-          @page { size: letter; margin: 0.75in; }
-          body { font-family:Inter,Arial,sans-serif; background:white; color:#0F2A52; }
+        css: `* { box-sizing:border-box; margin:0; padding:0;
+                -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          /* Without the two color-adjust declarations above, WebKit drops every
+             background fill when it prints - the navy masthead, the green rule
+             and all the cards render as bare text on white. */
+          @page { size: letter; margin: 0.55in 0.6in 0.75in 0.6in; }
+          html, body { font-family:Inter,Arial,Helvetica,sans-serif; background:#FFFFFF; color:#0F2A52; }
           .page { padding:0; }
 
-          /* KEEP-TOGETHER. Nothing here may be split across a page boundary.
-             The summary breaking mid-sentence (a lone "genuinely" stranded at
-             the foot of page 1) is the defect this exists to prevent, and a
-             product whose name lands on one page and its reason on the next is
-             the same defect in a smaller box. */
-          .summary-card, .approach-section, .guidance-item, .product-card,
-          .pro-tip, .viz-section, .photo-section {
+          /* KEEP-TOGETHER. A section that splits across a page boundary is the
+             defect this exists to prevent - most visibly the summary, which
+             used to strand a single word at the foot of page 1. */
+          .summary-card, .approach-section, .step, .product-card,
+          .pro-tip, .viz-section, .photo-section, .prodgrid-row {
             page-break-inside: avoid; break-inside: avoid;
           }
-          /* Orphan/widow control for anything NOT in one of those blocks, so a
-             section can never begin with a single dangling line at a page foot. */
-          p, li, div { orphans: 3; widows: 3; }
+          p, li, div { orphans:3; widows:3; }
 
-          /* Full-width branded bar, rebuilt in CSS rather than as an image so
-             it always spans the content box and the type stays crisp at any
-             scale. It repeats at the top of every logical page - WebKit's
-             printToFileAsync does not support running @page headers, so the
-             element is emitted into the flow at each page start instead. */
-          .brandbar { background:#0F2A52; padding:16px 20px; margin:0 0 18px 0; }
-          .brandmark { color:#FFFFFF; font-size:25px; font-weight:700;
-                       letter-spacing:-0.3px; line-height:1.15; }
-          .tagline { margin-top:5px; font-size:9px; font-weight:700; letter-spacing:1.8px; }
-          /* Brand colours LIGHTENED for the dark bar, the same adjustment the
-             app makes with greenOnDark. Measured on #0F2A52: brand green
-             #1E9E52 is 4.12:1 and brand blue #1463D8 only 2.58:1, which is not
-             readable at 9px. These are 5.17:1 and 5.02:1. */
-          .t-green { color:#10B43E; }
-          .t-blue  { color:#5B9BF0; }
-          .t-white { color:#FFFFFF; }
-          .eyebrow { font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px; }
-          .h1 { font-size:22px;font-weight:700;color:#0F2A52;margin-bottom:12px; }
-          .note { background:#E6E9EE;border:1px solid #D7DCE3;border-radius:10px;padding:14px;font-size:13px;color:#64748B;line-height:1.6; }
-          .summary-card { margin-bottom:16px; }
-          .lbl { font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#64748B;margin:14px 0 4px 0; }
-          .sublbl { font-size:11px;color:#64748B;margin:0 0 8px 0;font-style:italic; }
+          /* ---- masthead ---- */
+          .brandbar { background:#0F2A52; padding:14px 18px; display:flex;
+                      align-items:center; justify-content:space-between; }
+          .brandrule { height:4px; background:#3FC77A; margin-bottom:22px; }
+          .brandleft { display:flex; align-items:center; }
+          /* The U mark, drawn rather than embedded: a white rounded tile with a
+             green and a blue upright. Cheaper than base64 and it stays sharp. */
+          .ulogo { width:34px; height:34px; background:#FFFFFF; border-radius:9px;
+                   margin-right:11px; position:relative; display:inline-block; }
+          .ubar { position:absolute; top:8px; width:6px; height:15px; border-radius:2px; }
+          .ug { left:9px; background:#10B43E; }
+          .ub { left:19px; background:#1463D8; }
+          .brandmark { color:#FFFFFF; font-size:19px; font-weight:700; letter-spacing:-0.2px; line-height:1.1; }
+          .tagline { margin-top:3px; font-size:7.5px; font-weight:600; letter-spacing:1.1px; }
+          /* Brand colours lightened for the dark bar, the same adjustment the
+             app makes with greenOnDark. On #0F2A52 the raw brand green is
+             4.12:1 and the raw brand blue only 2.58:1, unreadable at this size;
+             these are 5.17:1 and 5.02:1. */
+          .t-green { color:#10B43E; } .t-blue { color:#5B9BF0; } .t-white { color:#FFFFFF; }
+          .brandright { text-align:right; }
+          .br1 { color:#FFFFFF; font-size:9px; font-weight:700; letter-spacing:1.2px; }
+          .br2 { color:#C6D2E4; font-size:8.5px; margin-top:2px; }
 
-          /* Product name and reason are one unit, never separated. */
-          .product-card { padding:8px 10px;background:#F4F6F8;border-radius:8px;margin-bottom:5px;font-size:12px; }
-          .prodname { font-weight:700;color:#0F2A52;display:block;margin-bottom:2px; }
-          .prodwhy { color:#64748B;line-height:1.5; }
-          .guidance-item { margin-bottom:6px;font-size:13px;color:#0F2A52;line-height:1.55; }
+          /* ---- page 1 ---- */
+          .eyebrow { font-size:10px; font-weight:700; letter-spacing:1.4px;
+                     text-transform:uppercase; color:#166E38; margin-bottom:6px; }
+          .h1 { font-size:30px; font-weight:700; color:#0F2A52; margin-bottom:18px; letter-spacing:-0.5px; }
+          .photo-section { margin:0 0 22px 0; }
+          /* Full content width, deliberately. An earlier revision capped this at
+             50%/250px to stop it dominating the page; the approved design wants
+             the photo as the hero, so the constraint is the border radius and
+             the aspect ratio, not the width. */
+          .photo { width:100%; display:block; border-radius:10px; border:1px solid #D7DCE3; }
+          .cap { font-size:8.5px; font-weight:700; letter-spacing:1.3px;
+                 text-transform:uppercase; color:#8A94A6; text-align:center; margin-top:9px; }
 
-          /* Reference thumbnail, not a hero. object-fit keeps the aspect ratio
-             instead of letting a tall photo dictate the height of the page. */
-          .photo-section { text-align:center; margin:0 0 18px 0; }
-          .photo { max-width:50%; max-height:250px; object-fit:cover;
-                   display:block; margin:0 auto 6px auto;
-                   border-radius:10px; border:1px solid #D7DCE3; }
-          .viz-section { text-align:center; margin:6px 0 16px 0; }
-          .viz { max-width:60%; max-height:350px; object-fit:cover;
-                 display:block; margin:0 auto 6px auto;
-                 border-radius:10px; border:1px solid #D7DCE3; }
-          .cap { font-size:10px;color:#64748B;text-align:center; }
+          .lbl { font-size:9px; font-weight:700; letter-spacing:1.2px;
+                 text-transform:uppercase; color:#64748B; margin:0 0 7px 0; }
+          .summary-card { background:#F7F8FA; border:1px solid #E2E6EC; border-radius:10px;
+                          padding:16px 18px; margin-bottom:16px; }
+          .summary-card .lbl { color:#64748B; }
+          .body { font-size:12.5px; color:#3D4A5C; line-height:1.65; }
 
-          .approach-section { border-radius:12px;padding:16px;margin-bottom:14px;background:white; }
-          .pro-tip { background:#E6F7EE;border:1px solid #A8DDBF;border-radius:10px;padding:14px;margin-bottom:14px; }
-          .foot { text-align:center;padding-top:12px;border-top:1px solid #D7DCE3;color:#64748B;font-size:10px; }`,
-        footer: `<div class="foot">Generated by Uncluttrd Pro &middot; More Space. More Time. More You. &middot; uncluttrd.app</div>`,
+          .approach-section { background:#FAFAFC; border:1px solid #E4E2EE; border-radius:10px;
+                              padding:16px 18px; margin-bottom:16px; }
+          .approach-name { font-size:9.5px; font-weight:700; letter-spacing:1.2px;
+                           text-transform:uppercase; color:#166E38;
+                           border-bottom:2px solid #10B43E; padding-bottom:7px;
+                           margin-bottom:11px; display:block; }
+          .lead { font-weight:700; color:#0F2A52; }
+
+          /* ---- page 2 ---- */
+          .h2 { font-size:25px; font-weight:700; color:#0F2A52; margin-bottom:20px; letter-spacing:-0.4px; }
+          .step { display:flex; padding:11px 0; border-bottom:1px solid #EDEFF3; }
+          .step:last-child { border-bottom:none; }
+          .stepno { width:34px; flex:0 0 34px; font-size:12.5px; font-weight:700; color:#166E38; }
+          .steptitle { font-size:12.5px; font-weight:700; color:#0F2A52; margin-bottom:3px; }
+          .stepbody { font-size:11.5px; color:#5D6B7F; line-height:1.6; }
+
+          .sublbl { font-size:11px; color:#64748B; margin:0 0 11px 0; }
+          /* Two-up grid built from table rows, not flex-wrap: WebKit's print
+             path breaks flex-wrapped children across pages unpredictably, and a
+             row is something page-break-inside can actually hold together. */
+          .prodgrid { width:100%; border-collapse:separate; border-spacing:9px 9px; margin:0 -9px; }
+          .prodgrid td { width:50%; vertical-align:top; }
+          .product-card { background:#F7F8FA; border:1px solid #E9ECF1; border-radius:8px;
+                          padding:11px 12px; display:flex; align-items:flex-start; }
+          .prodicon { width:17px; height:17px; flex:0 0 17px; border-radius:4px;
+                      background:#166E38; margin-right:10px; margin-top:1px; }
+          .prodname { font-size:11.5px; font-weight:700; color:#0F2A52; margin-bottom:2px; }
+          .prodwhy { font-size:10.5px; color:#6B7787; line-height:1.5; }
+
+          .viz-section { margin:18px 0 0 0; }
+          .viz { width:100%; display:block; border-radius:10px; border:1px solid #D7DCE3; }
+
+          .pro-tip { background:#EAF7EF; border:1px solid #A8DDBF; border-radius:10px;
+                     padding:15px 18px; margin-top:18px; }
+          .pro-tip .lbl { color:#166E38; }
+          .pro-tip .body { color:#1B5E34; }
+
+          /* ---- footer, every page ---- */
+          .foot { border-top:1px solid #E2E6EC; margin-top:26px; padding-top:9px;
+                  display:flex; justify-content:space-between;
+                  font-size:8.5px; color:#8A94A6; }`,
+        footer: `<div class="foot"><span>Generated by Uncluttrd Pro</span><span>uncluttrd.app</span></div>`,
       };
 
       const buildApproachPdf = async () => {
         const identity = await resolveExportIdentity();
         const selectedId = results.selectedApproach || null;
+        const roomLabel = escHtml(identity.label);
+
         const proTip = results.proTip
           ? `<div class="pro-tip">
-               <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;">&#9989; PRO TIP</div>
-               <div style="color:#166E38;font-size:13px;line-height:1.6;">${escHtml(results.proTip)}</div>
+               <div class="lbl">Pro tip</div>
+               <div class="body">${escHtml(results.proTip)}</div>
              </div>`
           : "";
 
         // The original photo. Optional for exactly the same reason the
         // visualization is: a plan whose photo has been cleaned up from
         // Storage must still export.
-        const photoUri = await imageToDataUri(results.photoUrl, 1000);
+        const photoUri = await imageToDataUri(results.photoUrl, 1400);
         const photoBlock = photoUri
           ? `<div class="photo-section"><img class="photo" src="${photoUri}"/><div class="cap">Your space today</div></div>`
           : "";
 
+        // First sentence of the strategy is set bold as a lead-in, the rest
+        // regular. Splitting on the first terminator rather than a fixed word
+        // count so the bold part is always a whole thought.
+        const leadSplit = (text) => {
+          const t = String(text || "").trim();
+          const m = t.match(/^(.+?[.!?])(\s+)(.*)$/s);
+          if (!m || m[1].length > 140) return escHtml(t);
+          return `<span class="lead">${escHtml(m[1])}</span> ${escHtml(m[3])}`;
+        };
+
         const head = `${makeHeader(false)}
           <div class="page">
-            <div class="eyebrow">${escHtml(identity.label)}</div>
+            <div class="eyebrow">${roomLabel}</div>
             <div class="h1">Your Organization Plan</div>
             ${photoBlock}
             <div class="summary-card">
-              <div class="lbl" style="margin-top:0;">What we noticed</div>
-              <div class="note">${escHtml(results.overview)}</div>
+              <div class="lbl">What we noticed</div>
+              <div class="body">${escHtml(results.overview)}</div>
             </div>`;
 
-        const productRows = (approach) => {
-          const items = (approach.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
-          if (!items.length) {
-            return `<div class="lbl">Products for this space</div>
-                    <div class="sublbl">Find options and shop for these in the Uncluttrd app.</div>
-                    <div class="product-card"><span class="prodwhy">This approach uses what you already have.</span></div>`;
-          }
-          // Type + reason only. No price and no retailer link, deliberately:
-          // a shared PDF outlives the prices in it, and the affiliate search
-          // link is a live app affordance, not a document.
-          // shortReason first, the truncation fallback second, and the full
-          // reason never. The full reason is a whole sentence of visible
-          // evidence - correct on screen where one card is in view, but six of
-          // them stacked is the wall of text this section had become.
-          return `<div class="lbl">Products for this space</div>
-                  <div class="sublbl">Find options and shop for these in the Uncluttrd app.</div>`
-            + items.map((item) => {
-                const why = item.shortReason
-                  || shortDisplayReason(resolveRecommendationReason(item, results.problemsFound));
-                return `
-            <div class="product-card">
-              <span class="prodname">${escHtml(pdfTitleCase(item.productType))}</span>
-              <span class="prodwhy">${escHtml(why)}</span>
+        // A short bold title per step, with the FULL guidance sentence as the
+        // description. An earlier version cut the sentence in two and used the
+        // remainder as the body, which produced broken grammar - "Add
+        // coordinating framed art or" / "Decorative mirrors so the room..." -
+        // because a fixed word count lands mid-phrase.
+        //
+        // shortDisplayReason already solves exactly this: it trims to a clean
+        // phrase at a word boundary and backs off weak endings (prepositions,
+        // conjunctions, attributive adjectives) rather than stopping on one.
+        // Reusing it means the title is always a whole thought. The cost is
+        // that the title repeats the opening words of the description, which
+        // reads far better than a severed clause.
+        const stepTitle = (text) => {
+          const t = String(text || "").trim().replace(/s+/g, " ");
+          const title = shortDisplayReason(t) || t;
+          return { title: title.replace(/[.,;:]+$/, ""), body: t };
+        };
+
+        const stepsHtml = (items) => items.map((g, i) => {
+          const { title, body } = stepTitle(g);
+          return `<div class="step">
+              <div class="stepno">${String(i + 1).padStart(2, "0")}</div>
+              <div>
+                <div class="steptitle">${escHtml(title)}</div>
+                <div class="stepbody">${escHtml(body)}</div>
+              </div>
             </div>`;
-              }).join("");
+        }).join("");
+
+        const NUM_WORD = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten"];
+        const movesHeadline = (n) =>
+          `${NUM_WORD[n] || n} move${n === 1 ? "" : "s"} that make${n === 1 ? "s" : ""} the biggest difference`;
+
+        const productGrid = (approach) => {
+          const items = (approach.productRecommendations || []).map(normalizeProductRecommendation).filter(Boolean);
+          const heading = `<div class="lbl">Products for this space</div>
+            <div class="sublbl">A quick shopping list. Open Uncluttrd to browse options for each recommendation.</div>`;
+          if (!items.length) {
+            return `${heading}<div class="product-card"><div><div class="prodwhy">This approach uses what you already have.</div></div></div>`;
+          }
+          // shortReason first, the truncation fallback second, the full reason
+          // never - a whole sentence of evidence per card is right on screen
+          // where one is in view, and is the wall of text this section became
+          // with six of them stacked.
+          const cell = (item) => {
+            if (!item) return `<td></td>`;
+            const why = item.shortReason
+              || shortDisplayReason(resolveRecommendationReason(item, results.problemsFound));
+            return `<td><div class="product-card">
+                <span class="prodicon"></span>
+                <div><div class="prodname">${escHtml(pdfTitleCase(item.productType))}</div>
+                <div class="prodwhy">${escHtml(why)}</div></div>
+              </div></td>`;
+          };
+          let rows = "";
+          for (let i = 0; i < items.length; i += 2) {
+            rows += `<tr class="prodgrid-row">${cell(items[i])}${cell(items[i + 1])}</tr>`;
+          }
+          return `${heading}<table class="prodgrid"><tbody>${rows}</tbody></table>`;
         };
 
         if (selectedId && results.approaches?.[selectedId]) {
           const a = results.approaches[selectedId];
           const m = APPROACH_META[selectedId] || {};
-          const guidance = (a.organizingGuidance || [])
-            .filter((g) => typeof g === "string" && g.trim())
-            .map((g) => `<li class="guidance-item">${escHtml(g)}</li>`)
-            .join("");
+          const guidance = (a.organizingGuidance || []).filter((g) => typeof g === "string" && g.trim());
           // Present tense on the local state first (this session's
           // generation), then the persisted map, so a visualization made
           // moments ago is in the PDF without waiting for a plan reload.
           const vizUrl = vizImage[selectedId] || results.vizImages?.[selectedId] || null;
-          const vizUri = await imageToDataUri(vizUrl, 1000);
+          const vizUri = await imageToDataUri(vizUrl, 1400);
           const vizBlock = vizUri
             ? `<div class="viz-section"><img class="viz" src="${vizUri}"/><div class="cap">${escHtml(m.name || selectedId)} &middot; AI visualization</div></div>`
             : "";
           return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>${PDF_SHELL.css}</style></head><body>
             ${head}
-              <div class="approach-section" style="border:1.5px solid ${m.border || "#D7DCE3"};">
-                <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid ${m.border || "#D7DCE3"};">
-                  <span style="background:${m.bg || "#E6E9EE"};color:${m.color || "#0F2A52"};border:1px solid ${m.border || "#D7DCE3"};padding:3px 12px;border-radius:20px;font-weight:700;font-size:12px;">${escHtml(m.name || selectedId)}</span>
-                </div>
-                <div style="font-size:13px;color:#0F2A52;line-height:1.6;">${escHtml(a.strategyDescription)}</div>
+              <div class="approach-section">
+                <span class="approach-name">${escHtml(m.name || selectedId)}</span>
+                <div class="body">${leadSplit(a.strategyDescription)}</div>
               </div>
+              ${PDF_SHELL.footer}
             </div>
-            ${makeHeader(true)}
+            ${makeHeader(true, { top: roomLabel, sub: "Organization Plan" })}
             <div class="page">
-              ${guidance ? `<div class="lbl" style="margin-top:0;">Organizing guidance</div><ul style="margin:0;padding-left:18px;">${guidance}</ul>` : ""}
-              ${productRows(a)}
+              ${guidance.length ? `<div class="eyebrow">Your action plan</div>
+                <div class="h2">${escHtml(movesHeadline(guidance.length))}</div>
+                ${stepsHtml(guidance)}` : ""}
+              <div style="margin-top:${guidance.length ? "22px" : "0"};">${productGrid(a)}</div>
               ${vizBlock}
               ${proTip}
               ${PDF_SHELL.footer}
@@ -7891,23 +7977,25 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           const changes = (a.keyChanges || [])
             .filter((k) => typeof k === "string" && k.trim())
             .slice(0, 4)
-            .map((k) => `<li style="margin-bottom:4px;font-size:12px;color:#0F2A52;line-height:1.5;">${escHtml(k)}</li>`)
+            .map((k) => `<li style="margin-bottom:4px;font-size:11.5px;color:#3D4A5C;line-height:1.55;">${escHtml(k)}</li>`)
             .join("");
-          return `<div style="border:1.5px solid ${m.border || "#D7DCE3"};border-radius:12px;padding:14px;margin-bottom:10px;background:white;">
-              <span style="background:${m.bg || "#E6E9EE"};color:${m.color || "#0F2A52"};border:1px solid ${m.border || "#D7DCE3"};padding:3px 12px;border-radius:20px;font-weight:700;font-size:12px;">${escHtml(m.name || id)}</span>
-              <div style="font-size:12px;color:#0F2A52;line-height:1.6;margin-top:8px;">${escHtml(a.strategyDescription)}</div>
-              ${changes ? `<ul style="margin:8px 0 0 0;padding-left:18px;">${changes}</ul>` : ""}
+          return `<div class="approach-section">
+              <span class="approach-name">${escHtml(m.name || id)}</span>
+              <div class="body">${leadSplit(a.strategyDescription)}</div>
+              ${changes ? `<ul style="margin:9px 0 0 0;padding-left:17px;">${changes}</ul>` : ""}
             </div>`;
         }).join("");
 
         return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>${PDF_SHELL.css}</style></head><body>
           ${head}
-            <div class="lbl">Three ways to approach this</div>
-            ${cards}
+            ${PDF_SHELL.footer}
           </div>
-          ${makeHeader(true)}
-          <div class="page" style="padding-top:16px;">
-            <div class="note">Open this room in Uncluttrd to choose an approach and get its full checklist, product recommendations, and AI visualization.</div>
+          ${makeHeader(true, { top: roomLabel, sub: "Organization Plan" })}
+          <div class="page">
+            <div class="eyebrow">Your options</div>
+            <div class="h2">Three ways to approach this</div>
+            ${cards}
+            <div class="summary-card"><div class="body">Open this room in Uncluttrd to choose an approach and get its full action plan, product list, and AI visualization.</div></div>
             ${proTip}
             ${PDF_SHELL.footer}
           </div>
@@ -7950,9 +8038,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#1E9E52;margin-bottom:4px;">&#9989; PRO TIP</div>
             <div style="color:#166E38;font-size:13px;line-height:1.6;">${results.proTip}</div>
           </div>` : ""}
-          <div style="text-align:center;padding-top:12px;border-top:1px solid #D7DCE3;color:#64748B;font-size:10px;">
-            Generated by Uncluttrd Pro &middot; More Space. More Time. More You. &middot; uncluttrd.app
-          </div>
+          ${PDF_SHELL.footer}
         </div>
 
       </body></html>`;
