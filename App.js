@@ -5570,20 +5570,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         Alert.alert("Photos Permission Required", "Cluttrd needs access to your photos to analyze your room. Please go to Settings → Uncluttrd → Photos and allow access.", [{ text: "OK" }]);
         return;
       }
+      dlog("[CROP] pickPhoto: opening library");
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
         allowsEditing: false,
         quality: 0.2,
-        base64: true,
       });
+      dlog(`[CROP] pickPhoto returned canceled=${result.canceled} assets=${result.assets?.length ?? 0}`);
       if (!result.canceled && result.assets?.[0]) {
-        requestCrop(result.assets[0], (a) => {
-          setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-          logEvent(getAnalytics(), "photo_uploaded");
-          setResults(null); setErr(null);
-        });
+        requestCrop(result.assets[0], acceptPhoto);
       }
     } catch (e) {
+      dlog(`[CROP] pickPhoto ERROR ${e?.message}`);
       setErr("We couldn't open your photos. Please check your permissions in Settings and try again.");
     }
   };
@@ -6418,6 +6416,37 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const [cropSource, setCropSource] = useState(null);
   const cropDoneRef = useRef(null);
 
+  // Every entry point now ends here, and none of them takes base64 from the
+  // picker any more.
+  //
+  // That combination is what broke the crop. Turning allowsEditing off was
+  // necessary - its editor is a forced square on iOS - but allowsEditing was
+  // also what kept the returned image small. With it off the picker hands back
+  // the full-resolution original, and base64: true made it encode all of it,
+  // on the bridge, before launchCameraAsync ever resolved. On a 12MP photo
+  // that is a multi-megabyte string built at the moment the camera is already
+  // holding the image in memory. Nothing downstream ever needed it at that
+  // size: analyze() reads photo.base64, but compressPhoto has always produced
+  // it at 768px, and the camera path already called compressPhoto anyway.
+  //
+  // It fits every symptom - no [CROP] requestCrop line ever, because the
+  // failure is inside the picker before it returns; unaffected by force-quit,
+  // because it is photo size and not state; and invisible in the log, because
+  // debugLogBuffer is a plain in-memory array that a restart wipes.
+  const acceptPhoto = async (a) => {
+    const compressed = await compressPhoto(a.uri);
+    if (!compressed) {
+      dlog(`[CROP] compressPhoto FAILED for ${a?.uri?.slice(-28)}`);
+      setErr("We couldn't process that photo. Please try another one.");
+      return;
+    }
+    dlog(`[CROP] accepted, base64 ${Math.round(compressed.base64.length / 1024)}KB`);
+    setPhoto(compressed);
+    logEvent(getAnalytics(), "photo_uploaded");
+    Image.getSize(compressed.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
+    setResults(null); setErr(null);
+  };
+
   const requestCrop = (asset, done) => {
     dlog(`[CROP] requestCrop uri=${asset?.uri?.slice(-28)} ${asset?.width}x${asset?.height}`);
     cropDoneRef.current = done;
@@ -6459,54 +6488,44 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
   const pickFile = async () => {
     try {
+      dlog("[CROP] pickFile: opening library");
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
         // allowsEditing off: it opens the OS editor, which is a forced square
         // on iOS. The crop screen below is free-form and needs the full frame.
         allowsEditing: false,
         quality: 0.2,
-        base64: true,
       });
+      dlog(`[CROP] pickFile returned canceled=${result.canceled} assets=${result.assets?.length ?? 0}`);
       if (!result.canceled && result.assets?.[0]) {
-        requestCrop(result.assets[0], (a) => {
-          setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-          logEvent(getAnalytics(), "photo_uploaded");
-          setResults(null); setErr(null);
-        });
+        requestCrop(result.assets[0], acceptPhoto);
       }
     } catch (e) {
+      dlog(`[CROP] pickFile ERROR ${e?.message}`);
       setErr("We couldn't open your files. Please try another option.");
     }
   };
 
   const openCamera = async () => {
     try {
+      dlog("[CROP] openCamera: requesting permission");
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== "granted") {
+        dlog("[CROP] openCamera: permission denied");
         Alert.alert("Camera Permission Required", "Please allow camera access in Settings → Uncluttrd → Camera.");
         return;
       }
+      dlog("[CROP] openCamera: launching");
       const result = await ImagePicker.launchCameraAsync({
         allowsEditing: false,
         quality: 0.2,
-        base64: true,
       });
+      dlog(`[CROP] openCamera returned canceled=${result.canceled} assets=${result.assets?.length ?? 0}`);
       if (!result.canceled && result.assets?.[0]) {
-        requestCrop(result.assets[0], async (a) => {
-          const compressed = await compressPhoto(a.uri);
-          if (compressed) {
-            setPhoto(compressed);
-            logEvent(getAnalytics(), "photo_uploaded");
-            Image.getSize(compressed.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
-          } else {
-            setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-            logEvent(getAnalytics(), "photo_uploaded");
-            Image.getSize(a.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
-          }
-          setResults(null); setErr(null);
-        });
+        requestCrop(result.assets[0], acceptPhoto);
       }
     } catch (e) {
+      dlog(`[CROP] openCamera ERROR ${e?.message}`);
       setErr("Could not open camera. Please try again.");
     }
   };
@@ -10729,6 +10748,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // started from, the crop is what renders next - which is the whole reason
   // it is a gate and not something mounted inside one screen's return.
   if (cropSource) {
+    dlog(`[CROP] gate rendering for ${cropSource.uri?.slice(-28)}`);
     return (
       <PhotoCropScreen
         key={cropSource.uri}
@@ -14563,12 +14583,16 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
         onUseOriginal();
         return;
       }
+      // No base64 here either. acceptPhoto runs the result through
+      // compressPhoto, which produces the 768px base64 analyze() actually
+      // reads; encoding the full-size crop first would just be a second large
+      // string built for nothing.
       const out = await manipulateAsync(
         source.uri,
         [{ crop: { originX, originY, width, height } }],
-        { compress: 0.9, format: SaveFormat.JPEG, base64: true }
+        { compress: 0.9, format: SaveFormat.JPEG }
       );
-      onConfirm({ ...source, uri: out.uri, base64: out.base64, width: out.width, height: out.height });
+      onConfirm({ ...source, uri: out.uri, base64: null, width: out.width, height: out.height });
     } catch (e) {
       // Cropping is an enhancement, not a gate. If the manipulator fails the
       // original is still a perfectly good photo and the run is not lost.
