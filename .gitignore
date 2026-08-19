@@ -32,6 +32,27 @@ yarn-error.*
 
 # local env files
 .env*.local
+*.env.local
+.env
+.env.*
+
+# Firebase client config and store credentials. None of these have ever been
+# committed - checked across all 294 commits - but nothing was stopping the
+# next `git add -A` from doing it. play-service-account.json in particular is
+# a real private key.
+GoogleService-Info*.plist
+google-services*.json
+play-service-account.json
+.firebaserc
+
+# NOTE: functions/.env and functions/.env.cluttrd-staging ARE tracked, on
+# purpose, and are deliberately not listed here. In Firebase Functions v2 that
+# file holds defineString params, not secrets - every actual secret
+# (ANTHROPIC_KEY, OPENAI_KEY, RESEND_API_KEY, the two RevenueCat webhook
+# secrets, REVENUECAT_SECRET_API_KEY) uses defineSecret and lives in Secret
+# Manager, never in the repo. The three values in there - CANARY_TEST_UID,
+# CANARY_WEB_API_KEY, REVENUECAT_PROJECT_ID - are also written as literal
+# defaults in functions/index.js, so ignoring the file would hide nothing.
 
 # typescript
 *.tsbuildinfo
