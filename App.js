@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated
+  TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated,
+  PanResponder
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -5571,15 +5572,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       }
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
-        allowsEditing: true,
+        allowsEditing: false,
         quality: 0.2,
         base64: true,
       });
       if (!result.canceled && result.assets?.[0]) {
-        const a = result.assets[0];
-        setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-        logEvent(getAnalytics(), "photo_uploaded");
-        setResults(null); setErr(null);
+        requestCrop(result.assets[0], (a) => {
+          setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
+          logEvent(getAnalytics(), "photo_uploaded");
+          setResults(null); setErr(null);
+        });
       }
     } catch (e) {
       setErr("We couldn't open your photos. Please check your permissions in Settings and try again.");
@@ -6408,6 +6410,38 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
   };
 
+  // Crop hand-off. requestCrop parks the asset and remembers what the caller
+  // wanted to do with it; the modal calls back with either the cropped asset
+  // or the original. Each entry point keeps its own tail - the camera path
+  // compresses and measures, the two library paths do not - so inserting the
+  // crop changes none of what they already did afterwards.
+  const [cropSource, setCropSource] = useState(null);
+  const cropDoneRef = useRef(null);
+
+  const requestCrop = (asset, done) => {
+    cropDoneRef.current = done;
+    // The crop rectangle is converted back into source pixels on confirm, so
+    // the modal cannot open without real dimensions. The picker supplies them;
+    // Image.getSize is the fallback, and if even that fails the crop is
+    // skipped rather than opened against a guess.
+    if (asset?.width > 0 && asset?.height > 0) {
+      setCropSource(asset);
+      return;
+    }
+    Image.getSize(
+      asset.uri,
+      (w, h) => setCropSource({ ...asset, width: w, height: h }),
+      () => { cropDoneRef.current = null; done(asset); }
+    );
+  };
+
+  const finishCrop = (asset) => {
+    const done = cropDoneRef.current;
+    cropDoneRef.current = null;
+    setCropSource(null);
+    if (done && asset) done(asset);
+  };
+
   const showPhotoOptions = () => {
     Alert.alert(
       "Add a Photo",
@@ -6425,15 +6459,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
-        allowsEditing: true,
+        // allowsEditing off: it opens the OS editor, which is a forced square
+        // on iOS. The crop screen below is free-form and needs the full frame.
+        allowsEditing: false,
         quality: 0.2,
         base64: true,
       });
       if (!result.canceled && result.assets?.[0]) {
-        const a = result.assets[0];
-        setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-        logEvent(getAnalytics(), "photo_uploaded");
-        setResults(null); setErr(null);
+        requestCrop(result.assets[0], (a) => {
+          setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
+          logEvent(getAnalytics(), "photo_uploaded");
+          setResults(null); setErr(null);
+        });
       }
     } catch (e) {
       setErr("We couldn't open your files. Please try another option.");
@@ -6448,23 +6485,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         return;
       }
       const result = await ImagePicker.launchCameraAsync({
-        allowsEditing: true,
+        allowsEditing: false,
         quality: 0.2,
         base64: true,
       });
       if (!result.canceled && result.assets?.[0]) {
-        const a = result.assets[0];
-        const compressed = await compressPhoto(a.uri);
-        if (compressed) {
-          setPhoto(compressed);
-          logEvent(getAnalytics(), "photo_uploaded");
-          Image.getSize(compressed.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
-        } else {
-          setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
-          logEvent(getAnalytics(), "photo_uploaded");
-          Image.getSize(a.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
-        }
-        setResults(null); setErr(null);
+        requestCrop(result.assets[0], async (a) => {
+          const compressed = await compressPhoto(a.uri);
+          if (compressed) {
+            setPhoto(compressed);
+            logEvent(getAnalytics(), "photo_uploaded");
+            Image.getSize(compressed.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
+          } else {
+            setPhoto({ uri: a.uri, base64: a.base64, mimeType: "image/jpeg" });
+            logEvent(getAnalytics(), "photo_uploaded");
+            Image.getSize(a.uri, (w, h) => setPhotoSize({ width: w, height: h }), () => { });
+          }
+          setResults(null); setErr(null);
+        });
       }
     } catch (e) {
       setErr("Could not open camera. Please try again.");
@@ -13857,6 +13895,18 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </View>
         )}
       </ScrollView>
+      {/* Outside the ScrollView on purpose: a Modal rendered inside a
+          ScrollView's content inflates the scrollable area, which is the
+          defect that made the Results screen scroll past its own content. */}
+      {cropSource && (
+        <PhotoCropModal
+          key={cropSource.uri}
+          source={cropSource}
+          onCancel={() => { cropDoneRef.current = null; setCropSource(null); }}
+          onUseOriginal={() => finishCrop(cropSource)}
+          onConfirm={(cropped) => finishCrop(cropped)}
+        />
+      )}
     </SafeAreaView>
   );
 
@@ -14318,6 +14368,242 @@ function SwipeToDeleteRow({ onDelete, accessibilityLabel, children }) {
 // "Upgrade to Pro" affordance. On the other three screens the surrounding tap
 // target navigates home, and a button that says Upgrade but goes home is worse
 // than no button.
+// ---------------------------------------------------------------------------
+// PHOTO CROP
+// ---------------------------------------------------------------------------
+// Free-form crop, shown between the picker and everything downstream.
+//
+// It sits at the one point where all three entry points - camera, camera roll,
+// file browser - converge on setPhoto. Because nothing reads the photo until
+// setPhoto has run, analysis, the Storage upload, the plan's photoUrl, My
+// Rooms and Room Detail thumbnails, the PDF and the visualization input all
+// receive the cropped image without any of them knowing a crop took place.
+// Covering those seven consumers by construction rather than by editing seven
+// call sites is the entire reason the crop goes here.
+//
+// expo-image-picker's allowsEditing was already on at these call sites, but
+// the editor it opens is the OS one: a forced square on iOS. Rooms are not
+// square, which is what this screen is for, so allowsEditing is turned off on
+// the three calls that feed it and the full frame arrives here instead.
+const CROP_MIN = 48;      // smallest crop side, in fitted-image px
+const CROP_HANDLE = 34;   // corner touch target
+const CROP_ZOOM_MAX = 4;
+
+function PhotoCropModal({ source, onCancel, onUseOriginal, onConfirm }) {
+  const win = Dimensions.get("window");
+  const stageW = win.width - 32;
+  const stageH = Math.max(220, win.height * 0.56);
+
+  // The image is laid out at an explicitly computed "contain" size rather than
+  // being handed to resizeMode, because the crop rectangle has to be converted
+  // back into source pixels and that conversion needs the fitted size as a
+  // known number, not one the layout engine picked.
+  const srcW = Math.max(1, source?.width || 1);
+  const srcH = Math.max(1, source?.height || 1);
+  const fit = Math.min(stageW / srcW, stageH / srcH);
+  const fitW = srcW * fit;
+  const fitH = srcH * fit;
+
+  const [rect, setRect] = useState({ x: 0, y: 0, w: fitW, h: fitH });
+  const [zoom, setZoom] = useState({ k: 1, tx: 0, ty: 0 });
+  const [busy, setBusy] = useState(false);
+  const rectRef = useRef(rect);
+  const zoomRef = useRef(zoom);
+  const startRef = useRef(null);
+  const pinchRef = useRef(null);
+
+  const applyRect = (r) => {
+    const w = Math.max(CROP_MIN, Math.min(r.w, fitW));
+    const h = Math.max(CROP_MIN, Math.min(r.h, fitH));
+    const c = {
+      x: Math.max(0, Math.min(r.x, fitW - w)),
+      y: Math.max(0, Math.min(r.y, fitH - h)),
+      w, h,
+    };
+    rectRef.current = c;
+    setRect(c);
+  };
+
+  // Drag inside the frame moves it. Screen distance is divided by the zoom
+  // factor because the frame's coordinates are in unzoomed stage pixels.
+  const moveResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onPanResponderGrant: () => { startRef.current = rectRef.current; },
+    onPanResponderMove: (_e, g) => {
+      const a = startRef.current;
+      if (!a) return;
+      const k = zoomRef.current.k || 1;
+      applyRect({ w: a.w, h: a.h, x: a.x + g.dx / k, y: a.y + g.dy / k });
+    },
+  })).current;
+
+  // One responder per corner. cx/cy of 0 means the handle drags the left/top
+  // edge, which moves the origin as well as the size; 1 means the right/bottom
+  // edge, which only changes the size.
+  const cornersRef = useRef(null);
+  if (!cornersRef.current) {
+    const mk = (cx, cy) => PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => { startRef.current = rectRef.current; },
+      onPanResponderMove: (_e, g) => {
+        const a = startRef.current;
+        if (!a) return;
+        const k = zoomRef.current.k || 1;
+        const dx = g.dx / k;
+        const dy = g.dy / k;
+        let { x, y, w, h } = a;
+        if (cx === 0) { x = a.x + dx; w = a.w - dx; } else { w = a.w + dx; }
+        if (cy === 0) { y = a.y + dy; h = a.h - dy; } else { h = a.h + dy; }
+        // Pin the near edge when the frame hits its minimum, so dragging past
+        // the limit stops the handle instead of pushing the opposite edge.
+        if (w < CROP_MIN) { if (cx === 0) x = a.x + a.w - CROP_MIN; w = CROP_MIN; }
+        if (h < CROP_MIN) { if (cy === 0) y = a.y + a.h - CROP_MIN; h = CROP_MIN; }
+        if (x < 0) { if (cx === 0) w += x; x = 0; }
+        if (y < 0) { if (cy === 0) h += y; y = 0; }
+        if (x + w > fitW) w = fitW - x;
+        if (y + h > fitH) h = fitH - y;
+        applyRect({ x, y, w, h });
+      },
+    });
+    cornersRef.current = { tl: mk(0, 0), tr: mk(1, 0), bl: mk(0, 1), br: mk(1, 1) };
+  }
+
+  // Two fingers zoom and pan the stage. Claimed on the CAPTURE phase so the
+  // parent takes a two-finger gesture away from the frame and handles beneath
+  // it, while one-finger gestures are never captured and reach them normally.
+  const stageResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponderCapture: () => false,
+    onMoveShouldSetPanResponderCapture: (e) => e.nativeEvent.touches.length === 2,
+    onPanResponderGrant: (e) => {
+      const t = e.nativeEvent.touches;
+      if (t.length !== 2) { pinchRef.current = null; return; }
+      const dx = t[0].pageX - t[1].pageX;
+      const dy = t[0].pageY - t[1].pageY;
+      pinchRef.current = { d: Math.max(1, Math.hypot(dx, dy)), z: zoomRef.current };
+    },
+    onPanResponderMove: (e, g) => {
+      const t = e.nativeEvent.touches;
+      const p = pinchRef.current;
+      if (!p || t.length < 2) return;
+      const dx = t[0].pageX - t[1].pageX;
+      const dy = t[0].pageY - t[1].pageY;
+      const k = Math.max(1, Math.min(CROP_ZOOM_MAX, p.z.k * (Math.max(1, Math.hypot(dx, dy)) / p.d)));
+      // Keep the image from being dragged off the stage: at scale k it can
+      // move by half the overhang in each direction, and not at all at k = 1.
+      const maxX = (fitW * (k - 1)) / 2;
+      const maxY = (fitH * (k - 1)) / 2;
+      const z = {
+        k,
+        tx: Math.max(-maxX, Math.min(maxX, p.z.tx + g.dx)),
+        ty: Math.max(-maxY, Math.min(maxY, p.z.ty + g.dy)),
+      };
+      zoomRef.current = z;
+      setZoom(z);
+    },
+    onPanResponderRelease: () => { pinchRef.current = null; },
+    onPanResponderTerminate: () => { pinchRef.current = null; },
+  })).current;
+
+  const reset = () => {
+    applyRect({ x: 0, y: 0, w: fitW, h: fitH });
+    const z = { k: 1, tx: 0, ty: 0 };
+    zoomRef.current = z;
+    setZoom(z);
+  };
+
+  const confirm = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const toSrc = srcW / fitW;   // fit preserves aspect, so one factor serves both axes
+      const originX = Math.max(0, Math.min(Math.round(rect.x * toSrc), srcW - 1));
+      const originY = Math.max(0, Math.min(Math.round(rect.y * toSrc), srcH - 1));
+      const width = Math.max(1, Math.min(Math.round(rect.w * toSrc), srcW - originX));
+      const height = Math.max(1, Math.min(Math.round(rect.h * toSrc), srcH - originY));
+      // A frame still covering the whole image is not a crop. Take the
+      // untouched original rather than paying for a re-encode that only loses
+      // quality - this is the same path the Use Original button takes.
+      if (originX <= 1 && originY <= 1 && width >= srcW - 2 && height >= srcH - 2) {
+        onUseOriginal();
+        return;
+      }
+      const out = await manipulateAsync(
+        source.uri,
+        [{ crop: { originX, originY, width, height } }],
+        { compress: 0.9, format: SaveFormat.JPEG, base64: true }
+      );
+      onConfirm({ ...source, uri: out.uri, base64: out.base64, width: out.width, height: out.height });
+    } catch (e) {
+      // Cropping is an enhancement, not a gate. If the manipulator fails the
+      // original is still a perfectly good photo and the run is not lost.
+      onUseOriginal();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handle = (key, left, top, style) => (
+    <View
+      style={[s.cropHandle, style, { left, top }]}
+      {...cornersRef.current[key].panHandlers}
+      accessibilityLabel={"Resize crop, " + key}
+    />
+  );
+
+  return (
+    <Modal visible={true} animationType="slide" onRequestClose={onCancel} transparent={false}>
+      <SafeAreaView style={s.cropSafe}>
+        <View style={s.cropHead}>
+          <TouchableOpacity onPress={onCancel} style={s.cropCancel} accessibilityRole="button">
+            <Text style={s.cropCancelText}>Cancel</Text>
+          </TouchableOpacity>
+          <Text style={s.cropTitle}>Frame your space</Text>
+          <TouchableOpacity onPress={reset} style={s.cropCancel} accessibilityRole="button">
+            <Text style={s.cropCancelText}>Reset</Text>
+          </TouchableOpacity>
+        </View>
+        <Text style={s.cropHint}>Drag the corners to crop. Pinch with two fingers to zoom.</Text>
+
+        <View style={[s.cropStage, { width: stageW, height: stageH }]} {...stageResponder.panHandlers}>
+          <View style={{
+            width: fitW, height: fitH,
+            transform: [{ translateX: zoom.tx }, { translateY: zoom.ty }, { scale: zoom.k }],
+          }}>
+            <Image source={{ uri: source.uri }} style={{ width: fitW, height: fitH }} />
+            {/* Four bands rather than one overlay with a hole: React Native has
+                no cut-out, and four plain views cost nothing. */}
+            <View pointerEvents="none" style={[s.cropDim, { left: 0, top: 0, width: fitW, height: rect.y }]} />
+            <View pointerEvents="none" style={[s.cropDim, { left: 0, top: rect.y + rect.h, width: fitW, height: Math.max(0, fitH - rect.y - rect.h) }]} />
+            <View pointerEvents="none" style={[s.cropDim, { left: 0, top: rect.y, width: rect.x, height: rect.h }]} />
+            <View pointerEvents="none" style={[s.cropDim, { left: rect.x + rect.w, top: rect.y, width: Math.max(0, fitW - rect.x - rect.w), height: rect.h }]} />
+
+            <View style={[s.cropFrame, { left: rect.x, top: rect.y, width: rect.w, height: rect.h }]} {...moveResponder.panHandlers} />
+
+            {/* Handles sit INSIDE the frame corners. Half-overlapping the edge
+                reads better but Android clips anything outside the parent, and
+                a handle you cannot press at the image edge is worse. */}
+            {handle("tl", rect.x, rect.y, s.cropHandleTL)}
+            {handle("tr", rect.x + rect.w - CROP_HANDLE, rect.y, s.cropHandleTR)}
+            {handle("bl", rect.x, rect.y + rect.h - CROP_HANDLE, s.cropHandleBL)}
+            {handle("br", rect.x + rect.w - CROP_HANDLE, rect.y + rect.h - CROP_HANDLE, s.cropHandleBR)}
+          </View>
+        </View>
+
+        <View style={s.cropActions}>
+          <TouchableOpacity style={s.cropPrimary} onPress={confirm} disabled={busy} accessibilityRole="button">
+            {busy
+              ? <ActivityIndicator color="white" />
+              : <Text style={s.cropPrimaryText}>Use This Photo</Text>}
+          </TouchableOpacity>
+          <TouchableOpacity style={s.cropSecondary} onPress={onUseOriginal} disabled={busy} accessibilityRole="button">
+            <Text style={s.cropSecondaryText}>Use Original</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 function FreeRoomsBadge({ isPro, analyses, showUpgrade = false }) {
   if (isPro) return <Text style={s.hdrTag}>Pro member</Text>;
   if (showUpgrade && (analyses || 0) >= 3) {
@@ -14337,6 +14623,25 @@ function FreeRoomsBadge({ isPro, analyses, showUpgrade = false }) {
 }
 
 const s = StyleSheet.create({
+  cropSafe: { flex: 1, backgroundColor: "#0F2A52", alignItems: "center" },
+  cropHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", width: "100%", paddingHorizontal: 8, paddingTop: 6 },
+  cropTitle: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
+  cropCancel: { padding: 10, minWidth: 72 },
+  cropCancelText: { color: "rgba(255,255,255,0.85)", fontSize: 15, fontFamily: "Inter_500Medium" },
+  cropHint: { color: "rgba(255,255,255,0.6)", fontSize: 12, textAlign: "center", paddingHorizontal: 24, marginTop: 2, marginBottom: 12 },
+  cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  cropDim: { position: "absolute", backgroundColor: "rgba(0,0,0,0.55)" },
+  cropFrame: { position: "absolute", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.95)" },
+  cropHandle: { position: "absolute", width: CROP_HANDLE, height: CROP_HANDLE, borderColor: BRAND.green },
+  cropHandleTL: { borderLeftWidth: 4, borderTopWidth: 4 },
+  cropHandleTR: { borderRightWidth: 4, borderTopWidth: 4 },
+  cropHandleBL: { borderLeftWidth: 4, borderBottomWidth: 4 },
+  cropHandleBR: { borderRightWidth: 4, borderBottomWidth: 4 },
+  cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, gap: 10 },
+  cropPrimary: { backgroundColor: BRAND.green, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
+  cropPrimaryText: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
+  cropSecondary: { borderRadius: 14, paddingVertical: 13, alignItems: "center", borderWidth: 1, borderColor: "rgba(255,255,255,0.35)" },
+  cropSecondaryText: { color: "rgba(255,255,255,0.9)", fontSize: 15, fontFamily: "Inter_500Medium" },
   stagingBanner: { backgroundColor: "#F59E0B", alignItems: "center", justifyContent: "center", paddingVertical: 4 },
   stagingBannerText: { color: "#1F2937", fontSize: 12, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   safe: { flex: 1, backgroundColor: BRAND.offWhite },
