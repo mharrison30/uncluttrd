@@ -4184,7 +4184,7 @@ function CompanionWrapUp({ items, checkedCount, source, onResolve, onCancel }) {
         </TouchableOpacity>
         <View style={{ flex: 1 }} />
       </View>
-      <ScrollView contentContainerStyle={s.scrollContent}>
+      <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
         <View style={s.wrapUpCard}>
           {/* Celebration renders first, always, regardless of source or how
               many items are pending - the win comes before the ask. "Nice
@@ -10433,7 +10433,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     return (
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="dark-content" />
-        <ScrollView contentContainerStyle={[s.scrollContent, { alignItems: "center" }]}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={[s.scrollContent, { alignItems: "center" }]}>
           <View style={s.paywallHeader}>
             <View style={{ alignItems: "center", marginBottom: 12 }}><DrawerIcon size={80} dark={false} /></View>
             <Text style={s.paywallTitle}>Go Unlimited</Text>
@@ -10640,7 +10640,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <X size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           <Text style={[s.sectionLabel, { marginTop: 8 }]}>MENU</Text>
 
           {[
@@ -10719,7 +10719,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </Text>
           </View>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           {/* Explains the situation once, at the top, rather than on every
               card. These sessions predate Rooms and Areas - the user did
               nothing wrong, and the copy says so plainly. */}
@@ -10884,7 +10884,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           {rooms.length === 0 ? (
             <View style={{ alignItems: "center", paddingTop: 60 }}>
               <Text style={{ fontSize: 48, marginBottom: 16 }}>📋</Text>
@@ -11051,7 +11051,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           >
             <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>← My Rooms</Text>
           </TouchableOpacity>
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             <Text style={{ fontSize: 14, color: "#64748B" }}>This room could no longer be found.</Text>
           </ScrollView>
         </SafeAreaView>
@@ -11233,7 +11233,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         >
           <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>← My Rooms</Text>
         </TouchableOpacity>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           {roomDetailLoading && roomDetailPlans.length === 0 ? (
             <View style={{ alignItems: "center", paddingTop: 60 }}>
               <ActivityIndicator size="small" color={BRAND.green} />
@@ -11518,7 +11518,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           <View style={s.faqIntro}>
             <Text style={s.faqIntroText}>Have a question? Tap any topic below. If you still need help, email us at <Text style={{ color: BRAND.green }}>hello@uncluttrd.app</Text></Text>
           </View>
@@ -11688,7 +11688,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={[s.scrollContent, { paddingBottom: 140 }]}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={[s.scrollContent, { paddingBottom: 140 }]}>
           {stillLoadingPlans && (
             <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 12 }}>Loading...</Text>
           )}
@@ -11770,6 +11770,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             fields sit above a Load button, and without persistTaps the first
             tap on that button is swallowed dismissing the keyboard. */}
         <ScrollView
+          style={s.screenScroll}
           contentContainerStyle={s.scrollContent}
           automaticallyAdjustKeyboardInsets
           keyboardShouldPersistTaps="handled"
@@ -11888,7 +11889,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
           </TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           <View style={s.accountCard}>
             <View style={s.accountAvatar}>
               <Text style={s.accountAvatarText}>{user.displayName?.charAt(0)?.toUpperCase() || "?"}</Text>
@@ -12108,7 +12109,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <AreaConfirmationHeader title="Choose a saved Area" />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             {existingAreas.map((area) => (
               <TouchableOpacity key={area.id} disabled={areaConfirmationSaving} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12 }} onPress={() => completeAreaConfirmation({ kind: "picked", areaId: area.id })}>
                 {area.latestPhotoUrl || area.originalPhotoUrl ? (
@@ -12136,7 +12137,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <AreaConfirmationHeader title="We couldn't check your saved Areas right now." />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 16 }}>Choose an existing Area, or continue with a new one.</Text>
             {existingAreas.map((area) => (
               <TouchableOpacity key={area.id} disabled={areaConfirmationSaving} style={{ backgroundColor: "white", borderRadius: 12, borderWidth: 1, borderColor: "#E6E9EE", padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12 }} onPress={() => completeAreaConfirmation({ kind: "picked", areaId: area.id })}>
@@ -12165,7 +12166,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <AreaConfirmationHeader title="Have we worked on this area before?" />
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           {candidates.map((area) => (
             <EvidenceCardForAreaCandidate
               key={area.id}
@@ -12297,7 +12298,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title="Choose a Room" />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             {knownRooms.length === 0 && (
               <Text style={{ fontSize: 13, color: "#64748B", marginBottom: 12 }}>You don't have any saved Rooms yet.</Text>
             )}
@@ -12322,7 +12323,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title={isParentFlavor ? "What's the Room called?" : "Enter a Room name"} />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             <TextInput
               style={s.renameSheetInput}
               value={roomFreeformInput}
@@ -12354,7 +12355,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title={`Is this in your ${routing.candidate.displayName}?`} />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             <EvidenceCardForCandidate
               candidate={routing.candidate}
               confirmLabel={`Yes, this is my ${routing.candidate.displayName}`}
@@ -12376,7 +12377,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title="Have we organized this room before?" />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             {routing.candidates.map((candidate) => (
               <EvidenceCardForCandidate
                 key={candidate.canonicalSpaceId}
@@ -12407,7 +12408,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title={headerTitle} />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             {routing.outcome === "b3" && (
               <Text style={{ fontSize: 14, color: "#64748B", marginBottom: 14 }}>Is it its own room, or part of an existing room?</Text>
             )}
@@ -12458,7 +12459,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         <SafeAreaView style={s.safe}>
           <StatusBar barStyle="light-content" />
           <RoomConfirmationHeader title="We couldn't check your saved Rooms right now." />
-          <ScrollView contentContainerStyle={s.scrollContent}>
+          <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
             <Text style={{ fontSize: 14, color: BRAND.slate, marginBottom: 16 }}>Choose an existing Room or continue with a new one.</Text>
             {knownRooms.length > 0 && (
               <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={() => openRoomPicker("failed-secondary")}>
@@ -12479,7 +12480,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       <SafeAreaView style={s.safe}>
         <StatusBar barStyle="light-content" />
         <RoomConfirmationHeader title={`We think this is your ${pendingParsed?.suggestedRoomName || "room"}. Is that right?`} />
-        <ScrollView contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} contentContainerStyle={s.scrollContent}>
           <TouchableOpacity style={[s.startOverBtn, { marginTop: 0, backgroundColor: BRAND.green, borderWidth: 0 }]} onPress={onAcceptSuggestedRoom} disabled={roomConfirmationSaving}>
             <Text style={[s.startOverText, { color: "white" }]}>{`Yes, create "${pendingParsed?.suggestedRoomName || ""}"`}</Text>
           </TouchableOpacity>
@@ -12539,7 +12540,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             </Text>
           </TouchableOpacity>
         )}
-        <ScrollView ref={resultsScrollRef} contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} ref={resultsScrollRef} contentContainerStyle={s.scrollContent}>
           <View style={s.resTop}>
             <View style={{ flex: 1 }}>
               {/* Room/area hierarchy fix (2026-08-07): the Room's actual
@@ -13373,7 +13374,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             <Text style={{ fontSize: 13, fontFamily: "Inter_600SemiBold", color: BRAND.green }} numberOfLines={1}>{companionBackLabel}</Text>
           </TouchableOpacity>
         )}
-        <ScrollView ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
+        <ScrollView style={s.screenScroll} ref={companionScrollRef} contentContainerStyle={s.scrollContent}>
           {!showCompletedSummary && (
             companionStage === "batch-active" ? (
               // Only the checklist stage genuinely needs items to render -
@@ -13476,6 +13477,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           this screen, and keyboardShouldPersistTaps in particular affects
           every button here, not just text entry. */}
       <ScrollView
+        style={s.screenScroll}
         ref={homeScrollRef}
         contentContainerStyle={s.scrollContent}
         automaticallyAdjustKeyboardInsets
@@ -14076,7 +14078,19 @@ const s = StyleSheet.create({
   stagingBanner: { backgroundColor: "#F59E0B", alignItems: "center", justifyContent: "center", paddingVertical: 4 },
   stagingBannerText: { color: "#1F2937", fontSize: 12, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   safe: { flex: 1, backgroundColor: BRAND.offWhite },
-  scrollContent: { padding: 20, paddingBottom: 80 },
+  // flexGrow:1 is the load-bearing part. Without it a screen whose content is
+  // shorter than the viewport has a contentSize SMALLER than its frame, and the
+  // scroll view happily drags that content up into empty space. iOS defaults
+  // alwaysBounceVertical to true for vertical scroll views, so the gesture is
+  // always available even when there is nothing to scroll. With flexGrow the
+  // content container is at least the height of the viewport, so there is no
+  // empty region to scroll into. It never shrinks taller content.
+  scrollContent: { padding: 20, paddingBottom: 80, flexGrow: 1 },
+  // Every screen-level ScrollView gets this. A ScrollView with no flex inside a
+  // flex:1 parent sizes itself to its CONTENT rather than to the remaining
+  // viewport, which is what makes flexGrow above meaningless on its own - the
+  // two only work as a pair.
+  screenScroll: { flex: 1 },
   hdr: { backgroundColor: BRAND.navy, borderBottomWidth: 0, paddingTop: 22, paddingBottom: 18, paddingHorizontal: 20, flexDirection: "row", alignItems: "center", gap: 12 },
   hdrMark: { width: 58, height: 58, backgroundColor: "transparent", alignItems: "center", justifyContent: "center" },
   hdrMarkText: { color: "white", fontSize: 22, fontFamily: "Inter_700Bold" },
