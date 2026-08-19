@@ -9403,11 +9403,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   };
   const handleDeleteSession = (plan) => {
     Alert.alert(
-      "Delete this organizing session?",
-      // A session is a leaf - nothing cascades from it - so the body says only
-      // what recovery is available. Claiming it "removes organizing history"
-      // overstated the blast radius of deleting one session.
-      "You can restore it from Recently Deleted within 30 days.",
+      DELETE_CONFIRM.session().title,
+      DELETE_CONFIRM.session().body,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -9850,24 +9847,70 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // (existing !retired filter, no new filtering code) - navigate back
   // there rather than leave the user on a Room Detail screen for a Room
   // that no longer resolves.
-  const handleDeleteRoom = (room) => {
+  // Reached two ways now: the "Delete Room" button at the bottom of Room
+  // Detail (no swipe row to close, so swipeableMethods is undefined), and a
+  // left-swipe on a Room row in My Rooms. The optional-chaining on
+  // swipeableMethods is what lets one handler serve both without the button
+  // path needing a fake object.
+  const handleDeleteRoom = (room, swipeableMethods) => {
+    const copy = DELETE_CONFIRM.room(room.displayName);
     Alert.alert(
-      `Delete ${room.displayName}?`,
-      // Names the CASCADE explicitly. The previous wording ("this room and
-      // all its organizing history") never told the user that every Area
-      // inside the Room goes with it - the part they cannot infer, and the
-      // part they would most regret. Deleting a Room is the widest
-      // destructive action in the app.
-      "This will also delete all areas and organizing sessions inside it. You can restore it from Recently Deleted within 30 days.",
+      copy.title,
+      copy.body,
       [
-        { text: "Cancel", style: "cancel" },
+        // Cancel returns the row to rest. Nothing is written.
+        { text: "Cancel", style: "cancel", onPress: () => swipeableMethods?.close() },
         {
           text: "Delete", style: "destructive", onPress: async () => {
+            // Close the swipe row FIRST and let its own animation finish
+            // before the Room leaves `rooms` - otherwise the list yanks a
+            // still-open row out from under itself. Same 300ms the Area
+            // path uses, so the two feel identical.
+            swipeableMethods?.close();
             try {
+              if (swipeableMethods) await new Promise((resolve) => setTimeout(resolve, 300));
               await softDeleteRoom(user.uid, room.id);
               setRooms((prev) => prev.filter((r) => r.id !== room.id));
+              // No-ops when the swipe came from My Rooms (already there);
+              // load-bearing when the button was tapped inside Room Detail,
+              // which must not stay open on a Room that no longer exists.
               setRoomDetailRoomId(null);
               setShowHistory(true);
+            } catch (e) {
+              Alert.alert("Couldn't delete", e.message);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // Per-visit delete, for the Earlier Organizing Visits rows. Deliberately
+  // NOT handleDeleteSession: that one is owned by the classify sheet and
+  // drives classifyInFlightRef / setClassifyText / closeClassify, none of
+  // which exist on Room Detail. Calling it from here would set sheet state
+  // for a sheet that is not open, and - the real bug - would never remove the
+  // row, because it patches recovery state rather than roomDetailPlans.
+  //
+  // The plan is FILTERED OUT rather than patched to retired:true, because
+  // the Room Detail loader excludes retired plans entirely. Filtering is what
+  // a reload would produce; patching would leave a row visiblePlans still
+  // shows, since that filter keys on retired AREAS, not on the plan's own flag.
+  const handleDeleteVisit = (plan, swipeableMethods) => {
+    const copy = DELETE_CONFIRM.session();
+    Alert.alert(
+      copy.title,
+      copy.body,
+      [
+        { text: "Cancel", style: "cancel", onPress: () => swipeableMethods?.close() },
+        {
+          text: "Delete", style: "destructive", onPress: async () => {
+            swipeableMethods?.close();
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 300));
+              await softDeletePlan(user.uid, plan.id);
+              setRoomDetailPlans((prev) => prev.filter((p) => p.id !== plan.id));
+              refreshRecovery();
             } catch (e) {
               Alert.alert("Couldn't delete", e.message);
             }
@@ -9890,11 +9933,8 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // patched locally, so the rest of the screen doesn't need a full re-fetch.
   const handleDeleteArea = (area, swipeableMethods) => {
     Alert.alert(
-      `Delete ${area.displayName}?`,
-      // Says "organizing sessions" rather than "organizing history": history
-      // is vague about what is actually destroyed, sessions are the thing
-      // the user recognises and has worked on.
-      "This will also delete all organizing sessions for this area. You can restore it from Recently Deleted within 30 days.",
+      DELETE_CONFIRM.area(area.displayName).title,
+      DELETE_CONFIRM.area(area.displayName).body,
       [
         // Cancel: close the swipe row back to its resting state, Area
         // stays exactly as it was - no delete call at all.
@@ -10811,7 +10851,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               // only its child changes.
               const RoomIcon = getRoomTypeIcon(room.displayName);
               return (
-                <TouchableOpacity key={room.id} style={s.historyItem} onPress={() => openRoomDetail(room)}>
+                {/* Swipe-to-delete on the Rooms list. The row keeps tap-to-open;
+                    the gesture only reveals the trash action, and handleDeleteRoom
+                    owns the confirmation. marginBottom moves to the swipe container
+                    so the red panel sits flush with the card. */}
+                <SwipeToDeleteRow
+                  key={room.id}
+                  accessibilityLabel={`Delete ${room.displayName}`}
+                  onDelete={(swipeableMethods) => handleDeleteRoom(room, swipeableMethods)}
+                >
+                <TouchableOpacity style={[s.historyItem, { marginBottom: 0 }]} onPress={() => openRoomDetail(room)}>
                   <View style={s.historyIcon}>
                     <RoomIcon size={30} color={BRAND.green} strokeWidth={2.25} />
                   </View>
@@ -10829,6 +10878,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   </Text>
                   </View>
                 </TouchableOpacity>
+                </SwipeToDeleteRow>
               );
             })
           )}
@@ -11058,7 +11108,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // (the whole row), not split between a content area and a separate
     // icon anymore.
     const renderVisitRow = (plan) => (
-      <TouchableOpacity key={plan.id} style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12 }]} onPress={() => openRoomDetailVisit(plan)}>
+      {/* Same gesture and component as Room and Area rows. Deleting a
+          visit routes through handleDeleteVisit, which confirms first and
+          removes the plan from roomDetailPlans so the row disappears. */}
+      <SwipeToDeleteRow
+        key={plan.id}
+        accessibilityLabel="Delete this organizing session"
+        onDelete={(swipeableMethods) => handleDeleteVisit(plan, swipeableMethods)}
+      >
+      <TouchableOpacity style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 0 }]} onPress={() => openRoomDetailVisit(plan)}>
         {plan.photoUrl ? (
           <Image source={{ uri: plan.photoUrl }} style={s.historyIcon} resizeMode="cover" />
         ) : (
@@ -11074,6 +11132,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <Text style={s.historyOverview} numberOfLines={1}>{visitStatusLabel(plan)}</Text>
         </View>
       </TouchableOpacity>
+      </SwipeToDeleteRow>
     );
 
     return (
@@ -11232,21 +11291,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                     // handleDeleteArea uses to close this exact row cleanly
                     // on both confirm and cancel.
                     return (
-                      <Swipeable
+                      <SwipeToDeleteRow
                         key={area.id}
-                        containerStyle={s.areaSwipeContainer}
-                        overshootRight={false}
-                        rightThreshold={40}
-                        renderRightActions={(progress, translation, swipeableMethods) => (
-                          <TouchableOpacity
-                            style={s.areaSwipeDeleteAction}
-                            onPress={() => handleDeleteArea(area, swipeableMethods)}
-                            accessibilityLabel={`Delete ${area.displayName}`}
-                            accessibilityRole="button"
-                          >
-                            <Trash2 size={22} color="white" strokeWidth={2.25} />
-                          </TouchableOpacity>
-                        )}
+                        accessibilityLabel={`Delete ${area.displayName}`}
+                        onDelete={(swipeableMethods) => handleDeleteArea(area, swipeableMethods)}
                       >
                         <View style={[s.historyItem, { flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 0 }]}>
                           {resolvedPhotoUrl ? (
@@ -11290,7 +11338,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                             </View>
                           </View>
                         </View>
-                      </Swipeable>
+                      </SwipeToDeleteRow>
                     );
                   })}
                 </>
@@ -13858,6 +13906,71 @@ export default function App() {
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// DELETE CONFIRMATION COPY
+// ---------------------------------------------------------------------------
+// One source for all three levels. Previously each handler carried its own
+// string, which is how they drifted: two understated the cascade and one
+// overstated it. Keeping them here means a Room row swiped from My Rooms and
+// the "Delete Room" button inside Room Detail cannot ever say different things
+// about the same action.
+//
+// Each body answers the only two questions that matter at the moment of a
+// destructive tap: what ELSE goes with this, and can I get it back.
+const DELETE_CONFIRM = {
+  room: (name) => ({
+    title: `Delete ${name}?`,
+    body: "This will also delete all areas and organizing sessions inside it. You can restore it from Recently Deleted within 30 days.",
+  }),
+  area: (name) => ({
+    title: `Delete ${name}?`,
+    body: "This will also delete all organizing sessions for this area. You can restore it from Recently Deleted within 30 days.",
+  }),
+  // A session is a leaf - nothing cascades from it - so this says only what
+  // recovery is available, and does not claim to remove "organizing history".
+  session: () => ({
+    title: "Delete this organizing session?",
+    body: "You can restore it from Recently Deleted within 30 days.",
+  }),
+};
+
+// ---------------------------------------------------------------------------
+// SWIPE-TO-DELETE ROW
+// ---------------------------------------------------------------------------
+// The single gesture implementation, used at all three levels - Room rows in
+// My Rooms, Area rows in Room Detail, and visit rows in Earlier Organizing
+// Visits. Sharing the component is what makes "all three feel identical"
+// structurally true rather than three copies that happen to match today.
+//
+// The gesture only REVEALS. Nothing here writes: onDelete is handed the row's
+// own swipeableMethods and is expected to open a confirmation dialog, which
+// owns the actual delete. That separation is the whole safety model.
+//
+// overshootRight={false} plus a fixed 80px action is deliberate - without it
+// Swipeable measures a flex-stretched action and lets the row slide fully off
+// screen with no visible way back (see the areaSwipeDeleteAction fix).
+function SwipeToDeleteRow({ onDelete, accessibilityLabel, children }) {
+  return (
+    <Swipeable
+      containerStyle={s.areaSwipeContainer}
+      overshootRight={false}
+      rightThreshold={40}
+      renderRightActions={(progress, translation, swipeableMethods) => (
+        <TouchableOpacity
+          style={s.areaSwipeDeleteAction}
+          onPress={() => onDelete(swipeableMethods)}
+          accessibilityLabel={accessibilityLabel}
+          accessibilityRole="button"
+        >
+          <Trash2 size={22} color="white" strokeWidth={2.25} />
+        </TouchableOpacity>
+      )}
+    >
+      {children}
+    </Swipeable>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // FREE ROOMS HEADER INDICATOR
