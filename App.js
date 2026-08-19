@@ -4720,6 +4720,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   const mergeRoomsInFlightRef = useRef(false);
   const vizInFlightRef = useRef(new Set());
   const deleteAccountInFlightRef = useRef(false);
+  // Processing-feedback guards (audit MEDIUM items). Each is an independent
+  // ref so two different flows can never block one another, and each flips
+  // SYNCHRONOUSLY before the first await - a state flag cannot do this job,
+  // because setState does not apply until re-render and two taps in the same
+  // frame would both read the old value and both proceed.
+  const pdfInFlightRef = useRef(false);
+  const restoreSessionInFlightRef = useRef(false);
+  const restoreRoomInFlightRef = useRef(false);
+  const restoreAreaInFlightRef = useRef(false);
+  const roomRenameInFlightRef = useRef(false);
+  // One overlay text for all of the above. null = no overlay. Reuses the
+  // existing ProcessingOverlay rather than introducing a second visual
+  // system; only the label differs per flow.
+  const [asyncBusyText, setAsyncBusyText] = useState(null);
   // Area Identity, Phase B (AreaRecognitionPhaseBImplementation.md): the
   // Area-level analog of roomConfirmation above - null when not showing,
   // else { status: "MATCH_FOUND" | "RECOGNITION_FAILED", candidates,
@@ -7613,7 +7627,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
   const generatePDF = async () => {
     if (!results) return;
+    if (pdfInFlightRef.current) return;
+    pdfInFlightRef.current = true;
+    setAsyncBusyText("Preparing your plan...");
     try {
+      // Yield one tick so the overlay actually PAINTS before the expensive
+      // synchronous HTML construction below begins. Without this the string
+      // building blocks the JS thread through the render that would have
+      // shown the spinner, and the user sees nothing until the share sheet
+      // appears - which is the exact complaint this fixes.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const tierColors = {
         budget: { color: "#1E9E52", bg: "#E6F7EE", border: "#A8DDBF" },
         mid: { color: "#1463D8", bg: "#EBF1FC", border: "#A8C0EE" },
@@ -7842,6 +7865,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       await Sharing.shareAsync(uri, { mimeType: "application/pdf", UTI: "com.adobe.pdf" });
     } catch (e) {
       Alert.alert("PDF Error", e.message);
+    } finally {
+      // Always released, including the approach-PDF path's early `return`
+      // inside the try - finally runs on that too.
+      pdfInFlightRef.current = false;
+      setAsyncBusyText(null);
     }
   };
 
@@ -8719,6 +8747,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // parallel implementations of it.
   const performRoomRename = async () => {
     const trimmed = renameSheetValue.trim();
+    // Synchronous re-entry guard. The existing renameSheetSaving state still
+    // drives the visible "Saving..." label; it cannot also serve as the
+    // guard, because two submits in the same frame both read it as false.
+    if (roomRenameInFlightRef.current) return;
+    roomRenameInFlightRef.current = true;
     setRenameSheetSaving(true);
     try {
       await renameSpace(user.uid, renamePlanTarget.id, trimmed);
@@ -8747,6 +8780,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       Alert.alert("Couldn't rename", e.message);
     } finally {
       setRenameSheetSaving(false);
+      roomRenameInFlightRef.current = false;
     }
   };
 
@@ -9434,11 +9468,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     );
   };
   const handleRestoreSession = async (plan) => {
+    if (restoreSessionInFlightRef.current) return;
+    restoreSessionInFlightRef.current = true;
+    setAsyncBusyText("Restoring...");
     try {
       await restorePlan(user.uid, plan.id);
       refreshRecovery();
     } catch (e) {
       Alert.alert("Couldn't restore", e.message);
+    } finally {
+      restoreSessionInFlightRef.current = false;
+      setAsyncBusyText(null);
     }
   };
   // Completed / remaining counts, using the same unresolved definition
@@ -9980,6 +10020,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // change visitCount/lastOrganizedAt/etc. from whatever they were at
   // delete time, so this refetches the Space doc instead.
   const handleRestoreRoom = async (room) => {
+    if (restoreRoomInFlightRef.current) return;
+    restoreRoomInFlightRef.current = true;
+    setAsyncBusyText("Restoring...");
     try {
       await restoreRoom(user.uid, room.id);
       const spaceSnap = await getDoc(doc(db, "users", user.uid, "spaces", room.id));
@@ -9988,6 +10031,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       setRooms((prev) => [restored, ...prev.filter((r) => r.id !== room.id)]);
     } catch (e) {
       Alert.alert("Couldn't restore", e.message);
+    } finally {
+      restoreRoomInFlightRef.current = false;
+      setAsyncBusyText(null);
     }
   };
   // Restore Area (Phase C2, Recently Deleted Areas' own action, Room
@@ -9997,11 +10043,17 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // visitCount here, so a full re-fetch isn't needed for the Area to
   // reappear.
   const handleRestoreArea = async (area) => {
+    if (restoreAreaInFlightRef.current) return;
+    restoreAreaInFlightRef.current = true;
+    setAsyncBusyText("Restoring...");
     try {
       await restoreArea(user.uid, roomDetailRoomId, area.id);
       setRoomDetailAreas((prev) => prev.map((a) => (a.id === area.id ? { ...a, retired: false, deletedAt: undefined, deletedWithRoomId: undefined } : a)));
     } catch (e) {
       Alert.alert("Couldn't restore", e.message);
+    } finally {
+      restoreAreaInFlightRef.current = false;
+      setAsyncBusyText(null);
     }
   };
   // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1a): the one flow
@@ -10785,6 +10837,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             Results and Room Detail. Rendered last so it layers above the
             classify sheets if one happens to be open. */}
         {renderPhotoZoomModal()}
+        {/* Shared processing overlay for PDF export and the restore actions.
+            Same component every other flow uses. */}
+        {asyncBusyText && <ProcessingOverlay text={asyncBusyText} />}
       </SafeAreaView>
     );
   }
@@ -10948,6 +11003,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           )}
         </ScrollView>
         {renderRenameSheet()}
+        {/* Shared processing overlay for PDF export and the restore actions.
+            Same component every other flow uses. */}
+        {asyncBusyText && <ProcessingOverlay text={asyncBusyText} />}
       </SafeAreaView>
     );
   }
@@ -11422,6 +11480,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         {renderAreaActionsSheet()}
         {renderRoomPicker()}
         {renderMoveConfirm()}
+        {/* Shared processing overlay for PDF export and the restore actions.
+            Same component every other flow uses. */}
+        {asyncBusyText && <ProcessingOverlay text={asyncBusyText} />}
       </SafeAreaView>
     );
   }
@@ -13209,6 +13270,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
         </ScrollView>
         {renderRenameSheet()}
+        {/* Shared processing overlay for PDF export and the restore actions.
+            Same component every other flow uses. */}
+        {asyncBusyText && <ProcessingOverlay text={asyncBusyText} />}
       </SafeAreaView>
     );
   }
