@@ -7741,9 +7741,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           /* Without the two color-adjust declarations above, WebKit drops every
              background fill when it prints - the navy masthead, the green rule
              and all the cards render as bare text on white. */
-          @page { size: letter; margin: 0.55in 0.6in 0.75in 0.6in; }
+          /* Zero page margin so the masthead bleeds to the paper edge. The
+             content inset lives on .page instead, which also means the footer -
+             it sits inside .page - lines up with the body rather than running
+             out to the trim. The bottom inset works per page rather than only
+             on the last one because every page here is its own .page block,
+             ended by the forced break on the next masthead. */
+          @page { size: letter; margin: 0; }
           html, body { font-family:Inter,Arial,Helvetica,sans-serif; background:#FFFFFF; color:#0F2A52; }
-          .page { padding:0; }
+          .page { padding:0 0.75in 0.75in 0.75in; }
 
           /* KEEP-TOGETHER. A section that splits across a page boundary is the
              defect this exists to prevent - most visibly the summary, which
@@ -7755,7 +7761,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           p, li, div { orphans:3; widows:3; }
 
           /* ---- masthead ---- */
-          .brandbar { background:#0F2A52; padding:11px 18px; display:flex;
+          /* Full width by virtue of the zero page margin; the 0.75in side
+             padding lines the wordmark up with the body text below it. */
+          .brandbar { background:#0F2A52; padding:14px 0.75in; display:flex;
                       align-items:center; justify-content:space-between; }
           .brandrule { height:4px; background:#3FC77A; margin-bottom:18px; }
           .brandleft { display:flex; align-items:center; }
@@ -7893,7 +7901,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // that the title repeats the opening words of the description, which
         // reads far better than a severed clause.
         const stepTitle = (text) => {
-          const t = String(text || "").trim().replace(/s+/g, " ");
+          // /\s+/, NOT /s+/. The backslash was lost when this block was
+          // written, so the "collapse whitespace" pass was deleting every
+          // letter s in the guidance text instead - "Replace mismatched
+          // bottles" printed as "Replace mi matched bottle ".
+          const t = String(text || "").trim().replace(/\s+/g, " ");
           const title = shortDisplayReason(t) || t;
           return { title: title.replace(/[.,;:]+$/, ""), body: t };
         };
