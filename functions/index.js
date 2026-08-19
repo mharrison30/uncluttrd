@@ -911,14 +911,6 @@ async function syncProStatus(uid) {
     return null;
   }
   const activeData = await activeResp.json();
-  // TEMP DEBUG: logging the raw response verbatim during initial
-  // testing. The V2 API's exact entitlement_id format (developer-facing
-  // identifier like "Uncluttrd Pro" vs. an internal RevenueCat id) was
-  // not fully confirmed from docs alone - this line exists so the first
-  // real webhook delivery makes that unambiguous instead of silently
-  // producing isPro: false forever if the comparison below is wrong.
-  // Remove once confirmed correct against a real event.
-  console.log(`[revenueCatWebhook] active_entitlements raw response for uid=${uid}: ${JSON.stringify(activeData)}`);
   const isPro = (activeData.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
 
   // Read before write, reused for both the Pro-transition check below and
