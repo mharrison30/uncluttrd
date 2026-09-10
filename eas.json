@@ -15,6 +15,7 @@
     "preview": {
       "distribution": "internal",
       "channel": "staging",
+      "environment": "preview",
       "ios": {
         "autoIncrement": true
       },

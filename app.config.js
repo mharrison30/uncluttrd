@@ -14,6 +14,34 @@ const PRODUCTION_VERSION = "2.0.0";
 // long note on `version` below. Bumping this orphans the installed staging app.
 const STAGING_VERSION = "2.0.0";
 
+// THE FIREBASE CLIENT CONFIG FILES ARE NOT IN THE REPOSITORY, so EAS Build
+// cannot receive them the way it receives source.
+//
+// They are gitignored (2063a6e, deliberately - play-service-account.json in
+// that same list is a real private key). EAS Build's project upload excludes
+// ignored files, so from that commit onward every native build failed with
+// EAS_BUILD_MISSING_GOOGLE_SERVICES_PLIST_ERROR / _JSON_ERROR. Before it they
+// were merely untracked, which the upload does include - which is why this
+// stayed invisible until a build was attempted.
+//
+// EAS file environment variables are the supported answer: the file is stored
+// by EAS with secret visibility, materialised on the builder, and its PATH is
+// handed to the build in these variables. Scoped per environment, so the
+// preview environment holds the staging pair and production will hold the
+// production pair.
+//
+// The fallback is what keeps local work unchanged. Nothing in a local `expo
+// start`, `expo config` or fingerprint run sets these, so the literal paths
+// below are used exactly as before, still chosen by APP_ENV. The environment
+// variable only ever wins on an EAS builder, where the local file does not
+// exist at all.
+const GOOGLE_SERVICES_IOS =
+  process.env.GOOGLE_SERVICES_IOS ||
+  (IS_PRODUCTION ? "./GoogleService-Info.plist" : "./GoogleService-Info.staging.plist");
+const GOOGLE_SERVICES_ANDROID =
+  process.env.GOOGLE_SERVICES_ANDROID ||
+  (IS_PRODUCTION ? "./google-services.json" : "./google-services.staging.json");
+
 module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
@@ -58,7 +86,7 @@ module.exports = {
     ios: {
       supportsTablet: true,
       bundleIdentifier: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
-      googleServicesFile: IS_PRODUCTION ? "./GoogleService-Info.plist" : "./GoogleService-Info.staging.plist",
+      googleServicesFile: GOOGLE_SERVICES_IOS,
       infoPlist: {
         NSCameraUsageDescription: "Uncluttrd needs camera access to photograph your space.",
         NSPhotoLibraryUsageDescription: "Uncluttrd needs your photos to analyze your space.",
@@ -71,7 +99,7 @@ module.exports = {
         backgroundColor: "#0F2A52",
       },
       package: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
-      googleServicesFile: IS_PRODUCTION ? "./google-services.json" : "./google-services.staging.json",
+      googleServicesFile: GOOGLE_SERVICES_ANDROID,
       permissions: ["android.permission.CAMERA"],
     },
     // EAS Update (DecisionLog.md 2026-07-18). Fingerprint policy, not
