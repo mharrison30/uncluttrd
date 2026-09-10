@@ -51,9 +51,17 @@ import * as Updates from "expo-updates";
 // slider itself was deleted, DecisionLog.md 2026-07-18) - remove once the
 // remaining photo-pipeline/staging-isolation investigations are closed too.
 const debugLogBuffer = [];
+// The buffer is unbounded otherwise, and a long session (hundreds of companion
+// rounds, each logging photo-pipeline lines) grows it until the app is
+// restarted. 200 entries is enough to cover the recent activity a shared log is
+// ever read for, and the oldest are the least useful once that many have
+// accumulated. console.log is untouched - only what is RETAINED is capped, so
+// an attached Metro session still sees every line.
+const DEBUG_LOG_MAX_ENTRIES = 200;
 function dlog(line) {
   console.log(line);
   debugLogBuffer.push(`${new Date().toISOString()} ${line}`);
+  while (debugLogBuffer.length > DEBUG_LOG_MAX_ENTRIES) debugLogBuffer.shift();
 }
 // Lightweight, non-cryptographic fingerprint for a base64 image payload -
 // cheap enough to run on a ~150-400KB string without hashing every byte.
@@ -4942,14 +4950,31 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   useEffect(() => {
     batchItemsRef.current = batchItems;
   }, [batchItems]);
-  const debugShareLog = async () => {
-    const text = debugLogBuffer.length ? debugLogBuffer.join("\n\n") : "(no debug log entries captured yet)";
-    try {
-      await Share.share({ message: text, title: "Companion Debug Log" });
-    } catch (e) {
-      Alert.alert("Share failed", e.message);
-    }
-  };
+  // STAGING ONLY, and `undefined` rather than a no-op function on production.
+  //
+  // The accumulated log carries plan IDs, photo URIs and update IDs, so the
+  // share affordance must not exist in a customer's hands. All eleven headers
+  // pass this straight to `onLongPress`, so leaving it undefined REMOVES the
+  // long-press handler at every one of them from a single place - a no-op
+  // function would instead leave eleven live gestures that silently do
+  // nothing, which is the harder thing to reason about later. With no
+  // `onLongPress`, a long press on the header logo simply behaves like a tap
+  // and goes home.
+  //
+  // Gated here rather than at each header for the same reason: one decision,
+  // one place, and no way to add a twelfth header that forgets it. The
+  // separate staging-only share button on the confirmation screen is already
+  // inside its own `IS_STAGING &&` block, so it is unaffected either way.
+  const debugShareLog = IS_STAGING
+    ? async () => {
+        const text = debugLogBuffer.length ? debugLogBuffer.join("\n\n") : "(no debug log entries captured yet)";
+        try {
+          await Share.share({ message: text, title: "Companion Debug Log" });
+        } catch (e) {
+          Alert.alert("Share failed", e.message);
+        }
+      }
+    : undefined;
   // Fires once per mount so a shared log can be matched to the exact OTA
   // update that produced it - confirms whether a given device is actually
   // running the code containing a given fix, not a stale/cached bundle.
