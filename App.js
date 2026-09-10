@@ -14455,6 +14455,53 @@ const CROP_MIN = 72;      // smallest crop side, in fitted-image px - two
 const CROP_HANDLE = 34;   // corner touch target
 const CROP_EDGE = 30;     // edge-midpoint touch target
 const CROP_ZOOM_MAX = 4;
+const CROP_BAR = 4;       // bracket arm thickness - the old border width, kept
+
+// HOW MANY FINGERS ARE DOWN, without assuming the event says so.
+//
+// Android does not always populate `nativeEvent.touches`; on the New
+// Architecture a move can arrive with it undefined or empty. Reading `.length`
+// off it directly is what broke this screen: the stage's CAPTURE-phase handler
+// runs on every move BEFORE any child can be granted the responder, so the
+// TypeError took the whole gesture down with it - the frame did not move, no
+// handle resized, nothing was interactive at all. iOS always populates it,
+// which is why it survived every iOS test and failed on the first Android
+// build of this screen.
+//
+// `gestureState.numberActiveTouches` is PanResponder's own count and is the
+// fallback when the raw list is missing.
+const touchCountOf = (e, g) => {
+  const fromEvent = e?.nativeEvent?.touches?.length ?? 0;
+  return fromEvent || g?.numberActiveTouches || 0;
+};
+/** The raw touch list, or an empty array. Only pinch needs the coordinates. */
+const touchesOf = (e) => {
+  const t = e?.nativeEvent?.touches;
+  return Array.isArray(t) ? t : [];
+};
+
+// Which bracket arms each grab point draws. These are also its OUTWARD sides,
+// which is what makes the hit slop below safe.
+const HANDLE_ARMS = {
+  tl: ["top", "left"], tr: ["top", "right"],
+  bl: ["bottom", "left"], br: ["bottom", "right"],
+  top: ["top"], bottom: ["bottom"], left: ["left"], right: ["right"],
+};
+// SLOP OUTWARD ONLY, never toward a neighbouring handle.
+//
+// At CROP_MIN two 34pt corner handles leave a 4pt gap, so a uniform slop of any
+// useful size would make adjacent targets overlap and the wrong one would win a
+// press. Growing only on the sides the bracket already points at cannot collide
+// with anything: the neighbour is always along an axis this handle does not
+// grow on. At the image edge the extra area falls outside the parent and is
+// simply clipped, which costs nothing.
+const CROP_SLOP = 8;
+const HANDLE_SLOP = Object.fromEntries(
+  Object.entries(HANDLE_ARMS).map(([key, sides]) => [
+    key,
+    { top: 0, bottom: 0, left: 0, right: 0, ...Object.fromEntries(sides.map((side) => [side, CROP_SLOP])) },
+  ])
+);
 
 function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   const win = Dimensions.get("window");
@@ -14545,17 +14592,24 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   // it, while one-finger gestures are never captured and reach them normally.
   const stageResponder = useRef(PanResponder.create({
     onStartShouldSetPanResponderCapture: () => false,
-    onMoveShouldSetPanResponderCapture: (e) => e.nativeEvent.touches.length === 2,
+    // ONE FINGER IS NEVER CAPTURED, so a drag on the frame or on a handle
+    // always reaches the child that was pressed. When the count cannot be
+    // determined at all this reads 0, which is not 2 - so an event Android
+    // fails to describe leaves the child's gesture alone rather than taking it.
+    onMoveShouldSetPanResponderCapture: (e, g) => touchCountOf(e, g) === 2,
     onPanResponderGrant: (e) => {
-      const t = e.nativeEvent.touches;
+      const t = touchesOf(e);
       if (t.length !== 2) { pinchRef.current = null; return; }
       const dx = t[0].pageX - t[1].pageX;
       const dy = t[0].pageY - t[1].pageY;
       pinchRef.current = { d: Math.max(1, Math.hypot(dx, dy)), z: zoomRef.current };
     },
     onPanResponderMove: (e, g) => {
-      const t = e.nativeEvent.touches;
+      const t = touchesOf(e);
       const p = pinchRef.current;
+      // Pinch needs the two coordinates, not just the count, so a platform that
+      // does not supply them simply does not zoom. It never throws, and it
+      // never disturbs the one-finger gestures that matter most here.
       if (!p || t.length < 2) return;
       const dx = t[0].pageX - t[1].pageX;
       const dy = t[0].pageY - t[1].pageY;
@@ -14627,13 +14681,36 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
     }
   };
 
-  const handle = (key, left, top, style, size) => (
+  // BRACKET ARMS AS FILLED VIEWS, not partial borders.
+  //
+  // The handles used to be transparent boxes whose whole appearance came from
+  // two of their four border sides. Android painted none of them - and the one
+  // element on this screen that DID render, the crop frame, is also the only
+  // one with a UNIFORM border. The symptom split the component exactly along
+  // that line. A filled view is unambiguous on both renderers.
+  //
+  // The look is deliberately unchanged: same colour, same 4pt thickness, same
+  // L-shaped bracket - not a solid square. The arms are pointerEvents="none"
+  // so the press still belongs to the container holding the pan handlers.
+  const arm = (side, size) => {
+    const box =
+      side === "top" ? { left: 0, top: 0, width: size, height: CROP_BAR }
+      : side === "bottom" ? { left: 0, bottom: 0, width: size, height: CROP_BAR }
+      : side === "left" ? { left: 0, top: 0, width: CROP_BAR, height: size }
+      : { right: 0, top: 0, width: CROP_BAR, height: size };
+    return <View key={side} pointerEvents="none" style={[s.cropBar, box]} />;
+  };
+
+  const handle = (key, left, top, size) => (
     <View
       key={key}
-      style={[s.cropHandle, { width: size, height: size }, style, { left, top }]}
+      style={[s.cropHandle, { width: size, height: size, left, top }]}
+      hitSlop={HANDLE_SLOP[key]}
       {...cornersRef.current[key].panHandlers}
       accessibilityLabel={"Resize crop, " + key}
-    />
+    >
+      {HANDLE_ARMS[key].map((side) => arm(side, size))}
+    </View>
   );
   // Edge midpoints are hidden while a side is too short to hold one without
   // covering its own corners - at that size the corners do the same job.
@@ -14671,14 +14748,14 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
             {/* Handles sit INSIDE the frame corners. Half-overlapping the edge
                 reads better but Android clips anything outside the parent, and
                 a handle you cannot press at the image edge is worse. */}
-            {handle("tl", rect.x, rect.y, s.cropHandleTL, CROP_HANDLE)}
-            {handle("tr", rect.x + rect.w - CROP_HANDLE, rect.y, s.cropHandleTR, CROP_HANDLE)}
-            {handle("bl", rect.x, rect.y + rect.h - CROP_HANDLE, s.cropHandleBL, CROP_HANDLE)}
-            {handle("br", rect.x + rect.w - CROP_HANDLE, rect.y + rect.h - CROP_HANDLE, s.cropHandleBR, CROP_HANDLE)}
-            {roomAcross && handle("top", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y, s.cropEdgeTop, CROP_EDGE)}
-            {roomAcross && handle("bottom", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y + rect.h - CROP_EDGE, s.cropEdgeBottom, CROP_EDGE)}
-            {roomDown && handle("left", rect.x, rect.y + rect.h / 2 - CROP_EDGE / 2, s.cropEdgeLeft, CROP_EDGE)}
-            {roomDown && handle("right", rect.x + rect.w - CROP_EDGE, rect.y + rect.h / 2 - CROP_EDGE / 2, s.cropEdgeRight, CROP_EDGE)}
+            {handle("tl", rect.x, rect.y, CROP_HANDLE)}
+            {handle("tr", rect.x + rect.w - CROP_HANDLE, rect.y, CROP_HANDLE)}
+            {handle("bl", rect.x, rect.y + rect.h - CROP_HANDLE, CROP_HANDLE)}
+            {handle("br", rect.x + rect.w - CROP_HANDLE, rect.y + rect.h - CROP_HANDLE, CROP_HANDLE)}
+            {roomAcross && handle("top", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y, CROP_EDGE)}
+            {roomAcross && handle("bottom", rect.x + rect.w / 2 - CROP_EDGE / 2, rect.y + rect.h - CROP_EDGE, CROP_EDGE)}
+            {roomDown && handle("left", rect.x, rect.y + rect.h / 2 - CROP_EDGE / 2, CROP_EDGE)}
+            {roomDown && handle("right", rect.x + rect.w - CROP_EDGE, rect.y + rect.h / 2 - CROP_EDGE / 2, CROP_EDGE)}
           </View>
         </View>
 
@@ -14724,15 +14801,10 @@ const s = StyleSheet.create({
   cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden" },
   cropDim: { position: "absolute", backgroundColor: "rgba(0,0,0,0.55)" },
   cropFrame: { position: "absolute", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.95)" },
-  cropHandle: { position: "absolute", borderColor: BRAND.green },
-  cropHandleTL: { borderLeftWidth: 4, borderTopWidth: 4 },
-  cropHandleTR: { borderRightWidth: 4, borderTopWidth: 4 },
-  cropHandleBL: { borderLeftWidth: 4, borderBottomWidth: 4 },
-  cropHandleBR: { borderRightWidth: 4, borderBottomWidth: 4 },
-  cropEdgeTop: { borderTopWidth: 4 },
-  cropEdgeBottom: { borderBottomWidth: 4 },
-  cropEdgeLeft: { borderLeftWidth: 4 },
-  cropEdgeRight: { borderRightWidth: 4 },
+  // The touch target only. Its appearance is the filled arms inside it - see
+  // the bracket note in PhotoCropScreen for why this is not a border any more.
+  cropHandle: { position: "absolute" },
+  cropBar: { position: "absolute", backgroundColor: BRAND.green },
   cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, gap: 10 },
   cropPrimary: { backgroundColor: BRAND.green, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
   cropPrimaryText: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
