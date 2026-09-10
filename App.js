@@ -14526,38 +14526,6 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   const startRef = useRef(null);
   const pinchRef = useRef(null);
 
-  /* ===================== TEMPORARY DIAGNOSTIC INSTRUMENTATION =====================
-   * THROWAWAY. Remove with the whole block once the Android behaviour is known.
-   *
-   * WHY IT WRITES TO A REF AND PAINTS ON A TIMER, rather than calling setState
-   * from the callbacks: `onStartShouldSetPanResponder` runs DURING touch
-   * dispatch, and a setState there re-renders the very view being negotiated
-   * over, which can lose the responder. Instrumentation that changes the
-   * behaviour it is measuring would be worse than none - and the code-level
-   * diagnosis has already been wrong twice. The ref records synchronously and
-   * exactly; a 150ms interval copies it to state for painting, entirely
-   * outside the gesture.
-   */
-  const diagRef = useRef({ touch: "none", responder: "none", touches: 0, seq: 0 });
-  const [diag, setDiag] = useState(diagRef.current);
-  useEffect(() => {
-    const id = setInterval(() => setDiag({ ...diagRef.current }), 150);
-    return () => clearInterval(id);
-  }, []);
-  /** Every responder callback funnels through here: ref for the screen, dlog for the share. */
-  const note = (who, what, e, g) => {
-    const touches = touchCountOf(e, g);
-    const d = diagRef.current;
-    d.touch = what;
-    d.touches = touches;
-    d.seq += 1;
-    // "who has it" only changes on the callbacks that actually mean possession.
-    if (what === "grant") d.responder = who;
-    else if (what === "release" || what === "terminate") d.responder = "none";
-    dlog(`[CROP DIAG] ${who} ${what} touches=${touches} rect=${JSON.stringify(rectRef.current)}`);
-  };
-  /* =============================== END DIAGNOSTIC =============================== */
-
   const applyRect = (r) => {
     const w = Math.max(CROP_MIN, Math.min(r.w, fitW));
     const h = Math.max(CROP_MIN, Math.min(r.h, fitH));
@@ -14573,18 +14541,14 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   // Drag inside the frame moves it. Screen distance is divided by the zoom
   // factor because the frame's coordinates are in unzoomed stage pixels.
   const moveResponder = useRef(PanResponder.create({
-    onStartShouldSetPanResponder: (e, g) => { note("frame", "startShouldSet", e, g); return true; },
-    onMoveShouldSetPanResponder: (e, g) => { note("frame", "moveShouldSet", e, g); return true; },
-    onPanResponderGrant: (e, g) => { note("frame", "grant", e, g); startRef.current = rectRef.current; },
-    onPanResponderMove: (e, g) => {
-      note("frame", "move", e, g);
+    onStartShouldSetPanResponder: () => true,
+    onPanResponderGrant: () => { startRef.current = rectRef.current; },
+    onPanResponderMove: (_e, g) => {
       const a = startRef.current;
       if (!a) return;
       const k = zoomRef.current.k || 1;
       applyRect({ w: a.w, h: a.h, x: a.x + g.dx / k, y: a.y + g.dy / k });
     },
-    onPanResponderRelease: (e, g) => { note("frame", "release", e, g); },
-    onPanResponderTerminate: (e, g) => { note("frame", "terminate", e, g); },
   })).current;
 
   // One responder per grab point. cx/cy of 0 drags the left/top edge, which
@@ -14594,14 +14558,10 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   // edge down crops the ceiling without touching the sides.
   const cornersRef = useRef(null);
   if (!cornersRef.current) {
-    const mk = (name, cx, cy) => PanResponder.create({
-      onStartShouldSetPanResponder: (e, g) => { note(name, "startShouldSet", e, g); return true; },
-      onMoveShouldSetPanResponder: (e, g) => { note(name, "moveShouldSet", e, g); return true; },
-      onPanResponderRelease: (e, g) => { note(name, "release", e, g); },
-      onPanResponderTerminate: (e, g) => { note(name, "terminate", e, g); },
-      onPanResponderGrant: (e, g) => { note(name, "grant", e, g); startRef.current = rectRef.current; },
-      onPanResponderMove: (e, g) => {
-        note(name, "move", e, g);
+    const mk = (cx, cy) => PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => { startRef.current = rectRef.current; },
+      onPanResponderMove: (_e, g) => {
         const a = startRef.current;
         if (!a) return;
         const k = zoomRef.current.k || 1;
@@ -14622,9 +14582,8 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
       },
     });
     cornersRef.current = {
-      tl: mk("tl", 0, 0), tr: mk("tr", 1, 0), bl: mk("bl", 0, 1), br: mk("br", 1, 1),
-      top: mk("top", null, 0), bottom: mk("bottom", null, 1),
-      left: mk("left", 0, null), right: mk("right", 1, null),
+      tl: mk(0, 0), tr: mk(1, 0), bl: mk(0, 1), br: mk(1, 1),
+      top: mk(null, 0), bottom: mk(null, 1), left: mk(0, null), right: mk(1, null),
     };
   }
 
@@ -14632,20 +14591,13 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   // parent takes a two-finger gesture away from the frame and handles beneath
   // it, while one-finger gestures are never captured and reach them normally.
   const stageResponder = useRef(PanResponder.create({
-    onStartShouldSetPanResponderCapture: (e, g) => { note("stage", "startShouldSetCapture", e, g); return false; },
-    onStartShouldSetPanResponder: (e, g) => { note("stage", "startShouldSet", e, g); return false; },
-    onMoveShouldSetPanResponder: (e, g) => { note("stage", "moveShouldSet", e, g); return false; },
+    onStartShouldSetPanResponderCapture: () => false,
     // ONE FINGER IS NEVER CAPTURED, so a drag on the frame or on a handle
     // always reaches the child that was pressed. When the count cannot be
     // determined at all this reads 0, which is not 2 - so an event Android
     // fails to describe leaves the child's gesture alone rather than taking it.
-    onMoveShouldSetPanResponderCapture: (e, g) => {
-      const take = touchCountOf(e, g) === 2;
-      note("stage", take ? "moveShouldSetCapture=TAKE" : "moveShouldSetCapture", e, g);
-      return take;
-    },
-    onPanResponderGrant: (e, g) => {
-      note("stage", "grant", e, g);
+    onMoveShouldSetPanResponderCapture: (e, g) => touchCountOf(e, g) === 2,
+    onPanResponderGrant: (e) => {
       const t = touchesOf(e);
       if (t.length !== 2) { pinchRef.current = null; return; }
       const dx = t[0].pageX - t[1].pageX;
@@ -14653,7 +14605,6 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
       pinchRef.current = { d: Math.max(1, Math.hypot(dx, dy)), z: zoomRef.current };
     },
     onPanResponderMove: (e, g) => {
-      note("stage", "move", e, g);
       const t = touchesOf(e);
       const p = pinchRef.current;
       // Pinch needs the two coordinates, not just the count, so a platform that
@@ -14675,8 +14626,8 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
       zoomRef.current = z;
       setZoom(z);
     },
-    onPanResponderRelease: (e, g) => { note("stage", "release", e, g); pinchRef.current = null; },
-    onPanResponderTerminate: (e, g) => { note("stage", "terminate", e, g); pinchRef.current = null; },
+    onPanResponderRelease: () => { pinchRef.current = null; },
+    onPanResponderTerminate: () => { pinchRef.current = null; },
   })).current;
 
   // Now that this is a screen rather than a Modal it no longer gets
@@ -14753,7 +14704,7 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
   const handle = (key, left, top, size) => (
     <View
       key={key}
-      style={[s.cropHandle, s.cropHandleDiag, { width: size, height: size, left, top }]}
+      style={[s.cropHandle, { width: size, height: size, left, top }]}
       hitSlop={HANDLE_SLOP[key]}
       {...cornersRef.current[key].panHandlers}
       accessibilityLabel={"Resize crop, " + key}
@@ -14777,27 +14728,6 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
             <Text style={s.cropCancelText}>Reset</Text>
           </TouchableOpacity>
         </View>
-      {/* ===== TEMPORARY DIAGNOSTIC READOUT. Remove with the rest of the block. =====
-          Painted from `diag`, which a 150ms interval copies out of a ref - the
-          responder callbacks never call setState, so watching this cannot alter
-          what is being watched. RECT comes from render state on purpose: it is
-          the rectangle actually being drawn, so if it never changes while TOUCH
-          is moving, the gesture is arriving and the state is not following. */}
-      <View style={s.cropDiag}>
-        <Text style={s.cropDiagText}>TOUCH: {diag.touch}  (#{diag.seq})</Text>
-        <Text style={s.cropDiagText}>RESPONDER: {diag.responder}</Text>
-        <Text style={s.cropDiagText}>TOUCHES: {diag.touches}</Text>
-        <Text style={s.cropDiagText}>
-          RECT: {Math.round(rect.x)}, {Math.round(rect.y)}, {Math.round(rect.w)}, {Math.round(rect.h)}
-        </Text>
-        <Text style={s.cropDiagText}>STAGE: {Math.round(stageW)}, {Math.round(stageH)}</Text>
-        <Text style={s.cropDiagText}>
-          FIT: {Math.round(fitW)}, {Math.round(fitH)}   SRC: {srcW}x{srcH}
-        </Text>
-        <Text style={s.cropDiagText}>
-          EDGES RENDERED: across={String(roomAcross)} down={String(roomDown)}
-        </Text>
-      </View>
       <Text style={s.cropHint}>Drag the corners or edges to crop. Pinch with two fingers to zoom.</Text>
 
         <View style={[s.cropStage, { width: stageW, height: stageH }]} {...stageResponder.panHandlers}>
@@ -14868,25 +14798,13 @@ const s = StyleSheet.create({
   cropCancel: { padding: 10, minWidth: 72 },
   cropCancelText: { color: "rgba(255,255,255,0.85)", fontSize: 15, fontFamily: "Inter_500Medium" },
   cropHint: { color: "rgba(255,255,255,0.6)", fontSize: 12, textAlign: "center", paddingHorizontal: 24, marginTop: 2, marginBottom: 12 },
-  // TEMPORARY DIAGNOSTIC: bright red so the stage's real position and size are
-  // unmistakable on the device. Any red visible around the photo is stage that
-  // is NOT covered by the fitted image.
-  cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#FF0000" },
-  cropDiag: { width: "100%", paddingHorizontal: 12, paddingVertical: 6, backgroundColor: "#000" },
-  cropDiagText: { color: "#00FF00", fontSize: 11, lineHeight: 15 },
+  cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden" },
   cropDim: { position: "absolute", backgroundColor: "rgba(0,0,0,0.55)" },
   cropFrame: { position: "absolute", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.95)" },
   // The touch target only. Its appearance is the filled arms inside it - see
   // the bracket note in PhotoCropScreen for why this is not a border any more.
   cropHandle: { position: "absolute" },
-  // TEMPORARY DIAGNOSTIC: bright yellow, not brand green, so a handle that
-  // renders at all cannot be mistaken for anything else on the screen.
-  cropBar: { position: "absolute", backgroundColor: "#FFFF00" },
-  // TEMPORARY DIAGNOSTIC: a translucent yellow wash over the whole touch target,
-  // so the container is visible even if the arms somehow are not. If the wash
-  // shows and the arms do not, the fault is the arms; if neither shows, the
-  // handle View itself is not being laid out where we think it is.
-  cropHandleDiag: { backgroundColor: "rgba(255,255,0,0.35)" },
+  cropBar: { position: "absolute", backgroundColor: BRAND.green },
   cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, gap: 10 },
   cropPrimary: { backgroundColor: BRAND.green, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
   cropPrimaryText: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
