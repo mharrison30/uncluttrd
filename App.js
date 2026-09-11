@@ -14321,14 +14321,35 @@ export default function App() {
     // doesn't cover Room Detail.
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        {IS_STAGING && (
-          <SafeAreaView edges={["top"]} style={s.stagingBanner}>
-            <Text style={s.stagingBannerText}>STAGING</Text>
-          </SafeAreaView>
-        )}
         <View style={{ flex: 1 }}>
           <AppRoot />
         </View>
+        {/*
+          * AN OVERLAY, NOT A ROW. It used to be a normal-flow sibling ABOVE
+          * this view, which meant it removed its own height - the top safe-area
+          * inset plus its padding, 69-81pt on a notched phone - from every
+          * screen in the app. On the twenty-seven screens that scroll that was
+          * invisible; on the one that does not, PhotoCropScreen, it pushed
+          * "Use Original" off the bottom. Worse, it meant staging was a
+          * systematically shorter phone than production, so layout tested here
+          * was never quite the layout shipped.
+          *
+          * Rendered AFTER the content so it paints on top, absolutely
+          * positioned so it displaces nothing, and pointerEvents="none" so it
+          * cannot take a touch from whatever is beneath it.
+          *
+          * TOP-RIGHT, and deliberately: the header logo - whose long-press is
+          * the debug-log share - is top-LEFT on every screen that has one, so
+          * this cannot sit over it. `edges={["top"]}` pushes the pill below the
+          * status bar, into the 22pt of padding `s.hdr` leaves above its
+          * controls, so on a standard screen it overlaps nothing interactive
+          * at all.
+          */}
+        {IS_STAGING && (
+          <SafeAreaView edges={["top"]} pointerEvents="none" style={s.stagingBanner}>
+            <Text style={s.stagingBannerText}>STAGING</Text>
+          </SafeAreaView>
+        )}
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
@@ -14804,14 +14825,39 @@ const s = StyleSheet.create({
   // The touch target only. Its appearance is the filled arms inside it - see
   // the bracket note in PhotoCropScreen for why this is not a border any more.
   cropHandle: { position: "absolute" },
-  cropBar: { position: "absolute", backgroundColor: BRAND.green },
-  cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, gap: 10 },
+  // WHITE WITH A DARK EDGE, because a crop handle has to read on ANY photo.
+  // Brand green disappeared against foliage, dark wood and shadow; plain white
+  // disappears against a bright wall or a white worktop. The 1pt dark outline
+  // is what makes the white legible on the light end without making the handle
+  // heavier - it sits INSIDE the 4pt arm, so the arm's footprint, the 34/30pt
+  // touch targets and every coordinate stay exactly as they were.
+  cropBar: {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.9)",
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.3)",
+  },
+  // paddingBottom is ON TOP of whatever bottom inset the SafeAreaView supplies,
+  // not a replacement for it. On a home-indicator phone that reads 34 + 16; on
+  // an SE-class device, where the bottom inset is ZERO, it is the only thing
+  // standing between "Use Original" and the bottom edge of the screen - which
+  // it was flush against before, in production as well as staging.
+  cropActions: { width: "100%", paddingHorizontal: 20, paddingTop: 18, paddingBottom: 16, gap: 10 },
   cropPrimary: { backgroundColor: BRAND.green, borderRadius: 14, paddingVertical: 15, alignItems: "center" },
   cropPrimaryText: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
   cropSecondary: { borderRadius: 14, paddingVertical: 13, alignItems: "center", borderWidth: 1, borderColor: "rgba(255,255,255,0.35)" },
   cropSecondaryText: { color: "rgba(255,255,255,0.9)", fontSize: 15, fontFamily: "Inter_500Medium" },
-  stagingBanner: { backgroundColor: "#F59E0B", alignItems: "center", justifyContent: "center", paddingVertical: 4 },
-  stagingBannerText: { color: "#1F2937", fontSize: 12, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
+  // Absolute, so it occupies no layout height anywhere. The amber lives on the
+  // TEXT rather than this container, which keeps the marker a compact pill
+  // instead of a full-width bar - unobtrusive, still unmistakable, and narrow
+  // enough that anchoring it right keeps it clear of the header logo.
+  stagingBanner: { position: "absolute", top: 0, right: 12, alignItems: "flex-end" },
+  stagingBannerText: {
+    color: "#1F2937", backgroundColor: "#F59E0B",
+    fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 1.2,
+    paddingHorizontal: 8, paddingVertical: 2,
+    borderRadius: 4, overflow: "hidden",
+  },
   safe: { flex: 1, backgroundColor: BRAND.offWhite },
   // flexGrow:1 is the load-bearing part. Without it a screen whose content is
   // shorter than the viewport has a contentSize SMALLER than its frame, and the
@@ -15052,8 +15098,6 @@ const s = StyleSheet.create({
   mergeSecondaryBtnText: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.slate, textAlign: "center" },
   mergeAllCaughtUpTitle: { fontSize: 18, fontFamily: "Inter_700Bold", color: BRAND.ink, marginBottom: 6 },
   mergeAllCaughtUpSub: { fontSize: 13, fontFamily: "Inter_400Regular", color: BRAND.slate, textAlign: "center", marginBottom: 20 },
-  // TEMPORARY DIAGNOSTIC - remove alongside the debug badges in the
-  // render chain once the View Full Plan -> Results bug is confirmed fixed.
   mergeRenameLink: { flexDirection: "row", alignItems: "center", gap: 4, marginBottom: 6, alignSelf: "flex-start" },
   mergeRenameLinkText: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: BRAND.green },
   renameSheetBackdrop: { flex: 1, backgroundColor: "rgba(15,42,82,0.5)", justifyContent: "flex-end" },
