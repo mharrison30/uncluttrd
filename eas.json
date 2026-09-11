@@ -19,6 +19,9 @@
       "ios": {
         "autoIncrement": true
       },
+      "android": {
+        "autoIncrement": true
+      },
       "env": {
         "APP_ENV": "staging"
       }
@@ -26,6 +29,7 @@
     "production": {
       "autoIncrement": true,
       "channel": "production",
+      "environment": "production",
       "env": {
         "APP_ENV": "production"
       }
