@@ -12870,7 +12870,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} />
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -13720,7 +13720,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </TouchableOpacity>
           <TouchableOpacity onPress={goHome} style={{ flex: 1 }} accessibilityLabel="Go to home" accessibilityRole="button">
             <Text style={s.hdrName}>Uncluttrd{isPro ? <Text style={{ color: BRAND.green, fontFamily: "Inter_600SemiBold" }}> Pro</Text> : ""}</Text>
-            <Text style={s.hdrTag}>{isPro ? "Pro member" : `${Math.max(0, 3 - (analyses || 0))} Free Rooms Remaining`}</Text>
+            <FreeRoomsBadge isPro={isPro} analyses={analyses} />
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setShowMenu(true)} style={{ padding: 8 }} accessibilityLabel="Open menu" accessibilityRole="button">
             <Menu size={22} color="rgba(255,255,255,0.8)" strokeWidth={2.25} />
@@ -14429,6 +14429,13 @@ function SwipeToDeleteRow({ onDelete, accessibilityLabel, children }) {
 // drifted: Home was given the bordered badge treatment and the other three were
 // left as plain `hdrTag` text at rgba(255,255,255,0.6). Same string, same data,
 // two different designs depending on which screen you were on.
+//
+// "Four call sites" was aspirational when this was written: the component was
+// extracted and then wired into Home and the drawer only, leaving Results and
+// Companion on their original inline `hdrTag` line. The drift the extraction
+// was meant to end therefore survived it, in the same two places, for the same
+// reason - the inline copy is what renders, not the component. Both are now
+// converted, so the count is real and there is no inline copy left to drift.
 //
 // Declared at module level rather than inside MainApp on purpose. A component
 // defined inside a render function is a NEW component type on every render, so
