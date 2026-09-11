@@ -14749,7 +14749,9 @@ function PhotoCropScreen({ source, onCancel, onUseOriginal, onConfirm }) {
             <Text style={s.cropCancelText}>Reset</Text>
           </TouchableOpacity>
         </View>
-      <Text style={s.cropHint}>Drag the corners or edges to crop. Pinch with two fingers to zoom.</Text>
+      {/* Shortened to hold ONE line at the larger size. Both affordances are
+          still named - the pinch is not discoverable otherwise. */}
+      <Text style={s.cropHint}>Drag the corners or edges. Pinch to zoom.</Text>
 
         <View style={[s.cropStage, { width: stageW, height: stageH }]} {...stageResponder.panHandlers}>
           <View style={{
@@ -14818,22 +14820,32 @@ const s = StyleSheet.create({
   cropTitle: { color: "white", fontSize: 16, fontFamily: "Inter_600SemiBold" },
   cropCancel: { padding: 10, minWidth: 72 },
   cropCancelText: { color: "rgba(255,255,255,0.85)", fontSize: 15, fontFamily: "Inter_500Medium" },
-  cropHint: { color: "rgba(255,255,255,0.6)", fontSize: 12, textAlign: "center", paddingHorizontal: 24, marginTop: 2, marginBottom: 12 },
+  // 12pt at 60% white on navy was legible on iOS and barely there on Android,
+  // which renders small type more thinly. 14pt at 80% is comfortably readable
+  // on both without becoming a headline - this is an instruction you read once.
+  cropHint: { color: "rgba(255,255,255,0.8)", fontSize: 14, textAlign: "center", paddingHorizontal: 24, marginTop: 2, marginBottom: 12 },
   cropStage: { alignItems: "center", justifyContent: "center", overflow: "hidden" },
   cropDim: { position: "absolute", backgroundColor: "rgba(0,0,0,0.55)" },
   cropFrame: { position: "absolute", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.95)" },
   // The touch target only. Its appearance is the filled arms inside it - see
   // the bracket note in PhotoCropScreen for why this is not a border any more.
   cropHandle: { position: "absolute" },
-  // WHITE WITH A DARK EDGE, because a crop handle has to read on ANY photo.
-  // Brand green disappeared against foliage, dark wood and shadow; plain white
-  // disappears against a bright wall or a white worktop. The 1pt dark outline
-  // is what makes the white legible on the light end without making the handle
-  // heavier - it sits INSIDE the 4pt arm, so the arm's footprint, the 34/30pt
-  // touch targets and every coordinate stay exactly as they were.
+  // THE FRAME IS THE BOUNDARY, THE ARMS ARE THE GRAB POINTS, and they are
+  // coloured to say so: a white line marks where the crop edge is, green marks
+  // what you can actually pull. `greenOnDark` rather than BRAND.green because
+  // that token exists for exactly this situation - it is the on-navy green,
+  // documented at 5.17:1, and this stage is navy.
+  //
+  // The 1pt dark outline is what keeps green legible on green: foliage, lawns
+  // and painted walls are the one background a green handle would otherwise
+  // vanish into. It sits INSIDE the 4pt arm, so the arm's footprint, the
+  // 34/30pt touch targets and every coordinate are unchanged - colour only.
+  //
+  // NO Platform BRANCHING, here or anywhere in PhotoCropScreen. Both platforms
+  // read these same three values.
   cropBar: {
     position: "absolute",
-    backgroundColor: "rgba(255,255,255,0.9)",
+    backgroundColor: BRAND.greenOnDark,
     borderWidth: 1,
     borderColor: "rgba(0,0,0,0.3)",
   },
