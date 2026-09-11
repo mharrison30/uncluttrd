@@ -9,7 +9,7 @@ const APP_ENV = process.env.APP_ENV || "staging";
 const IS_PRODUCTION = APP_ENV === "production";
 
 // Tracks the store release. Bump for every App Store / Play submission.
-const PRODUCTION_VERSION = "2.0.0";
+const PRODUCTION_VERSION = "2.1.0";
 // PINNED to whichever staging binary is installed on the test device - see the
 // long note on `version` below. Bumping this orphans the installed staging app.
 const STAGING_VERSION = "2.0.0";
