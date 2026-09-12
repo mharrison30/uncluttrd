@@ -10833,6 +10833,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           </View>
 
           {/* Plan selector */}
+          {/*
+            THESE PRICES ARE HARDCODED USD DISPLAY STRINGS, not live ones.
+            getOfferings() is called in the CTA handler below, at purchase
+            time - nothing fetches RevenueCat packages for this render - so
+            there is no localized price string available here to show. What
+            the customer is actually charged comes from App Store Connect and
+            Google Play Console; these strings only have to agree with them.
+            CHANGE THEM TOGETHER OR THE PAYWALL LIES.
+
+            Save 30% is arithmetic, not marketing: 2.99 x 12 = 35.88, minus
+            24.99 leaves 10.89, which is 30.35% of 35.88. The per-month
+            equivalent below it is 24.99 / 12 = 2.0825, shown as 2.08.
+          */}
           <Text style={[s.sectionLabel, { alignSelf: "flex-start" }]}>CHOOSE BILLING</Text>
           <View style={{ flexDirection: "row", gap: 10, width: "100%", marginBottom: 20 }}>
             <TouchableOpacity
@@ -10840,15 +10853,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               onPress={() => setPaywallPlan("monthly")}>
               <View style={{ height: 22, marginBottom: 6 }} />
               <Text style={s.planOptionLabel}>Monthly</Text>
-              <Text style={s.planOptionPrice}>$4.99/mo</Text>
+              <Text style={s.planOptionPrice}>$2.99/mo</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[s.planOption, paywallPlan === "yearly" && s.planOptionSelYearly]}
               onPress={() => setPaywallPlan("yearly")}>
-              <View style={s.planSaveBadge}><Text style={s.planSaveText}>Save 33%</Text></View>
+              <View style={s.planSaveBadge}><Text style={s.planSaveText}>Save 30%</Text></View>
               <Text style={s.planOptionLabel}>Yearly</Text>
-              <Text style={s.planOptionPrice}>$39.99/yr</Text>
-              <Text style={[s.planOptionSub, { color: BRAND.green }]}>$3.33/mo</Text>
+              <Text style={s.planOptionPrice}>$24.99/yr</Text>
+              <Text style={[s.planOptionSub, { color: BRAND.green }]}>$2.08/mo</Text>
             </TouchableOpacity>
           </View>
 
@@ -10911,7 +10924,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                 <Text style={s.paywallCtaText}>Processing...</Text>
               </View>
             ) : (
-              <Text style={s.paywallCtaText}>{paywallPlan === "yearly" ? "Go Unlimited - $39.99/year" : "Go Unlimited - $4.99/month"}</Text>
+              <Text style={s.paywallCtaText}>{paywallPlan === "yearly" ? "Go Unlimited - $24.99/year" : "Go Unlimited - $2.99/month"}</Text>
             )}
           </TouchableOpacity>
           <Text style={s.paywallCtaSub}>Cancel anytime • Managed by {Platform.OS === "android" ? "Google Play" : "Apple"}</Text>
@@ -11850,7 +11863,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and offers three different approaches to transforming it, each with its own guidance, first-session checklist, and product recommendations." },
       { q: "What can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
       { q: "What's the difference between the three approaches?", a: "They differ in ambition, not just price. Keep It Simple makes the space work and look noticeably better using what you already own. Polished & Practical solves the organization problems and finishes the space with a few targeted purchases. Elevated Finish is a full transformation, addressing every problem and every opportunity the photo shows. Open any approach to see its full guidance, checklist, and recommendations before you choose." },
-      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($4.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
+      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($2.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
       { q: "What is the AI Visualization feature?", a: "After getting your organization plan, open any approach and tap 'See the transformation' to preview the result: an AI-created image showing what your space could look like under that approach. Each approach has its own visualization, so you can generate one, several, or all three and compare them. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
       { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. Pro members also get unlimited continuing guidance on each room and can share a branded PDF." },

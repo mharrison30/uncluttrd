@@ -239,7 +239,7 @@ These are not niche problems. They are universal problems that have never been s
 
 **Free tier:** 3 organization analyses per month. Text-based plan sharing. The hook.
 
-**Uncluttrd Pro:** $4.99/month or $39.99/year.
+**Uncluttrd Pro:** $2.99/month or $24.99/year.
 - Unlimited analyses
 - AI visualizations
 - Full plan history

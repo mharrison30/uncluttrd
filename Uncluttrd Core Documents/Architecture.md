@@ -59,7 +59,7 @@ The sharpest of these as a filter: "Does this strengthen the ownership graph?" I
 | Auth | Firebase Auth | Email/password, AsyncStorage persistence |
 | Database | Firestore | NoSQL, household-scoped |
 | File storage | Firebase Storage | Photos, thumbnails, visualizations |
-| Subscriptions | RevenueCat | Monthly $4.99, Yearly $39.99, bundle `com.mharrison.uncluttrd` |
+| Subscriptions | RevenueCat | Monthly $2.99, Yearly $24.99, bundle `com.mharrison.uncluttrd` |
 | AI (analysis) | Claude (Anthropic) | Photo to organization plan |
 | AI (visualization) | gpt-image-2 (OpenAI) | Before/after space visualization, Pro only |
 | Secrets | Firebase Cloud Functions | API keys never live in the app binary. See section 7. |
