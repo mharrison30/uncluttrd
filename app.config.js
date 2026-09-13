@@ -42,6 +42,52 @@ const GOOGLE_SERVICES_ANDROID =
   process.env.GOOGLE_SERVICES_ANDROID ||
   (IS_PRODUCTION ? "./google-services.json" : "./google-services.staging.json");
 
+// META (FACEBOOK) SDK - PRODUCTION ONLY, AND STRUCTURALLY SO.
+//
+// Both values are Meta client-side identifiers that ship inside every PRODUCTION
+// binary by design (Info.plist / AndroidManifest). Neither is the App Secret, which
+// must never appear in this repository.
+//
+// Staging gets NO Meta configuration at all - not a disabled flag, no App ID.
+// A staging binary therefore cannot address the production Meta app, so no
+// runtime mistake can mix staging events into production attribution. The
+// library is still linked into staging (autolinking is not per-environment),
+// which is why App.js only ever requires it behind IS_PRODUCTION: on Android
+// the SDK's init provider fails harmlessly without an App ID, and a native
+// module that is never touched from JS is never initialised.
+const META_APP_ID = "1578860883970731";
+const META_CLIENT_TOKEN = "483c6de488418214fbe2021c1f1b123c";
+
+// Production-only plugins. Kept out of staging so staging carries no Meta
+// identity and no ATT prompt text or AD_ID permission of its own.
+const PRODUCTION_ONLY_PLUGINS = IS_PRODUCTION
+  ? [
+      [
+        "react-native-fbsdk-next",
+        {
+          appID: META_APP_ID,
+          clientToken: META_CLIENT_TOKEN,
+          displayName: "Uncluttrd",
+          scheme: `fb${META_APP_ID}`,
+          // Automatic logging is what records App Install and App Launch -
+          // react-native-fbsdk-next 13.4.3 exposes no activateApp() to call.
+          autoLogAppEventsEnabled: true,
+          advertiserIDCollectionEnabled: true,
+          // Android initialises from its manifest provider at process start;
+          // iOS has no auto-init and is started from App.js.
+          isAutoInitEnabled: true,
+        },
+      ],
+      [
+        "expo-tracking-transparency",
+        {
+          userTrackingPermission:
+            "This identifier will be used to measure the effectiveness of advertising and provide more relevant ads.",
+        },
+      ],
+    ]
+  : [];
+
 module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
@@ -101,6 +147,11 @@ module.exports = {
       package: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
       googleServicesFile: GOOGLE_SERVICES_ANDROID,
       permissions: ["android.permission.CAMERA"],
+      // The app captures still photos only (image-picker, mediaTypes images)
+      // and never records audio or video. expo-camera's own library manifest
+      // declares RECORD_AUDIO, so turning its plugin option off is not enough:
+      // this emits tools:node="remove" to strip the merged declaration.
+      blockedPermissions: ["android.permission.RECORD_AUDIO"],
     },
     // EAS Update (DecisionLog.md 2026-07-18). Fingerprint policy, not
     // appVersion - runtimeVersion is derived from the actual resolved
@@ -124,12 +175,15 @@ module.exports = {
         {
           photosPermission: "Uncluttrd needs your photos to analyze your space.",
           cameraPermission: "Uncluttrd needs camera access to photograph your space.",
+          microphonePermission: false,
         },
       ],
       [
         "expo-camera",
         {
           cameraPermission: "Uncluttrd needs camera access to photograph your space.",
+          microphonePermission: false,
+          recordAudioAndroid: false,
         },
       ],
       "expo-font",
@@ -144,6 +198,7 @@ module.exports = {
           },
         },
       ],
+      ...PRODUCTION_ONLY_PLUGINS,
     ],
     extra: {
       eas: {

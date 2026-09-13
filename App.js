@@ -3,7 +3,7 @@ import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
   TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated,
-  PanResponder
+  PanResponder, AppState
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
@@ -14069,6 +14069,55 @@ async function checkForAppUpdate() {
   }
 }
 
+// ── META SDK AND APP TRACKING TRANSPARENCY ───────────────────
+// PRODUCTION ONLY. Staging binaries carry no Meta App ID (see app.config.js),
+// and these packages are required lazily INSIDE the IS_PRODUCTION guard rather
+// than imported at the top of the file. That is load-bearing, not style:
+// evaluating react-native-fbsdk-next touches every one of its native modules,
+// and on Android FBAppEventsLoggerModule.initialize() calls
+// AppEventsLogger.newLogger(), which throws when the SDK was never initialised -
+// exactly the state of a staging build with no App ID. A static import would
+// crash staging on launch.
+//
+// No activateApp() call: react-native-fbsdk-next 13.4.3 does not expose one.
+// App Install and App Launch are logged by Meta's automatic event logging
+// (autoLogAppEventsEnabled in app.config.js) once the SDK is initialised.
+// No custom or conversion events are logged here.
+function startMetaSdk() {
+  if (!IS_PRODUCTION) return;
+  try {
+    require("react-native-fbsdk-next").Settings.initializeSDK();
+  } catch (e) {
+    console.log("Meta SDK init error:", e.message);
+  }
+}
+
+// Asks once, on iOS production, and never blocks or gates the SDK above - the
+// SDK is initialised whatever the answer. FBSDK v17+ on iOS 17+ reads
+// ATTrackingManager's status itself, so there is no setAdvertiserTrackingEnabled
+// call to make afterwards (Meta documents that setter as unused there).
+//
+// Waits for the app to be ACTIVE first: iOS does not present the prompt to an
+// app that is not yet active, and the request would resolve without asking.
+async function requestTrackingPermissionIfNeeded() {
+  if (!IS_PRODUCTION || Platform.OS !== "ios") return;
+  try {
+    const tracking = require("expo-tracking-transparency");
+    const { status } = await tracking.getTrackingPermissionsAsync();
+    if (status !== "undetermined") return;
+    if (AppState.currentState !== "active") {
+      await new Promise((resolve) => {
+        const sub = AppState.addEventListener("change", (next) => {
+          if (next === "active") { sub.remove(); resolve(); }
+        });
+      });
+    }
+    await tracking.requestTrackingPermissionsAsync();
+  } catch (e) {
+    console.log("Tracking permission error:", e.message);
+  }
+}
+
 // ── ROOT ─────────────────────────────────────────────────────
 function AppRoot() {
   const [user, setUser] = useState(null);
@@ -14146,6 +14195,14 @@ function AppRoot() {
     logEvent(getAnalytics(), "analytics_test")
       .then(() => console.log("analytics_test event sent"))
       .catch(e => console.log("Analytics test event error:", e.message));
+  }, []);
+
+  useEffect(() => {
+    // Meta SDK first, then the ATT prompt, neither waiting on the other - see
+    // startMetaSdk and requestTrackingPermissionIfNeeded. Both are no-ops
+    // outside production.
+    startMetaSdk();
+    requestTrackingPermissionIfNeeded();
   }, []);
 
   useEffect(() => {
