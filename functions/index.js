@@ -15,7 +15,10 @@ const admin = require("firebase-admin");
 // ./shared here are generated copies, kept in sync automatically by
 // scripts/prepareFunctionsDeploy.js (see that script's own header for the
 // full reasoning; it runs as this functions codebase's predeploy hook).
-const { hardDeleteAreaAdmin, hardDeleteRoomAdmin, hardDeleteAccountAdmin } = require("./scripts/runSpaceMigration");
+const { hardDeleteAreaAdmin, hardDeleteRoomAdmin, hardDeleteAccountAdmin, deleteStoragePrefixesAdmin } = require("./scripts/runSpaceMigration");
+// Hand-authored, NOT a generated copy - lives beside index.js, outside the
+// scripts/ and shared/ directories prepareFunctionsDeploy.js overwrites.
+const { purgeExpiredDeletedPlanStorage } = require("./planStoragePurge");
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -1233,6 +1236,7 @@ async function runExpiredDeletionSweep(db, { retentionDays = 30 } = {}) {
   const summary = {
     rooms: { discovered: 0, deleted: 0, alreadyGone: 0, failed: 0 },
     areas: { discovered: 0, deleted: 0, alreadyGone: 0, skippedParentDeleted: 0, failed: 0 },
+    plans: null,
   };
   const fmtDeletedAt = (ts) => (ts && typeof ts.toDate === "function" ? ts.toDate().toISOString() : String(ts));
 
@@ -1309,6 +1313,28 @@ async function runExpiredDeletionSweep(db, { retentionDays = 30 } = {}) {
       summary.areas.failed++;
       console.error(`[cleanupExpiredDeletions] Area uid=${uid} roomId=${roomId} areaId=${areaId} deletedAt=${fmtDeletedAt(deletedAt)} outcome=failed error=${e.message}`);
     }
+  }
+
+  // Pass 3: Storage of individually soft-deleted plans past the same window.
+  // Runs after the Room/Area passes, which hard-delete their own plans
+  // outright, so nothing here overlaps them. See planStoragePurge.js for why
+  // this purges files and keeps the plan document as a tombstone.
+  //
+  // Isolated in its own try: a failure here (for example the plans.deletedAt
+  // collection-group index not yet deployed) must not hide the Room/Area
+  // results above, and the pass simply retries tomorrow.
+  try {
+    summary.plans = await purgeExpiredDeletedPlanStorage({
+      db,
+      bucket: admin.storage().bucket(),
+      deleteStoragePrefixes: deleteStoragePrefixesAdmin,
+      fieldValue: admin.firestore.FieldValue,
+      timestampFromMillis: (ms) => admin.firestore.Timestamp.fromMillis(ms),
+      retentionDays,
+    });
+  } catch (e) {
+    summary.plans = { failed: "pass", error: e.message };
+    console.error(`[cleanupExpiredDeletions] Plan storage pass failed: ${e.message}`);
   }
 
   console.log(`[cleanupExpiredDeletions] SUMMARY: ${JSON.stringify(summary)}`);
