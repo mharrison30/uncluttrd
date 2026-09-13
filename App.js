@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
-  TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal, Dimensions, BackHandler, Animated,
+  TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal as NativeModal, Dimensions, BackHandler, Animated,
   PanResponder, AppState
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -6924,6 +6924,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setRoomConfirmation(null);
     setResults(confirmedPlan);
     logEvent(getAnalytics(), "plan_completed");
+    requestTrackingPermissionWhenClear();
 
     // Approach Selection: same "usable content produced" analytics proxy as
     // finalizeAnalysisResult's identical check - see its own comment.
@@ -7140,6 +7141,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       || returningContext.spaceName || parsed.spaceName || null;
     setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: resolvedRoomName, analysisStage: "summary-ready" });
     logEvent(getAnalytics(), "plan_completed");
+    requestTrackingPermissionWhenClear();
     setOrganizeAgainContext(null);
 
     const resolvedAreaId = (areaIntent && areaIntent.kind !== "new") ? areaIntent.areaId : null;
@@ -7631,6 +7633,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         || returningContext.spaceName || parsed.spaceName || null;
       setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: returningRoomName, analysisStage: "summary-ready" });
       logEvent(getAnalytics(), "plan_completed");
+      requestTrackingPermissionWhenClear();
       // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
       // returning visit (organizeAgainContext set) creates its plan via
       // createReturningPlan - the Step 1 wrapper around this exact same
@@ -14050,20 +14053,25 @@ async function checkForAppUpdate() {
       ? IOS_APP_STORE_URL
       : `https://play.google.com/store/apps/details?id=${androidPackage}`;
 
-    Alert.alert(
-      "Update Available",
-      data.updateMessage
-        || "A new version of Uncluttrd is available. Update for the latest features and improvements.",
-      [
-        // Never blocking: "Not Now" always dismisses and the user carries on.
-        // There is deliberately no forced-update path, and `minimumVersion` in
-        // the config document is NOT read here - it is stored for a possible
-        // future hard gate, and wiring it in now would quietly turn a nudge
-        // into a wall.
-        { text: "Not Now", style: "cancel" },
-        { text: "Update Now", onPress: () => Linking.openURL(storeUrl) },
-      ]
-    );
+    // Awaited until a button dismisses it, so this function's promise means
+    // "the nudge is finished", not merely "the nudge was asked for". The ATT
+    // prompt waits on exactly that - see requestTrackingPermissionWhenClear.
+    await new Promise((resolve) => {
+      Alert.alert(
+        "Update Available",
+        data.updateMessage
+          || "A new version of Uncluttrd is available. Update for the latest features and improvements.",
+        [
+          // Never blocking: "Not Now" always dismisses and the user carries on.
+          // There is deliberately no forced-update path, and `minimumVersion` in
+          // the config document is NOT read here - it is stored for a possible
+          // future hard gate, and wiring it in now would quietly turn a nudge
+          // into a wall.
+          { text: "Not Now", style: "cancel", onPress: resolve },
+          { text: "Update Now", onPress: () => { Linking.openURL(storeUrl); resolve(); } },
+        ]
+      );
+    });
   } catch (e) {
     console.log("Update check error:", e.message);
   }
@@ -14092,29 +14100,134 @@ function startMetaSdk() {
   }
 }
 
-// Asks once, on iOS production, and never blocks or gates the SDK above - the
-// SDK is initialised whatever the answer. FBSDK v17+ on iOS 17+ reads
-// ATTrackingManager's status itself, so there is no setAdvertiserTrackingEnabled
-// call to make afterwards (Meta documents that setter as unused there).
+// ── ATT TIMING ───────────────────────────────────────────────
+// iOS production only. Meta SDK initialisation above never waits on any of it.
 //
-// Waits for the app to be ACTIVE first: iOS does not present the prompt to an
-// app that is not yet active, and the request would resolve without asking.
-async function requestTrackingPermissionIfNeeded() {
-  if (!IS_PRODUCTION || Platform.OS !== "ios") return;
+// WHEN: never during the first production launch. From the second launch on,
+// the prompt is requested at startup, and again whenever a plan is completed,
+// but only while the system status is still "undetermined" - once the user has
+// answered (or the OS has decided), it is never requested again. A first plan
+// completed during launch one is therefore answered on launch two.
+//
+// NOTHING ELSE ON SCREEN: the prompt is only presented after the startup
+// "Update Available" check has fully finished (its dialog shown AND dismissed,
+// or never needed), with no alert or modal visible, and with the app active.
+// Visibility is tracked centrally rather than at the 55 alert and 12 modal call
+// sites: Alert.alert is wrapped to count open alerts until a button closes
+// them, and <Modal> below is a thin wrapper that counts while visible. Both
+// render exactly what they did before. Not covered: overlays that are plain
+// Views rather than Modals, and system sheets (share, print, photo picker).
+//
+// No IDFA is read here. getTrackingPermissionsAsync reads the authorisation
+// status only; this code never calls getAdvertisingId.
+const TRACKS_OVERLAYS = IS_PRODUCTION && Platform.OS === "ios";
+const ATT_LAUNCH_COUNT_KEY = "attProductionLaunchCount";
+// How long "nothing visible" must hold before presenting, so a dismissal
+// animation or an alert chained from a button press is not raced.
+const OVERLAY_SETTLE_MS = 800;
+
+let visibleOverlays = 0;
+const overlayListeners = new Set();
+function changeVisibleOverlays(delta) {
+  visibleOverlays = Math.max(0, visibleOverlays + delta);
+  overlayListeners.forEach((listener) => listener());
+}
+
+if (TRACKS_OVERLAYS) {
+  const presentAlert = Alert.alert;
+  Alert.alert = (title, message, buttons, options) => {
+    let open = true;
+    const close = () => {
+      if (open) { open = false; changeVisibleOverlays(-1); }
+    };
+    // A lone button with no text is what RN itself sends when a caller passes no
+    // buttons: iOS still shows its localised default "OK", and the callback now
+    // reports the dismissal.
+    const source = Array.isArray(buttons) && buttons.length ? buttons : [{}];
+    const tracked = source.map((button) => ({
+      ...button,
+      onPress: (...args) => {
+        close();
+        return button.onPress ? button.onPress(...args) : undefined;
+      },
+    }));
+    changeVisibleOverlays(1);
+    presentAlert.call(Alert, title, message, tracked, options);
+  };
+}
+
+// Stands in for react-native's Modal throughout this file (imported as
+// NativeModal). RN's Modal defaults `visible` to true, so only an explicit
+// false counts as hidden.
+function Modal(props) {
+  const shown = props.visible !== false;
+  useEffect(() => {
+    if (!TRACKS_OVERLAYS || !shown) return undefined;
+    changeVisibleOverlays(1);
+    return () => changeVisibleOverlays(-1);
+  }, [shown]);
+  return <NativeModal {...props} />;
+}
+
+function waitUntilNothingIsPresented() {
+  return new Promise((resolve) => {
+    let timer = null;
+    let appStateSub = null;
+    const clear = () => visibleOverlays === 0 && AppState.currentState === "active";
+    function finish() {
+      clearTimeout(timer);
+      overlayListeners.delete(check);
+      if (appStateSub) appStateSub.remove();
+      resolve();
+    }
+    function check() {
+      clearTimeout(timer);
+      if (!clear()) return;
+      timer = setTimeout(() => { if (clear()) finish(); }, OVERLAY_SETTLE_MS);
+    }
+    overlayListeners.add(check);
+    appStateSub = AppState.addEventListener("change", check);
+    check();
+  });
+}
+
+// Settled by AppRoot once checkForAppUpdate has finished, dialog included.
+let settleAppUpdateCheck;
+const appUpdateCheckSettled = new Promise((resolve) => { settleAppUpdateCheck = resolve; });
+
+// Null until this launch has been counted. A plan completed before then is
+// not eligible, which errs toward not asking.
+let productionLaunchNumber = null;
+let trackingRequestInFlight = false;
+
+async function requestTrackingPermissionWhenClear() {
+  if (!TRACKS_OVERLAYS || trackingRequestInFlight) return;
+  if (productionLaunchNumber === null || productionLaunchNumber < 2) return;
+  trackingRequestInFlight = true;
   try {
     const tracking = require("expo-tracking-transparency");
-    const { status } = await tracking.getTrackingPermissionsAsync();
-    if (status !== "undetermined") return;
-    if (AppState.currentState !== "active") {
-      await new Promise((resolve) => {
-        const sub = AppState.addEventListener("change", (next) => {
-          if (next === "active") { sub.remove(); resolve(); }
-        });
-      });
-    }
+    if ((await tracking.getTrackingPermissionsAsync()).status !== "undetermined") return;
+    await appUpdateCheckSettled;
+    await waitUntilNothingIsPresented();
+    // Re-read: the wait can be long, and the answer may have changed meanwhile.
+    if ((await tracking.getTrackingPermissionsAsync()).status !== "undetermined") return;
     await tracking.requestTrackingPermissionsAsync();
   } catch (e) {
     console.log("Tracking permission error:", e.message);
+  } finally {
+    trackingRequestInFlight = false;
+  }
+}
+
+async function countProductionLaunchForTracking() {
+  if (!TRACKS_OVERLAYS) return;
+  try {
+    const previous = parseInt(await AsyncStorage.getItem(ATT_LAUNCH_COUNT_KEY), 10) || 0;
+    productionLaunchNumber = previous + 1;
+    await AsyncStorage.setItem(ATT_LAUNCH_COUNT_KEY, String(productionLaunchNumber));
+    requestTrackingPermissionWhenClear();
+  } catch (e) {
+    console.log("Tracking launch count error:", e.message);
   }
 }
 
@@ -14198,18 +14311,18 @@ function AppRoot() {
   }, []);
 
   useEffect(() => {
-    // Meta SDK first, then the ATT prompt, neither waiting on the other - see
-    // startMetaSdk and requestTrackingPermissionIfNeeded. Both are no-ops
-    // outside production.
+    // Meta SDK first and unconditionally. ATT eligibility is counted separately
+    // and never gates it - see startMetaSdk and the ATT TIMING section. Both
+    // are no-ops outside production.
     startMetaSdk();
-    requestTrackingPermissionIfNeeded();
+    countProductionLaunchForTracking();
   }, []);
 
   useEffect(() => {
     // Soft update-availability nudge - see checkForAppUpdate's own comment.
     // Runs once per app launch, independent of auth state (this is a
     // dismissible nudge about the app itself, not account data).
-    checkForAppUpdate();
+    checkForAppUpdate().finally(settleAppUpdateCheck);
   }, []);
 
   useEffect(() => {
