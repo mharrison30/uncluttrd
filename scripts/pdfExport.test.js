@@ -1,6 +1,6 @@
 /**
- * PDF export: approach resolution, the Results photo merge, and the HTML
- * generatePDF actually produces.
+ * PDF export: the Results photo merge, the comprehensive plan document, and
+ * the HTML generatePDF actually produces.
  *
  *   node --test scripts/pdfExport.test.js
  *
@@ -8,141 +8,156 @@
  * its declaration rather than re-implemented, against synthetic plans. Every
  * app dependency it touches is supplied explicitly; an identifier the slice
  * needs but the test does not provide fails the test instead of passing
- * silently. Images are placeholders - imageToDataUri's own download and
- * conversion are not exercised here.
+ * silently. imageToDataUri itself (download + resize) is stubbed with real,
+ * decodable PNG data URIs.
  */
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { resolvePdfApproachId, mergeUploadedPhotoUrl } = require(path.join(__dirname, "..", "shared", "pdfExport.js"));
+const zlib = require("node:zlib");
+const {
+  mergeUploadedPhotoUrl, buildComprehensivePlanPdf, comprehensivePdfAnalytics,
+  imageDimensions, PDF_PAGE, NO_PRODUCTS_MESSAGE, SELECTED_LABEL,
+} = require(path.join(__dirname, "..", "shared", "pdfExport.js"));
 
 // ---- fixtures ---------------------------------------------------------------
 
-const PHOTO = "https://firebasestorage.googleapis.com/v0/b/test/o/plans%2Fu%2FPLAN%2Foriginal.jpg";
-const VIZ_POLISHED = "https://firebasestorage.googleapis.com/v0/b/test/o/viz%2Fu%2FPLAN%2Fpolished.jpg";
+// A valid solid-colour PNG, small enough to build per test; the document
+// scales images from their own dimensions, so aspect is what matters.
+function pngDataUri(width, height, [r, g, b]) {
+  const crc = (buf) => {
+    let c = ~0;
+    for (const byte of buf) { c ^= byte; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)); }
+    return (~c) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const sum = Buffer.alloc(4); sum.writeUInt32BE(crc(td));
+    return Buffer.concat([len, td, sum]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(width * 3).map((_, i) => [r, g, b][i % 3])]);
+  const raw = Buffer.concat(Array.from({ length: height }, () => row));
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+  return `data:image/png;base64,${png.toString("base64")}`;
+}
 
-const approach = (id, guidance, products) => ({
-  strategyDescription: `Start by clearing the ${id} shelf. Then regroup what remains by how often it is used.`,
-  organizingGuidance: Array.from({ length: guidance }, (_, i) => `Group ${id} item set ${i + 1} by category so the counter reads as one surface`),
-  keyChanges: ["Clear the counter", "Group by use", "Contain loose items", "Label the bins"],
-  productRecommendations: Array.from({ length: products }, (_, i) => ({
-    approachId: id, productType: `${id} product ${i + 1}`, shortReason: "Keeps loose items findable",
-    reason: "Keeps loose items findable", icon: "bin", grounding: "observed", relatedProblemIds: [], searchTerms: ["x"],
-  })),
-  taskChecklist: ["Task 1", "Task 2", "Task 3", "Task 4"],
+// A JPEG header down to its start-of-frame marker - enough for the
+// dimension reader, which is what imageToDataUri's output is read with.
+function jpegHeaderDataUri(width, height) {
+  const app0 = [0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00];
+  const dqt = [0xff, 0xdb, 0x00, 0x04, 0x00, 0x00];
+  const sof = [0xff, 0xc0, 0x00, 0x11, 0x08, height >> 8, height & 255, width >> 8, width & 255, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+  return `data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, ...app0, ...dqt, ...sof]).toString("base64")}`;
+}
+
+const PHOTO_URL = "https://firebasestorage.googleapis.com/v0/b/test/o/plans%2Fu%2FPLAN%2Foriginal.jpg";
+const VIZ_URL = (id) => `https://firebasestorage.googleapis.com/v0/b/test/o/viz%2Fu%2FPLAN%2F${id}.jpg`;
+const IMAGES = {
+  [PHOTO_URL]: pngDataUri(30, 40, [120, 132, 150]),
+  [VIZ_URL("simple")]: pngDataUri(40, 40, [30, 158, 82]),
+  [VIZ_URL("polished")]: pngDataUri(40, 40, [183, 140, 90]),
+  [VIZ_URL("elevated")]: pngDataUri(40, 40, [110, 80, 170]),
+};
+
+const task = (id, i) => `${id} task ${i + 1}: clear the lower shelf and group what remains by how often you use it, so the counter reads as one calm surface.`;
+const product = (id, i) => ({
+  approachId: id, productType: `${id} item ${i + 1}`, shortReason: `${id} reason ${i + 1}`,
+  reason: "Keeps loose items findable", icon: "bin", grounding: "observed", relatedProblemIds: [], searchTerms: ["x"],
+});
+const approach = (id, tasks, products) => ({
+  strategyDescription: `Start by clearing the ${id} shelf. Then regroup what remains by how often it is used and give every group a container.`,
+  organizingGuidance: ["Guidance one", "Guidance two"],
+  keyChanges: ["Clear the counter", "Group by use"],
+  taskChecklist: Array.from({ length: tasks }, (_, i) => task(id, i)),
+  productRecommendations: Array.from({ length: products }, (_, i) => product(id, i)),
   suggestedAdditionTypes: [], estimatedSpendRange: "$25-$60", visualizationDirection: "x",
 });
 
-// The shape of the plan the bug was reported on: schemaVersion 3, detail
-// complete, nothing committed.
+// The stored shape of a new schemaVersion 3 plan: detail complete, nothing
+// committed, one visualization.
 const v3Plan = (extra = {}) => ({
   schemaVersion: 3, analysisStage: "complete", scopeSize: "room-section", areaScope: "sub-area",
   spaceName: "Kitchen", areaName: "Pantry Shelf",
-  overview: "The shelf holds mixed items with no clear grouping.",
-  proTip: "Keep daily items at eye level.",
+  overview: "The shelf holds mixed items with no clear grouping, and the lower half is doing most of the work.",
+  proTip: "Keep daily items between eye and hip level; everything else can live higher up.",
   problemsFound: [{ id: "p1", description: "Mixed items" }],
-  approaches: { simple: approach("simple", 4, 1), polished: approach("polished", 4, 5), elevated: approach("elevated", 4, 6) },
+  approaches: { simple: approach("simple", 4, 1), polished: approach("polished", 5, 5), elevated: approach("elevated", 6, 6) },
   selectedApproach: null, approachHistory: [], currentBatch: null, batchHistory: [], progressPhotos: [],
+  vizImages: { polished: VIZ_URL("polished") },
   ...extra,
 });
 
 const legacyPlan = () => ({
-  spaceName: "Kitchen", overview: "The shelf holds mixed items.", proTip: "Keep daily items at eye level.", photoUrl: PHOTO,
+  spaceName: "Kitchen", overview: "The shelf holds mixed items.", proTip: "Keep daily items at eye level.", photoUrl: PHOTO_URL,
   tiers: ["budget", "mid", "premium"].map((id) => ({
     id, label: id, range: "$20-$50", suggestions: ["Group like items"], products: [{ icon: "📦", name: "Clear bins", price: "$15" }],
   })),
 });
 
 const deepFreeze = (o) => {
-  if (o && typeof o === "object" && !Object.isFrozen(o)) {
-    Object.freeze(o);
-    Object.values(o).forEach(deepFreeze);
-  }
+  if (o && typeof o === "object" && !Object.isFrozen(o)) { Object.freeze(o); Object.values(o).forEach(deepFreeze); }
   return o;
 };
 
-// ---- resolvePdfApproachId ---------------------------------------------------
-
-test("valid committed selection wins", () => {
-  assert.equal(resolvePdfApproachId(v3Plan({ selectedApproach: "elevated" }), null), "elevated");
+// A model as App.js builds it, for the builder tests.
+const model = (extra = {}) => ({
+  roomLabel: "Kitchen · Pantry Shelf",
+  overview: "The shelf holds mixed items with no clear grouping.",
+  proTip: "Keep daily items at eye level.",
+  photo: IMAGES[PHOTO_URL],
+  logo: "",
+  selectedApproachId: null,
+  approaches: ["simple", "polished", "elevated"].map((id, n) => ({
+    id, name: { simple: "Keep It Simple", polished: "Polished & Practical", elevated: "Elevated Finish" }[id],
+    strategy: `Strategy for ${id}. More detail follows.`, spendRange: "$25-$60",
+    tasks: Array.from({ length: 3 + n }, (_, i) => task(id, i)),
+    products: Array.from({ length: 1 + n * 2 }, (_, i) => ({ name: `${id} item ${i + 1}`, why: `${id} reason ${i + 1}` })),
+    visualization: null,
+  })),
+  ...extra,
 });
 
-test("valid committed selection wins over a different preview", () => {
-  assert.equal(resolvePdfApproachId(v3Plan({ selectedApproach: "elevated" }), "polished"), "elevated");
-});
-
-test("no committed selection plus a valid preview uses the preview", () => {
-  assert.equal(resolvePdfApproachId(v3Plan(), "polished"), "polished");
-});
-
-test("an invalid preview is ignored", () => {
-  assert.equal(resolvePdfApproachId(v3Plan(), "luxury"), null);
-  assert.equal(resolvePdfApproachId(v3Plan(), "constructor"), null);
-  assert.equal(resolvePdfApproachId(v3Plan(), ""), null);
-  assert.equal(resolvePdfApproachId(v3Plan(), { id: "polished" }), null);
-  const missingDetail = v3Plan();
-  missingDetail.approaches = { ...missingDetail.approaches, polished: null };
-  assert.equal(resolvePdfApproachId(missingDetail, "polished"), null);
-});
-
-test("an invalid committed selection falls back to a valid preview, else comparison", () => {
-  assert.equal(resolvePdfApproachId(v3Plan({ selectedApproach: "luxury" }), "simple"), "simple");
-  assert.equal(resolvePdfApproachId(v3Plan({ selectedApproach: "luxury" }), null), null);
-});
-
-test("no valid committed selection or preview means comparison (null)", () => {
-  assert.equal(resolvePdfApproachId(v3Plan(), null), null);
-  assert.equal(resolvePdfApproachId(v3Plan(), undefined), null);
-});
-
-test("a legacy plan never resolves an approach", () => {
-  assert.equal(resolvePdfApproachId(legacyPlan(), "polished"), null);
-  assert.equal(resolvePdfApproachId(null, "polished"), null);
-});
-
-test("resolution reads without mutating", () => {
-  const plan = deepFreeze(v3Plan());
-  assert.equal(resolvePdfApproachId(plan, "polished"), "polished");
-  assert.equal(plan.selectedApproach, null);
-});
+const sheetsOf = (html) => html.split('<div class="sheet">').slice(1);
+const sectionOrder = (html) => [...html.matchAll(/<div class="h2">([^<]*)<\/div>/g)].map((m) => m[1]);
 
 // ---- mergeUploadedPhotoUrl --------------------------------------------------
 
 test("a successful upload adds photoUrl to the matching active results", () => {
   const prev = v3Plan();
-  const next = mergeUploadedPhotoUrl(prev, "PLAN", { planId: "PLAN", photoUrl: PHOTO });
+  const next = mergeUploadedPhotoUrl(prev, "PLAN", { planId: "PLAN", photoUrl: PHOTO_URL });
   assert.notEqual(next, prev);
-  assert.equal(next.photoUrl, PHOTO);
+  assert.equal(next.photoUrl, PHOTO_URL);
   assert.equal(prev.photoUrl, undefined, "the previous object is not mutated");
 });
 
 test("a different active plan is not changed", () => {
   const prev = v3Plan({ photoUrl: "https://example.test/other.jpg" });
-  assert.equal(mergeUploadedPhotoUrl(prev, "OTHER", { planId: "PLAN", photoUrl: PHOTO }), prev);
+  assert.equal(mergeUploadedPhotoUrl(prev, "OTHER", { planId: "PLAN", photoUrl: PHOTO_URL }), prev);
 });
 
 test("null results remain null", () => {
-  assert.equal(mergeUploadedPhotoUrl(null, "PLAN", { planId: "PLAN", photoUrl: PHOTO }), null);
-  assert.equal(mergeUploadedPhotoUrl(undefined, "PLAN", { planId: "PLAN", photoUrl: PHOTO }), undefined);
+  assert.equal(mergeUploadedPhotoUrl(null, "PLAN", { planId: "PLAN", photoUrl: PHOTO_URL }), null);
+  assert.equal(mergeUploadedPhotoUrl(undefined, "PLAN", { planId: "PLAN", photoUrl: PHOTO_URL }), undefined);
 });
 
 test("existing detail and visualization fields are preserved", () => {
-  const prev = deepFreeze(v3Plan({ vizImages: { polished: VIZ_POLISHED }, selectedApproach: "polished", currentBatch: { batchIndex: 1, items: [] } }));
-  const next = mergeUploadedPhotoUrl(prev, "PLAN", { planId: "PLAN", photoUrl: PHOTO });
+  const prev = deepFreeze(v3Plan({ selectedApproach: "polished", currentBatch: { batchIndex: 1, items: [] } }));
+  const next = mergeUploadedPhotoUrl(prev, "PLAN", { planId: "PLAN", photoUrl: PHOTO_URL });
   assert.deepEqual({ ...next, photoUrl: undefined }, { ...prev, photoUrl: undefined });
   assert.equal(next.approaches, prev.approaches);
   assert.equal(next.vizImages, prev.vizImages);
-  assert.equal(next.selectedApproach, "polished");
   assert.deepEqual(Object.keys(next).sort(), [...Object.keys(prev), "photoUrl"].sort());
 });
 
 test("a late upload cannot overwrite a newer plan's state", () => {
-  // Plan A's upload resolves after the user has moved on to plan B.
-  const planB = deepFreeze(v3Plan({ photoUrl: "https://example.test/b.jpg", analysisStage: "complete" }));
-  assert.equal(mergeUploadedPhotoUrl(planB, "PLAN_B", { planId: "PLAN_A", photoUrl: PHOTO }), planB);
-  // Home screen: no active plan at all.
-  assert.equal(mergeUploadedPhotoUrl(planB, null, { planId: "PLAN_A", photoUrl: PHOTO }), planB);
+  const planB = deepFreeze(v3Plan({ photoUrl: "https://example.test/b.jpg" }));
+  assert.equal(mergeUploadedPhotoUrl(planB, "PLAN_B", { planId: "PLAN_A", photoUrl: PHOTO_URL }), planB);
+  assert.equal(mergeUploadedPhotoUrl(planB, null, { planId: "PLAN_A", photoUrl: PHOTO_URL }), planB);
 });
 
 test("only a remote URL is merged, never a local cache file", () => {
@@ -153,9 +168,189 @@ test("only a remote URL is merged, never a local cache file", () => {
   assert.equal(mergeUploadedPhotoUrl(prev, "PLAN", null), prev);
 });
 
-test("merging the same URL again keeps the same reference", () => {
-  const prev = v3Plan({ photoUrl: PHOTO });
-  assert.equal(mergeUploadedPhotoUrl(prev, "PLAN", { planId: "PLAN", photoUrl: PHOTO }), prev);
+// ---- image dimensions -------------------------------------------------------
+
+test("image dimensions are read from JPEG and PNG data URIs", () => {
+  assert.deepEqual(imageDimensions(jpegHeaderDataUri(1400, 1050)), { width: 1400, height: 1050 });
+  assert.deepEqual(imageDimensions(pngDataUri(30, 40, [0, 0, 0])), { width: 30, height: 40 });
+  assert.equal(imageDimensions("data:image/jpeg;base64,AAAA"), null);
+  assert.equal(imageDimensions("https://example.test/x.jpg"), null);
+});
+
+// ---- buildComprehensivePlanPdf ----------------------------------------------
+
+test("no selected approach: all three approaches, in order, with no selected badge", () => {
+  const { html, stats } = buildComprehensivePlanPdf(model());
+  assert.deepEqual(sectionOrder(html), ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"]);
+  assert.ok(!html.includes(SELECTED_LABEL));
+  assert.equal(stats.approachCount, 3);
+  assert.equal(stats.selectedApproach, null);
+});
+
+test("a selected approach still includes all three, and only it carries the badge", () => {
+  const input = model({ selectedApproachId: "polished" });
+  const { html, stats } = buildComprehensivePlanPdf(input);
+  assert.deepEqual(sectionOrder(html), ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"]);
+  const heads = [...html.matchAll(/<div class="approach-head">([\s\S]*?)<\/div>\s*<\/div>/g)].map((m) => m[1]);
+  assert.equal(heads.length, 3);
+  assert.deepEqual(heads.map((h) => h.includes(`<div class="badge">${SELECTED_LABEL}</div>`)), [false, true, false]);
+  assert.equal(stats.selectedApproach, "polished");
+  // Nothing is removed from the other two.
+  const full = buildComprehensivePlanPdf(model());
+  assert.equal(stats.taskCount, full.stats.taskCount);
+  assert.equal(stats.productCount, full.stats.productCount);
+});
+
+test("an unknown selectedApproach is treated as no selection", () => {
+  const { html, stats } = buildComprehensivePlanPdf(model({ selectedApproachId: "luxury" }));
+  assert.ok(!html.includes(SELECTED_LABEL));
+  assert.equal(stats.selectedApproach, null);
+});
+
+test("every task from every approach is included, numbered", () => {
+  const input = model();
+  const { html } = buildComprehensivePlanPdf(input);
+  for (const a of input.approaches) {
+    a.tasks.forEach((t, i) => {
+      const number = String(i + 1).padStart(2, "0");
+      assert.ok(html.includes(`<div class="stepno">${number}</div><div class="steptext">${t.replace(/'/g, "&#39;")}</div>`), `${a.id} task ${i + 1}`);
+    });
+  }
+  assert.equal((html.match(/class="step"/g) || []).length, 3 + 4 + 5);
+});
+
+test("every product recommendation from every approach is included", () => {
+  const input = model();
+  const { html } = buildComprehensivePlanPdf(input);
+  for (const a of input.approaches) {
+    for (const p of a.products) {
+      assert.ok(html.includes(`<div class="prodname">${p.name}</div><div class="prodwhy">${p.why}</div>`), `${a.id} ${p.name}`);
+    }
+  }
+  assert.equal((html.match(/class="product-card"/g) || []).length, 1 + 3 + 5);
+});
+
+test("an approach with zero products shows the no-products message, not an empty grid", () => {
+  const input = model();
+  input.approaches[0].products = [];
+  const { html } = buildComprehensivePlanPdf(input);
+  const simple = html.slice(html.indexOf(`<div class="h2">Keep It Simple</div>`), html.indexOf(`<div class="h2">Polished &amp; Practical</div>`));
+  assert.ok(simple.includes(NO_PRODUCTS_MESSAGE));
+  assert.ok(!simple.includes('class="prodrow"'));
+  assert.equal((html.match(new RegExp(NO_PRODUCTS_MESSAGE.replace(/\./g, "\\."), "g")) || []).length, 1);
+});
+
+test("visualizations sit under their own approach, all of them, and missing ones leave nothing", () => {
+  const input = model();
+  input.approaches[1].visualization = IMAGES[VIZ_URL("polished")];
+  input.approaches[2].visualization = IMAGES[VIZ_URL("elevated")];
+  const { html, stats } = buildComprehensivePlanPdf(input);
+  const at = (s) => html.indexOf(s);
+  const polishedViz = at(IMAGES[VIZ_URL("polished")]);
+  const elevatedViz = at(IMAGES[VIZ_URL("elevated")]);
+  assert.ok(at(`<div class="h2">Polished &amp; Practical</div>`) < polishedViz && polishedViz < at(`<div class="h2">Elevated Finish</div>`), "polished viz inside the polished section");
+  assert.ok(at(`<div class="h2">Elevated Finish</div>`) < elevatedViz, "elevated viz inside the elevated section");
+  assert.equal((html.match(/<img class="viz"/g) || []).length, 2);
+  assert.equal((html.match(/class="viz-section"/g) || []).length, 2, "no section for the approach without one");
+  assert.ok(html.includes("Polished &amp; Practical &middot; AI visualization"));
+  assert.ok(html.includes("Elevated Finish &middot; AI visualization"));
+  assert.ok(!html.includes("Keep It Simple &middot; AI visualization"));
+  assert.equal(stats.visualizationCount, 2);
+});
+
+test("an unusable image is dropped rather than drawn as a blank box", () => {
+  const input = model({ photo: "https://not-inlined.example/x.jpg" });
+  input.approaches[0].visualization = "";
+  input.approaches[1].visualization = "file:///local.jpg";
+  const { html, stats } = buildComprehensivePlanPdf(input);
+  assert.ok(!html.includes('<img class="photo"'));
+  assert.ok(!html.includes("Your space today"));
+  assert.ok(!html.includes('class="viz-section"'));
+  assert.equal(stats.hasPhoto, false);
+  assert.equal(stats.visualizationCount, 0);
+});
+
+test("the photo is sized from its own dimensions, and images are never empty", () => {
+  const { html } = buildComprehensivePlanPdf(model({ photo: IMAGES[PHOTO_URL] }));
+  const m = html.match(/<img class="photo" src="([^"]+)" width="(\d+)" height="(\d+)"\/>/);
+  assert.ok(m, "photo present");
+  assert.equal(m[1], IMAGES[PHOTO_URL]);
+  assert.ok(Math.abs(Number(m[2]) / Number(m[3]) - 0.75) < 0.01);
+  assert.ok(html.includes('<div class="cap">Your space today</div>'));
+});
+
+test("every page has the branded header and footer, and page numbers are right", () => {
+  const input = model();
+  input.approaches.forEach((a) => { a.visualization = IMAGES[VIZ_URL(a.id)]; });
+  const { html, stats } = buildComprehensivePlanPdf(input);
+  const sheets = sheetsOf(html);
+  assert.equal(sheets.length, stats.pageCount);
+  assert.ok(stats.pageCount >= 4);
+  sheets.forEach((s, n) => {
+    assert.ok(s.includes('<div class="brandbar">') && s.includes('<div class="brandrule">'), `header on page ${n + 1}`);
+    assert.ok(s.includes(`<div class="foot"><span>Generated by Uncluttrd Pro</span><span>uncluttrd.app &middot; Page ${n + 1} of ${stats.pageCount}</span></div>`), `footer on page ${n + 1}`);
+  });
+});
+
+test("each approach starts on its own page, and no page is over-filled", () => {
+  const input = model();
+  input.approaches.forEach((a) => { a.visualization = IMAGES[VIZ_URL(a.id)]; });
+  const built = buildComprehensivePlanPdf(input);
+  const sheets = sheetsOf(built.html);
+  for (const name of ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"]) {
+    const n = sheets.findIndex((s) => s.includes(`<div class="h2">${name}</div>`));
+    assert.ok(n > 0, `${name} has a page`);
+    assert.match(sheets[n], /<div class="sheet-body"><div class="approach-head">/, `${name} opens its page`);
+  }
+  built.sheets.forEach((s, n) => assert.ok(s.used <= PDF_PAGE.bodyHeight, `page ${n + 1} estimated ${s.used}px of ${PDF_PAGE.bodyHeight}`));
+});
+
+test("follow-on pages are labelled and never nearly empty", () => {
+  const input = model();
+  input.approaches.forEach((a) => {
+    a.tasks = Array.from({ length: 6 }, (_, i) => task(a.id, i) + " Take your time with this one and put back only what earns its place.");
+    a.products = Array.from({ length: 6 }, (_, i) => ({ name: `${a.id} item ${i + 1}`, why: "A longer reason that wraps onto a second line on the card" }));
+    a.visualization = IMAGES[VIZ_URL(a.id)];
+  });
+  const built = buildComprehensivePlanPdf(input);
+  const sheets = sheetsOf(built.html);
+  built.sheets.forEach((s, n) => {
+    if (n === 0) return;
+    const opensSection = /<div class="sheet-body"><div class="approach-head">/.test(sheets[n]);
+    if (!opensSection) {
+      assert.ok(s.used - 30 >= PDF_PAGE.bodyHeight * 0.2, `page ${n + 1} holds ${s.used - 30}px`);
+      if (!sheets[n].includes('class="card pro-tip"') || s.sections.length > 1) {
+        assert.match(sheets[n], /<div class="continued">[^<]+ &middot; continued<\/div>/, `page ${n + 1} is labelled`);
+      }
+    }
+  });
+});
+
+test("page 1 lists the approaches with the page each starts on", () => {
+  const { html } = buildComprehensivePlanPdf(model({ selectedApproachId: "elevated" }));
+  const first = sheetsOf(html)[0];
+  assert.ok(first.includes('<div class="lbl">In this plan</div>'));
+  const pages = [...first.matchAll(/<div class="contents-page">Page (\d+)<\/div>/g)].map((m) => Number(m[1]));
+  const sheets = sheetsOf(html);
+  const actual = ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"].map((name) => 1 + sheets.findIndex((s) => s.includes(`<div class="h2">${name}</div>`)));
+  assert.deepEqual(pages, actual);
+  assert.ok(first.includes(`<span class="badge badge-sm">${SELECTED_LABEL}</span>`));
+});
+
+test("text is escaped", () => {
+  const input = model({ overview: "Bins & <baskets>" });
+  input.approaches[0].products = [{ name: "Bins & baskets", why: "Use <labels>" }];
+  const { html } = buildComprehensivePlanPdf(input);
+  assert.ok(html.includes("Bins &amp; &lt;baskets&gt;"));
+  assert.ok(html.includes("Use &lt;labels&gt;"));
+  assert.ok(!html.includes("<baskets>") && !html.includes("<labels>"));
+});
+
+test("analytics: comprehensive format, committed selection only, counts", () => {
+  assert.deepEqual(comprehensivePdfAnalytics({ approachCount: 3, visualizationCount: 1, selectedApproach: null }),
+    { format: "comprehensive", has_selected_approach: false, approach_count: 3, visualization_count: 1 });
+  assert.deepEqual(comprehensivePdfAnalytics({ approachCount: 3, visualizationCount: 2, selectedApproach: "polished" }),
+    { format: "comprehensive", has_selected_approach: true, selected_approach: "polished", approach_count: 3, visualization_count: 2 });
 });
 
 // ---- generatePDF render -----------------------------------------------------
@@ -173,12 +368,11 @@ function slice(source, startMarker, endMarker, { includeEnd }) {
 
 function pdfSlices(source) {
   return {
-    // APPROACH_META through the step-title and product-name helpers the PDF
+    // BRAND, then APPROACH_META through the product-name helpers the PDF
     // uses; stops before the icon table, which needs the icon imports.
     helpers: slice(source, "\nconst BRAND = {", "\n};\n", { includeEnd: true })
-      + slice(source, "\nconst APPROACH_META = {","\nconst PRODUCT_CATEGORY_ICONS = {", { includeEnd: false })
+      + slice(source, "\nconst APPROACH_META = {", "\nconst PRODUCT_CATEGORY_ICONS = {", { includeEnd: false })
       + "\n" + slice(source, "\nfunction normalizeProductRecommendation(rec) {", "\n// ===", { includeEnd: false }),
-    escHtml: slice(source, "\n  const escHtml = ", ";\n", { includeEnd: true }),
     generatePDF: slice(source, "\n  const generatePDF = async () => {", "\n  };\n", { includeEnd: true }),
   };
 }
@@ -186,13 +380,13 @@ function pdfSlices(source) {
 const WRITE_APIS = ["updateDoc", "setDoc", "addDoc", "deleteDoc", "writeBatch", "arrayUnion", "setResults", "setHistory", "setPreviewApproach", "setCurrentPlanId", "setVizImage"];
 
 // Runs generatePDF and returns the HTML handed to Print.printToFileAsync.
-async function renderPdf(source, { results, previewApproach = null, vizImage = {} }) {
+async function renderPdf(source, { results, previewApproach = null, vizImage = {}, images = IMAGES }) {
   const s = pdfSlices(source);
   const calls = [];
   let html = null;
   const env = {
     results, previewApproach, vizImage,
-    resolvePdfApproachId,
+    buildComprehensivePlanPdf, comprehensivePdfAnalytics,
     pdfInFlightRef: { current: false },
     setAsyncBusyText: () => {},
     Print: { printToFileAsync: async (opts) => { html = opts.html; return { uri: "file:///out.pdf" }; } },
@@ -202,10 +396,7 @@ async function renderPdf(source, { results, previewApproach = null, vizImage = {
     Alert: { alert: (title, message) => { throw new Error(`generatePDF raised "${title}": ${message}`); } },
     getSpaceDisplayName: (r) => r.spaceName || "Room",
     resolveExportIdentity: async () => ({ label: "Kitchen · Pantry Shelf" }),
-    imageToDataUri: async (url) => {
-      calls.push({ name: "imageToDataUri", url });
-      return url ? `data:image/png;base64,${Buffer.from(String(url)).toString("base64")}` : null;
-    },
+    imageToDataUri: async (url) => { calls.push({ name: "imageToDataUri", url }); return (url && images[url]) || null; },
     dlog: () => {},
   };
   for (const api of WRITE_APIS) env[api] = (...args) => { calls.push({ name: api, args }); };
@@ -218,77 +409,75 @@ async function renderPdf(source, { results, previewApproach = null, vizImage = {
     },
   });
   // eslint-disable-next-line no-new-func
-  const factory = new Function("scope", `with (scope) {\n${s.helpers}\n${s.escHtml}\n${s.generatePDF}\nreturn generatePDF;\n}`);
+  const factory = new Function("scope", `with (scope) {\n${s.helpers}\n${s.generatePDF}\nreturn generatePDF;\n}`);
   await factory(scope)();
   assert.ok(html, "generatePDF produced no HTML");
   return { html, calls };
 }
 
-const firstPage = (html) => html.slice(0, html.indexOf('style="page-break-before:always;"'));
-const imgSrc = (url) => `src="data:image/png;base64,${Buffer.from(url).toString("base64")}"`;
-
-test("render: new v3 plan previewing polished gets the single-approach document", async () => {
-  const results = deepFreeze(v3Plan({ photoUrl: PHOTO, vizImages: {} }));
+test("render: new plan, no selection, one visualization - the complete plan", async () => {
+  // photoUrl as the 157b7dc merge leaves it on a newly created plan.
+  const results = deepFreeze(mergeUploadedPhotoUrl(v3Plan(), "PLAN", { planId: "PLAN", photoUrl: PHOTO_URL }));
   const before = JSON.stringify(results);
-  const { html, calls } = await renderPdf(APP_SOURCE, { results, previewApproach: "polished", vizImage: { polished: VIZ_POLISHED } });
-  const p1 = firstPage(html);
+  const { html, calls } = await renderPdf(APP_SOURCE, { results, previewApproach: "elevated" });
 
-  assert.ok(p1.includes(`<img class="photo" ${imgSrc(PHOTO)}/>`), "photo on page 1");
-  assert.ok(p1.includes('<div class="cap">Your space today</div>'), "caption on page 1");
-  assert.match(p1, /<div class="approach-section">\s*<span class="approach-name">Polished &amp; Practical<\/span>/, "polished card on page 1");
-  assert.ok(html.includes('<div class="eyebrow">Your action plan</div>'));
-  assert.ok(html.includes("Four moves that make the biggest difference"));
-  for (const n of ["01", "02", "03", "04"]) assert.ok(html.includes(`<div class="stepno">${n}</div>`), `step ${n}`);
-  assert.ok(html.includes('<table class="prodgrid">'), "product grid");
-  assert.equal((html.match(/class="product-card"/g) || []).length, 5, "the five polished products");
-  assert.ok(html.includes(`<img class="viz" ${imgSrc(VIZ_POLISHED)}/>`), "polished visualization");
-  assert.ok(!html.includes("Three ways to approach this"));
+  assert.deepEqual(sectionOrder(html), ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"]);
+  assert.ok(sheetsOf(html)[0].includes(`<img class="photo" src="${IMAGES[PHOTO_URL]}"`), "photo on page 1");
+  assert.ok(html.includes('<div class="cap">Your space today</div>'));
+  assert.ok(html.includes('<div class="lbl">What we noticed</div>'));
+  assert.equal((html.match(/class="step"/g) || []).length, 4 + 5 + 6, "every task");
+  assert.equal((html.match(/class="product-card"/g) || []).length, 1 + 5 + 6, "every product");
+  assert.equal((html.match(/<img class="viz"/g) || []).length, 1);
+  assert.ok(html.includes("Polished &amp; Practical &middot; AI visualization"));
+  assert.ok(html.includes('class="card pro-tip"'));
+  assert.ok(!html.includes(SELECTED_LABEL), "an expanded preview is not a selection");
 
-  // Nothing persisted or started, and the plan object is untouched.
-  assert.deepEqual(calls.filter((c) => WRITE_APIS.includes(c.name)), []);
-  assert.equal(JSON.stringify(results), before);
+  // The session's own visualization state is honoured.
+  const withSession = await renderPdf(APP_SOURCE, { results, vizImage: { simple: VIZ_URL("simple") } });
+  assert.equal((withSession.html.match(/<img class="viz"/g) || []).length, 2);
+
+  assert.deepEqual(calls.find((c) => c.name === "pdf_exported").params,
+    { format: "comprehensive", has_selected_approach: false, approach_count: 3, visualization_count: 1 });
+  assert.deepEqual(calls.filter((c) => WRITE_APIS.includes(c.name)), [], "nothing persisted or started");
+  assert.equal(JSON.stringify(results), before, "plan object untouched");
   assert.equal(results.selectedApproach, null);
-  assert.deepEqual(results.approachHistory, []);
 });
 
-test("render: the persisted visualization is used when this session has none", async () => {
-  const results = v3Plan({ photoUrl: PHOTO, vizImages: { polished: VIZ_POLISHED } });
-  const { html } = await renderPdf(APP_SOURCE, { results, previewApproach: "polished" });
-  assert.ok(html.includes(`<img class="viz" ${imgSrc(VIZ_POLISHED)}/>`));
+test("render: selected Polished with visualizations for several approaches", async () => {
+  const results = v3Plan({ photoUrl: PHOTO_URL, selectedApproach: "polished", vizImages: { polished: VIZ_URL("polished"), elevated: VIZ_URL("elevated") } });
+  const { html, calls } = await renderPdf(APP_SOURCE, { results, vizImage: { simple: VIZ_URL("simple") } });
+  assert.deepEqual(sectionOrder(html), ["Keep It Simple", "Polished &amp; Practical", "Elevated Finish"]);
+  assert.equal((html.match(new RegExp(`<div class="badge">${SELECTED_LABEL}</div>`, "g")) || []).length, 1);
+  assert.equal((html.match(/<img class="viz"/g) || []).length, 3);
+  assert.deepEqual(calls.find((c) => c.name === "pdf_exported").params,
+    { format: "comprehensive", has_selected_approach: true, selected_approach: "polished", approach_count: 3, visualization_count: 3 });
 });
 
-test("render: a committed selection wins over a different preview", async () => {
-  const results = v3Plan({ photoUrl: PHOTO, selectedApproach: "elevated" });
-  const { html, calls } = await renderPdf(APP_SOURCE, { results, previewApproach: "polished" });
-  assert.match(firstPage(html), /<span class="approach-name">Elevated Finish<\/span>/);
-  assert.equal((html.match(/class="product-card"/g) || []).length, 6, "the six elevated products");
-  assert.deepEqual(calls.find((c) => c.name === "pdf_exported").params, { format: "approach", selected: "elevated" });
+test("render: a zero-product approach shows the message", async () => {
+  const results = v3Plan({ photoUrl: PHOTO_URL });
+  results.approaches = { ...results.approaches, simple: { ...results.approaches.simple, productRecommendations: [] } };
+  const { html } = await renderPdf(APP_SOURCE, { results });
+  assert.equal((html.match(/No additional products needed for this approach\./g) || []).length, 1);
 });
 
-test("render: no committed selection and no preview keeps the comparison document", async () => {
-  const { html } = await renderPdf(APP_SOURCE, { results: v3Plan({ photoUrl: PHOTO }), previewApproach: null });
-  assert.ok(html.includes("Three ways to approach this"));
-  assert.ok(!firstPage(html).includes('<div class="approach-section">'));
-  assert.ok(!html.includes("Your action plan"));
-  assert.ok(!html.includes('<table class="prodgrid">'));
+test("render: a missing photo or visualization leaves no image block", async () => {
+  const results = v3Plan({ photoUrl: PHOTO_URL, vizImages: {} });
+  const { html } = await renderPdf(APP_SOURCE, { results, images: {} });
+  assert.ok(!html.includes("<img class=\"photo\"") && !html.includes("Your space today"));
+  assert.ok(!html.includes('class="viz-section"'));
 });
 
-test("render: an invalid preview keeps the comparison document", async () => {
-  const { html } = await renderPdf(APP_SOURCE, { results: v3Plan({ photoUrl: PHOTO }), previewApproach: "luxury" });
-  assert.ok(html.includes("Three ways to approach this"));
-});
-
-test("render: a legacy tier plan stays on the legacy document, preview or not", async () => {
+test("render: a legacy tier plan stays on the legacy document", async () => {
   const { html, calls } = await renderPdf(APP_SOURCE, { results: legacyPlan(), previewApproach: "polished" });
   assert.equal((html.match(/class="tier"/g) || []).length, 3);
-  assert.ok(!html.includes('<div class="approach-section">'));
-  assert.ok(!html.includes("Three ways to approach this"));
-  assert.ok(!html.includes("Your action plan"));
+  assert.ok(!html.includes('class="sheet"'));
+  assert.ok(!html.includes('class="approach-head"'));
   assert.equal(calls.find((c) => c.name === "pdf_exported").params, undefined);
 });
 
-test("generatePDF itself contains no write or state-changing call", () => {
+test("generatePDF reads no preview state and makes no write or state-changing call", () => {
   const body = pdfSlices(APP_SOURCE).generatePDF;
+  assert.ok(!/\bpreviewApproach\b/.test(body), "generatePDF must not depend on previewApproach");
   for (const api of WRITE_APIS) {
     assert.ok(!new RegExp(`\\b${api}\\s*\\(`).test(body), `generatePDF calls ${api}`);
   }

@@ -19,7 +19,7 @@ Status: Living document — contract, not a changelog.
 | `plan_started` | Measures how many uploaded photos actually kick off an analysis | — | `tier` | YES | NO |
 | `plan_completed` | **NORTH STAR METRIC** — the core value moment: a user received a complete organization plan | — | `spaceType`, `time_to_complete` | YES | NO |
 | `visualization_viewed` | Measures how many completed plans lead to a user viewing an AI visualization | — | TBD | NO | NO |
-| `pdf_exported` | Measures how many plans are valuable enough for a user to save/share as a PDF | — | TBD | NO | NO |
+| `pdf_exported` | Measures how many plans are valuable enough for a user to save/share as a PDF | — | Approach-format plans: `format` (`comprehensive`), `has_selected_approach`, `selected_approach` (only when committed), `approach_count`, `visualization_count`. Legacy tier plans: none | YES | NO |
 | `product_clicked` | Measures affiliate purchase intent — how many recommended products get clicked | — | `product`, `companionActionIndex` | YES | NO |
 | `subscription_started` | Measures paywall engagement — how many users begin the Pro upgrade flow | Where in the native purchase flow itself do users drop off, distinct from whether they clicked "upgrade" at all? | `analysisId`, `source` | NO | NO |
 | `subscription_completed` | Measures actual Pro conversion — how many started upgrades convert to paying subscribers | — | TBD | NO | NO |
