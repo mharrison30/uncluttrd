@@ -34,6 +34,7 @@ import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, listAll, de
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
 import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation, resolveSessionScope } from "./shared/spaceMigration";
+import { resolvePdfApproachId, mergeUploadedPhotoUrl } from "./shared/pdfExport";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -4519,6 +4520,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // See runDetailCall for the bug this caused.
   const currentPlanIdRef = useRef(null);
   useEffect(() => { currentPlanIdRef.current = currentPlanId; }, [currentPlanId]);
+  // The most recent original-photo upload, { planId, photoUrl }. Room
+  // confirmation sets `results` only after savePlanToHistory has returned,
+  // so the upload has already finished by then and there is no Results
+  // object yet for savePlanToHistory to merge into - that path reads it
+  // from here instead. See mergeUploadedPhotoUrl.
+  const lastPhotoUploadRef = useRef(null);
   // vizImage/vizLoading are keyed by tier id on an old-format plan and by
   // approach id ("simple"/"polished"/"elevated") on a new-format one. The
   // two vocabularies never coexist on a single plan - a plan has tiers or
@@ -6069,6 +6076,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           const photoUrl = await getDownloadURL(fileRef);
           await updateDoc(doc(db, "users", user.uid, "plans", docRef.id), { photoUrl });
           setHistory(prev => prev.map(h => h.id === docRef.id ? { ...h, photoUrl } : h));
+          // And the open Results plan, when it is still this one (paths that
+          // show Results before saving: Organize Again, the paywall upgrade).
+          // Guarded on the ref for the same reason runDetailCall is.
+          lastPhotoUploadRef.current = { planId: docRef.id, photoUrl };
+          setResults((prev) => mergeUploadedPhotoUrl(prev, currentPlanIdRef.current, { planId: docRef.id, photoUrl }));
           shadowPhotoUrl = photoUrl;
         } catch (photoErr) {
           console.log("Save original photo error:", photoErr.message);
@@ -6922,7 +6934,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     }
 
     setRoomConfirmation(null);
-    setResults(confirmedPlan);
+    // photoUrl from this plan's own upload, which finished inside
+    // savePlanToHistory before confirmedPlan (which has none) is shown.
+    setResults(mergeUploadedPhotoUrl(confirmedPlan, newPlanId, lastPhotoUploadRef.current));
     logEvent(getAnalytics(), "plan_completed");
     requestTrackingPermissionWhenClear();
 
@@ -7937,7 +7951,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
       const buildApproachPdf = async () => {
         const identity = await resolveExportIdentity();
-        const selectedId = results.selectedApproach || null;
+        // Committed approach first, else the card expanded on Results. Read
+        // only - exporting a preview never commits it.
+        const selectedId = resolvePdfApproachId(results, previewApproach);
         const roomLabel = escHtml(identity.label);
 
         const proTip = results.proTip
