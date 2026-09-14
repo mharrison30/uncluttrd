@@ -4,10 +4,30 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if request.auth != null && request.auth.uid == userId;
 
-      // analysisCount/analysisCountMonth are permanently server-owned (written
-      // only by the Admin SDK inside analyzePhoto's transaction). A client
-      // create must not seed a nonzero/rollover-primed value for itself.
+      // A client may create ONLY its own profile document, and only with the
+      // fields the app's signup path actually writes (App.js
+      // ensureUserDocument: uid, email, displayName, createdAt, platform,
+      // isPro, isTestAccount, plus referralSource/isNewSignup at signup).
+      // Every one of these checks closes a real hole found by emulator audit:
+      //
+      // - uid must match the path, so the stored identity cannot be forged.
+      // - isPro must be present and exactly false. It is server-owned (see the
+      //   update rule), and without this a client could delete its document
+      //   and recreate it with isPro: true.
+      // - analysisCount/analysisCountMonth are permanently server-owned
+      //   (written only by the Admin SDK inside analyzePhoto's transaction). A
+      //   client create must not seed a nonzero/rollover-primed value.
+      // - keys().hasOnly() denies any field outside the allowlist, so no new
+      //   client-owned field can appear without a deliberate rule change.
+      //   analysisCount stays on the list only as absent-or-zero, for
+      //   compatibility with the check above.
       allow create: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.keys().hasOnly([
+             'uid', 'email', 'displayName', 'createdAt', 'platform', 'isPro',
+             'isTestAccount', 'referralSource', 'isNewSignup', 'analysisCount'
+           ])
+        && ('isPro' in request.resource.data) && request.resource.data.isPro == false
         && (!('analysisCount' in request.resource.data) || request.resource.data.analysisCount == 0)
         && !('analysisCountMonth' in request.resource.data);
 
@@ -41,10 +61,18 @@ service cloud.firestore {
       allow update: if request.auth != null && request.auth.uid == userId
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hasSeenTutorial']);
 
-      // NOT tightened per the flagged conflict: blocking delete here would
-      // break the existing client-side account deletion flow (deleteDoc while
-      // still authenticated - see DecisionLog.md). Left as-is pending a
-      // decision on moving account deletion server-side.
+      // TEMPORARY - LEGACY CLIENT COMPATIBILITY. The current app never deletes
+      // this document from the client: account deletion moved server-side to
+      // the hardDeleteAccount callable in ec5d06e (2026-08-10). Owner delete
+      // stays allowed only because 1.0.x builds still delete it client-side
+      // (deleteDoc while authenticated), and denying it would break account
+      // deletion for anyone still on those versions.
+      //
+      // Known cost: delete-then-recreate resets the server-owned monthly
+      // usage counter (checkOrphanedUserDeletions logs it as a possible
+      // free-plan bypass). The hardened create rule above still prevents
+      // recreating with isPro: true or seeded usage. Restrict this to
+      // `if false` once 1.0.x usage is confirmed gone.
       allow delete: if request.auth != null && request.auth.uid == userId;
 
       match /plans/{planId} {
