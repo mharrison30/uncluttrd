@@ -353,6 +353,125 @@ test("analytics: comprehensive format, committed selection only, counts", () => 
     { format: "comprehensive", has_selected_approach: true, selected_approach: "polished", approach_count: 3, visualization_count: 2 });
 });
 
+// ---- print pagination (iOS WebKit page model) -------------------------------
+//
+// Chrome prints on an 816 x 1056px Letter page whatever the document's width,
+// so a Chrome render cannot show this defect. iOS does not: expo-print hands
+// WKWebView's print formatter a 612 x 792pt page, and WebKit's PrintContext
+// lays the document out at that size times its minimum shrink factor (1.25),
+// i.e. 765px wide, widening only when the document is wider, then cuts pages
+// of floor(documentWidth x 792 / 612) px (PrintContext::computePageRects).
+// Every sheet is followed by a forced break, so each sheet occupies
+// ceil(sheetHeight / pageHeight) physical pages. This models exactly that.
+
+const IOS_PRINT = { pointsWide: 612, pointsHigh: 792, minimumShrink: 1.25 };
+function iosPhysicalPages({ documentWidth, sheetHeights }) {
+  const layoutWidth = Math.max(IOS_PRINT.pointsWide * IOS_PRINT.minimumShrink, documentWidth || 0);
+  const pageHeight = Math.floor(layoutWidth * IOS_PRINT.pointsHigh / IOS_PRINT.pointsWide);
+  return { layoutWidth, pageHeight, pages: sheetHeights.reduce((n, h) => n + Math.ceil(h / pageHeight), 0) };
+}
+
+// The page-box CSS the document actually ships, read back out of its <style>.
+function pageBox(html) {
+  const css = html.slice(html.indexOf("<style>") + 7, html.indexOf("</style>"));
+  const rule = (selector) => {
+    const m = css.match(new RegExp(`(?:^|[}\\s])${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`));
+    return m ? m[1] : "";
+  };
+  const px = (decls, prop) => {
+    const m = decls.match(new RegExp(`(?:^|[;\\s])${prop}\\s*:\\s*(-?[\\d.]+)px`));
+    return m ? Number(m[1]) : null;
+  };
+  return { css, rule, px };
+}
+
+test("iOS page model reproduces the on-device failure for an unpinned document width", () => {
+  // The document as ab35aa8 shipped it: sheets of 1040px, no explicit width,
+  // so WebKit prints it at its 765px default - six logical pages become twelve.
+  const { layoutWidth, pageHeight, pages } = iosPhysicalPages({ documentWidth: null, sheetHeights: Array(6).fill(1040) });
+  assert.equal(layoutWidth, 765);
+  assert.equal(pageHeight, 990);
+  assert.equal(pages, 12);
+});
+
+test("every logical page prints as exactly one physical page on iOS", () => {
+  const input = model();
+  input.approaches.forEach((a) => { a.visualization = IMAGES[VIZ_URL(a.id)]; });
+  for (const variant of [model(), input, model({ selectedApproachId: "polished" })]) {
+    const built = buildComprehensivePlanPdf(variant);
+    const { rule, px } = pageBox(built.html);
+    const docWidth = px(rule("html, body"), "width");
+    const sheetWidth = px(rule(".sheet"), "width");
+    const sheetHeight = px(rule(".sheet"), "height");
+    assert.equal(docWidth, PDF_PAGE.width, "html/body pinned to the Letter width");
+    assert.equal(sheetWidth, PDF_PAGE.width, "each sheet is exactly one page wide");
+    const sheets = sheetsOf(built.html).length;
+    const ios = iosPhysicalPages({ documentWidth: docWidth, sheetHeights: Array(sheets).fill(sheetHeight) });
+    assert.equal(ios.pageHeight, PDF_PAGE.height, "WebKit paginates an 816px document at 1056px");
+    assert.equal(ios.pages, built.stats.pageCount, "one physical page per logical page");
+    assert.ok(sheetHeight <= ios.pageHeight - 8, `a safety allowance remains (${ios.pageHeight - sheetHeight}px)`);
+  }
+});
+
+test("the page box keeps header, body and footer inside the page height", () => {
+  const { html } = buildComprehensivePlanPdf(model());
+  const { css, rule, px } = pageBox(html);
+  assert.match(css, /@page\s*\{\s*size:\s*letter;\s*margin:\s*0;\s*\}/);
+  assert.match(rule("html, body"), /margin:0/);
+  assert.match(rule("html, body"), /padding:0/);
+  const sheet = rule(".sheet");
+  assert.match(sheet, /box-sizing:border-box/);
+  assert.match(sheet, /position:relative/);
+  assert.match(sheet, /padding:0/);
+  assert.match(sheet, /border:0/);
+  assert.doesNotMatch(sheet, /overflow\s*:\s*hidden/, "no content is hidden to make the page fit");
+  const sheetHeight = px(sheet, "height");
+
+  // Header, body and footer are absolutely positioned inside the sheet and
+  // end above its bottom edge; nothing flows after the sheet.
+  const headerBottom = px(rule(".brandrule"), "top") + px(rule(".brandrule"), "height");
+  const bodyTop = px(rule(".sheet-body"), "top");
+  const bodyBottom = bodyTop + px(rule(".sheet-body"), "height");
+  const foot = rule(".foot");
+  assert.match(foot, /position:absolute/);
+  const footTop = sheetHeight - px(foot, "bottom") - px(foot, "height");
+  const footBottom = sheetHeight - px(foot, "bottom");
+  assert.ok(headerBottom <= bodyTop, "body starts below the header");
+  assert.ok(bodyBottom <= footTop, `body (${bodyBottom}) ends above the footer (${footTop})`);
+  assert.ok(footBottom <= sheetHeight, "footer inside the sheet");
+  assert.ok(sheetHeight <= PDF_PAGE.height, "sheet inside the page");
+
+  // Every sheet carries its own footer inside its own markup.
+  sheetsOf(html).forEach((s, n) => {
+    const footAt = s.indexOf('<div class="foot">');
+    assert.ok(footAt > 0 && footAt > s.indexOf('<div class="sheet-body">'), `footer ${n + 1} is inside sheet ${n + 1}`);
+  });
+});
+
+test("a break follows every sheet except the last", () => {
+  const { html } = buildComprehensivePlanPdf(model());
+  const { rule } = pageBox(html);
+  assert.match(rule(".sheet"), /page-break-after:always/);
+  assert.match(rule(".sheet:last-child"), /page-break-after:auto/);
+  assert.match(rule(".sheet:last-child"), /break-after:auto/);
+  // The last sheet really is the body's last child: nothing after it could
+  // turn it back into a sheet that breaks.
+  assert.match(html, /<\/div>\s*<\/div>\s*<\/body><\/html>$/);
+  assert.equal(html.slice(html.lastIndexOf('<div class="sheet">')).split('<div class="sheet">').length, 2);
+});
+
+test("nothing is wider than the page, so the document width stays exactly one page", () => {
+  const input = model();
+  input.approaches.forEach((a) => { a.visualization = IMAGES[VIZ_URL(a.id)]; });
+  const { html } = buildComprehensivePlanPdf(input);
+  const { rule, px } = pageBox(html);
+  const inset = px(rule(".sheet-body"), "left");
+  for (const m of html.matchAll(/<img class="(photo|viz)" src="[^"]+" width="(\d+)" height="(\d+)"\/>/g)) {
+    assert.ok(Number(m[2]) + 2 <= PDF_PAGE.width - inset * 2, `${m[1]} ${m[2]}px fits the content width`);
+  }
+  assert.ok(px(rule(".product-card"), "width") * 2 + 12 <= PDF_PAGE.width - inset * 2, "two product cards fit");
+});
+
 // ---- generatePDF render -----------------------------------------------------
 
 // Line endings normalized: the markers below are written with \n.

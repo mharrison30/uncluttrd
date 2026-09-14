@@ -40,22 +40,35 @@ function mergeUploadedPhotoUrl(results, activePlanId, upload) {
 // little unused space at the foot of a page is invisible; an underestimate
 // would overflow into the footer.
 //
-// Every length below is a CSS pixel at 96/in on a US Letter sheet, the
-// geometry both renderers print at (printToFileAsync width 612 x height 792pt).
+// Every length below is a CSS pixel. The page is US Letter at 96px/in -
+// 816 x 1056 - and the document is pinned to exactly that width, because on
+// iOS the width is what decides the page height. printToFileAsync hands
+// WebKit a 612 x 792pt page; WebKit's print layout (PrintContext) first lays
+// the document out at that size times its minimum shrink factor of 1.25,
+// 765px wide, and then cuts pages of floor(documentWidth x 792 / 612) px.
+// A document that merely fills the view is 765px wide, so its pages are 990px
+// tall, not 1056 - which is what split every 1040px sheet in two on iPhone,
+// its footer landing alone on a page of its own. A document exactly 816px
+// wide is laid out again at 816 and paginated at floor(816 x 792 / 612) =
+// 1056px: the same page Chrome and Android print on.
 // ===========================================================================
 
 const PAGE = {
-  // Slightly short of 11in (1056px): each sheet ends in a forced break, so a
-  // shortfall is absorbed by that page alone, while an overshoot of even one
-  // pixel would push a sliver onto an extra blank page.
-  sheetHeight: 1040,
+  width: 816,
+  height: 1056,
+  // Short of the page by a safety allowance: each sheet ends in a forced
+  // break, so a shortfall is absorbed by that page alone, while an overshoot
+  // of even a pixel (float-to-point rounding in the print path) would push a
+  // sliver onto an extra blank page.
+  safetyAllowance: 16,
   sideInset: 72,
   headerHeight: 84,
   bodyTop: 108,
   footerBottom: 30,
   footerHeight: 24,
 };
-PAGE.contentWidth = 816 - PAGE.sideInset * 2;
+PAGE.sheetHeight = PAGE.height - PAGE.safetyAllowance;
+PAGE.contentWidth = PAGE.width - PAGE.sideInset * 2;
 PAGE.bodyHeight = PAGE.sheetHeight - PAGE.footerBottom - PAGE.footerHeight - 18 - PAGE.bodyTop;
 // Space a section's "continued" label takes at the top of a follow-on page.
 const CONTINUED_HEIGHT = 30;
@@ -426,8 +439,15 @@ function rebalance(sheets) {
 const CSS = `
   * { box-sizing:border-box; margin:0; padding:0; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   @page { size: letter; margin: 0; }
-  html, body { font-family:Inter,Helvetica,Arial,sans-serif; background:#FFFFFF; color:#0F2A52; }
-  .sheet { position:relative; height:${PAGE.sheetHeight}px; overflow:hidden; page-break-after:always; break-after:page; }
+  /* Exactly one page wide - see PAGE. Wider would shrink every page; narrower
+     (including "auto", which is WebKit's 765px print view on iOS) makes the
+     pages shorter than the sheets. */
+  html, body { width:${PAGE.width}px; margin:0; padding:0; font-family:Inter,Helvetica,Arial,sans-serif; background:#FFFFFF; color:#0F2A52; }
+  /* One sheet per page: border-box, a fixed height inside the page, and the
+     header, body and footer all positioned within it. No overflow clipping -
+     the layout keeps content inside the body, and nothing is silently cut. */
+  .sheet { position:relative; box-sizing:border-box; width:${PAGE.width}px; height:${PAGE.sheetHeight}px; margin:0; padding:0; border:0;
+           page-break-after:always; break-after:page; page-break-inside:avoid; break-inside:avoid; }
   .sheet:last-child { page-break-after:auto; break-after:auto; }
 
   .brandbar { position:absolute; top:0; left:0; right:0; height:${PAGE.headerHeight - 4}px; background:#0F2A52;
@@ -442,7 +462,8 @@ const CSS = `
   .br1 { color:#FFFFFF; font-size:9px; line-height:12px; font-weight:700; letter-spacing:1.2px; }
   .br2 { color:#C6D2E4; font-size:8.5px; line-height:12px; margin-top:2px; }
 
-  .sheet-body { position:absolute; top:${PAGE.bodyTop}px; left:${PAGE.sideInset}px; right:${PAGE.sideInset}px; height:${PAGE.bodyHeight}px; }
+  .sheet-body { position:absolute; top:${PAGE.bodyTop}px; left:${PAGE.sideInset}px; right:${PAGE.sideInset}px; height:${PAGE.bodyHeight}px;
+                overflow-wrap:break-word; }
   .continued { height:${CONTINUED_HEIGHT}px; font-size:9.5px; line-height:14px; font-weight:700; letter-spacing:1.2px;
                text-transform:uppercase; color:#8A94A6; }
   .foot { position:absolute; left:${PAGE.sideInset}px; right:${PAGE.sideInset}px; bottom:${PAGE.footerBottom}px; height:${PAGE.footerHeight}px;
