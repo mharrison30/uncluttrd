@@ -3,10 +3,10 @@ import {
   StyleSheet, View, Text, TouchableOpacity, ScrollView,
   Image, ActivityIndicator, Linking, StatusBar,
   TextInput, KeyboardAvoidingView, Keyboard, Platform, Alert, Share, Modal as NativeModal, Dimensions, BackHandler, Animated,
-  PanResponder, AppState
+  PanResponder, AppState, Easing, AccessibilityInfo, useWindowDimensions
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import Svg, { Path, Rect, Circle, Polyline, Line } from "react-native-svg";
+import Svg, { Path, Rect, Circle, Polyline, Line, Defs, RadialGradient, Stop } from "react-native-svg";
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 // Area-row swipe-to-delete. gesture-handler 2.28 ships two Swipeable
@@ -24,6 +24,7 @@ import * as Print from "expo-print";
 import * as Sharing from "expo-sharing";
 import { Ionicons } from "@expo/vector-icons";
 import * as Font from "expo-font";
+import * as SplashScreen from "expo-splash-screen";
 import { useFonts, Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold } from "@expo-google-fonts/inter";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Menu, Check, X, AlertTriangle, Sparkles, RefreshCw, HelpCircle, Camera, Image as ImageIcon, FileText, Mail, LogOut, User, Clock, ShoppingBag, Folder, Zap, Star, Diamond, Sofa, Shirt, CarFront, UtensilsCrossed, BedDouble, Monitor, Lightbulb, Wrench, Home, ChevronRight, ChevronLeft, Eye, EyeOff, Layers, Pencil, CookingPot, Bath, Warehouse, WashingMachine, DoorOpen, Trash2, Cable, ShoppingBasket, Box, ShelvingUnit, Anchor, Tag, Archive, Package, MoreHorizontal, Plus, Frame, Leaf, Utensils, Wine, GlassWater, Boxes, Armchair, Sprout, ConciergeBell, Amphora, Container, Blinds, Grid2x2 } from "lucide-react-native";
@@ -40,6 +41,11 @@ import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
 import { PIConfetti } from "react-native-fast-confetti";
 import * as Updates from "expo-updates";
+
+// Hold the native splash until LaunchScreen has laid out - it hides it
+// itself (hideNativeSplashOnce). Called at module load, before the first
+// render, as expo-splash-screen requires.
+SplashScreen.preventAutoHideAsync().catch(() => {});
 
 // TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
 // outside MainApp's closure can log into the same buffer without
@@ -14050,6 +14056,187 @@ async function countProductionLaunchForTracking() {
   }
 }
 
+// ── LAUNCH SCREEN ────────────────────────────────────────────
+// The animated screen between the native splash and the first real screen,
+// shown once per cold launch (AppRoot mounts once per JS runtime, so coming
+// back from the background never shows it again).
+//
+// HANDOFF. The native splash is held (preventAutoHideAsync, at the top of
+// this file) until this screen has laid out, then hidden on the next frame, so
+// the switch is between two identical frames: both are LAUNCH_BACKGROUND,
+// and on iOS both show the approved logo SPLASH_LOGO_WIDTH points wide,
+// centred on the whole screen - exactly where expo-splash-screen's
+// storyboard puts it (app.config.js, ios.imageWidth). That is also why the
+// logo has no entrance animation: fading it up from zero would first make
+// the logo the native splash was already showing disappear. Android's
+// native splash shows the U mark alone (Android 12+ masks splash artwork to
+// a circle), and the full logo simply replaces it.
+//
+// EXIT. The moment `ready` turns true, every running animation is stopped
+// and the whole screen fades out over 200ms from wherever it is, then
+// unmounts. No minimum display time.
+const LAUNCH_BACKGROUND = "#F8FAF9"; // = expo-splash-screen backgroundColor
+const SPLASH_LOGO_WIDTH = 260; // = expo-splash-screen ios.imageWidth
+const FULL_LOGO = require("./assets/uncluttrd-logo-full.png");
+const FULL_LOGO_ASPECT = 457 / 1798; // the asset's own pixel size - uniform scaling only
+
+// Idempotent: onLayout can fire more than once, and hideAsync rejects if the
+// splash is already gone.
+let nativeSplashHidden = false;
+function hideNativeSplashOnce() {
+  if (nativeSplashHidden) return;
+  nativeSplashHidden = true;
+  SplashScreen.hideAsync().catch(() => {});
+}
+
+function LaunchScreen({ ready, onExited }) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const logoWidth = Math.min(SPLASH_LOGO_WIDTH, windowWidth - 48);
+  const logoHeight = logoWidth * FULL_LOGO_ASPECT;
+
+  // Inter may still be loading (it is half of the readiness gate). Whatever
+  // the status line starts in, it keeps, so it never reflows mid-fade.
+  const statusFont = useRef(Font.isLoaded("Inter_500Medium") ? "Inter_500Medium" : undefined).current;
+
+  const screenOpacity = useRef(new Animated.Value(1)).current;
+  const decorOpacity = useRef(new Animated.Value(0)).current;
+  const statusOpacity = useRef(new Animated.Value(0)).current;
+  const dots = useRef([0, 1, 2].map(() => ({ opacity: new Animated.Value(0.3), scale: new Animated.Value(1) }))).current;
+  const running = useRef([]);
+  const exiting = useRef(false);
+  const [reduceMotion, setReduceMotion] = useState(null); // null until the OS answers
+
+  const stopAll = () => {
+    running.current.forEach((a) => a.stop());
+    running.current = [];
+  };
+
+  useEffect(() => {
+    let alive = true;
+    AccessibilityInfo.isReduceMotionEnabled()
+      .then((v) => { if (alive) setReduceMotion(!!v); })
+      .catch(() => { if (alive) setReduceMotion(false); });
+    return () => { alive = false; };
+  }, []);
+
+  // Entrance and dot loop, once reduced-motion is known and unless the exit
+  // has already begun.
+  useEffect(() => {
+    if (reduceMotion === null || exiting.current) return;
+    if (reduceMotion) {
+      // Final state, no motion: text shown, dots still and fully visible.
+      decorOpacity.setValue(1);
+      statusOpacity.setValue(1);
+      dots.forEach((d) => { d.opacity.setValue(1); d.scale.setValue(1); });
+      return;
+    }
+    const easeOut = Easing.out(Easing.cubic);
+    const entrance = Animated.parallel([
+      // The native splash has no tints; bringing them up gently keeps the
+      // handoff frame identical.
+      Animated.timing(decorOpacity, { toValue: 1, duration: 450, easing: easeOut, useNativeDriver: true }),
+      Animated.sequence([
+        Animated.delay(150),
+        Animated.timing(statusOpacity, { toValue: 1, duration: 300, easing: easeOut, useNativeDriver: true }),
+      ]),
+    ]);
+    const pulse = (d, i) => Animated.sequence([
+      Animated.delay(i * 200),
+      Animated.loop(Animated.sequence([
+        Animated.parallel([
+          Animated.timing(d.opacity, { toValue: 1, duration: 400, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+          Animated.timing(d.scale, { toValue: 1.15, duration: 400, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        ]),
+        Animated.parallel([
+          Animated.timing(d.opacity, { toValue: 0.3, duration: 400, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+          Animated.timing(d.scale, { toValue: 1, duration: 400, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        ]),
+        Animated.delay(200),
+      ])),
+    ]);
+    const all = [entrance, ...dots.map(pulse)];
+    running.current = all;
+    all.forEach((a) => a.start());
+    return stopAll;
+  }, [reduceMotion]);
+
+  // Exit as soon as startup is ready - interrupting the entrance if needed.
+  useEffect(() => {
+    if (!ready || exiting.current) return;
+    exiting.current = true;
+    stopAll();
+    const fade = Animated.timing(screenOpacity, { toValue: 0, duration: 200, easing: Easing.out(Easing.quad), useNativeDriver: true });
+    running.current = [fade];
+    fade.start(({ finished }) => { if (finished) onExited(); });
+  }, [ready]);
+
+  // Safety net: stop everything on unmount, and never leave the native
+  // splash up if this screen goes away before it laid out.
+  useEffect(() => () => { stopAll(); hideNativeSplashOnce(); }, []);
+
+  const statusTop = windowHeight / 2 + logoHeight / 2 + 36;
+  const dotColors = [BRAND.green, BRAND.blue, BRAND.ink];
+  // Soft corner glows, as in the concept: radial gradients from a faint tint
+  // to nothing. react-native-svg is already a dependency.
+  const glow = (id, color, peak, cx, cy, r) => (
+    <>
+      <Defs>
+        <RadialGradient id={id} cx={cx} cy={cy} rx={r} ry={r} fx={cx} fy={cy} gradientUnits="userSpaceOnUse">
+          <Stop offset="0" stopColor={color} stopOpacity={peak} />
+          <Stop offset="0.55" stopColor={color} stopOpacity={peak * 0.45} />
+          <Stop offset="1" stopColor={color} stopOpacity="0" />
+        </RadialGradient>
+      </Defs>
+      <Rect x="0" y="0" width={windowWidth} height={windowHeight} fill={`url(#${id})`} />
+    </>
+  );
+
+  return (
+    <Animated.View
+      style={[StyleSheet.absoluteFill, { backgroundColor: LAUNCH_BACKGROUND, opacity: screenOpacity, zIndex: 1000 }]}
+      pointerEvents={ready ? "none" : "auto"}
+      onLayout={() => requestAnimationFrame(hideNativeSplashOnce)}
+    >
+      <Animated.View
+        style={[StyleSheet.absoluteFill, { opacity: decorOpacity }]}
+        pointerEvents="none"
+        accessibilityElementsHidden
+        importantForAccessibility="no-hide-descendants"
+      >
+        <Svg width={windowWidth} height={windowHeight}>
+          {glow("launchGlowGreen", BRAND.green, 0.1, windowWidth * 0.02, windowHeight * 0.15, windowWidth * 0.72)}
+          {glow("launchGlowBlue", BRAND.blue, 0.08, windowWidth * 0.98, windowHeight * 0.87, windowWidth * 0.72)}
+        </Svg>
+      </Animated.View>
+
+      {/* One accessible element for the whole state; the dots never change
+          its label, so the loop does not re-announce. */}
+      <View
+        style={StyleSheet.absoluteFill}
+        accessible
+        accessibilityLabel="Uncluttrd. Getting things ready"
+      >
+        <View style={[StyleSheet.absoluteFill, { alignItems: "center", justifyContent: "center" }]} pointerEvents="none">
+          <Image source={FULL_LOGO} style={{ width: logoWidth, height: logoHeight }} resizeMode="contain" />
+        </View>
+        <View style={{ position: "absolute", left: 24, right: 24, top: statusTop, alignItems: "center" }} pointerEvents="none">
+          <Animated.Text style={{ opacity: statusOpacity, fontSize: 15, color: BRAND.slateText, fontFamily: statusFont, letterSpacing: 0.2 }}>
+            Getting things ready...
+          </Animated.Text>
+          <View style={{ flexDirection: "row", marginTop: 18 }} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+            {dots.map((d, i) => (
+              <Animated.View key={i} style={{
+                width: 8, height: 8, borderRadius: 4, marginHorizontal: 5, backgroundColor: dotColors[i],
+                opacity: d.opacity, transform: [{ scale: d.scale }],
+              }} />
+            ))}
+          </View>
+        </View>
+      </View>
+    </Animated.View>
+  );
+}
+
 // ── ROOT ─────────────────────────────────────────────────────
 function AppRoot() {
   const [user, setUser] = useState(null);
@@ -14281,22 +14468,30 @@ function AppRoot() {
     return unsub;
   }, []);
 
-  if (loading || !fontsLoaded) {
-    return (
+  // Startup gate: unchanged conditions - Inter loaded, and the first
+  // onAuthStateChanged resolved (signed out, or signed in with the user
+  // reloaded and RevenueCat linked or its 8s bound reached).
+  const startupReady = !loading && fontsLoaded;
+  // Cold launch only: AppRoot mounts once per JS runtime.
+  const [showLaunch, setShowLaunch] = useState(true);
+
+  let screen;
+  if (!startupReady) {
+    // Only ever visible if LaunchScreen is gone before startup resolves,
+    // which it never is - kept as the plain fallback it always was.
+    screen = (
       <SafeAreaView style={[s.safe, { alignItems: "center", justifyContent: "center" }]}>
         <View style={s.hdrMark}><DrawerIcon size={54} dark={true} /></View>
         <Text style={[s.hdrName, { marginTop: 12 }]}>Uncluttrd</Text>
         <ActivityIndicator color={BRAND.green} style={{ marginTop: 20 }} />
       </SafeAreaView>
     );
-  }
-
-  // Not logged in, show auth screen
-  if (!user) return <AuthScreen />;
-
-  // Logged in but hasn't dismissed onboarding, show it
-  if (showOnboard && !skipPref) {
-    return <OnboardingScreen onDone={async (skip) => {
+  } else if (!user) {
+    // Not logged in, show auth screen
+    screen = <AuthScreen />;
+  } else if (showOnboard && !skipPref) {
+    // Logged in but hasn't dismissed onboarding, show it
+    screen = <OnboardingScreen onDone={async (skip) => {
       if (skip) {
         setSkipPref(true);
         await AsyncStorage.setItem("skipOnboarding", "true");
@@ -14308,10 +14503,20 @@ function AppRoot() {
       }
       setShowOnboard(false);
     }} />;
+  } else {
+    // Logged in and onboarding done, show main app
+    screen = <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} revenueCatLinkedRef={revenueCatLinkedRef} />;
   }
 
-  // Logged in and onboarding done, show main app
-  return <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} revenueCatLinkedRef={revenueCatLinkedRef} />;
+  // The destination renders underneath from the moment startup is ready, so
+  // the launch screen fades out onto the real first screen. Same wrapper and
+  // child position throughout, so nothing remounts when the overlay leaves.
+  return (
+    <View style={{ flex: 1 }}>
+      {screen}
+      {showLaunch ? <LaunchScreen ready={startupReady} onExited={() => setShowLaunch(false)} /> : null}
+    </View>
+  );
 }
 
 export default function App() {

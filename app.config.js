@@ -124,11 +124,8 @@ module.exports = {
     orientation: "portrait",
     icon: IS_PRODUCTION ? "./assets/icon.png" : "./assets/icon-staging.png",
     userInterfaceStyle: "light",
-    splash: {
-      image: "./assets/splash-icon.png",
-      resizeMode: "contain",
-      backgroundColor: "#0F2A52",
-    },
+    // The native splash is configured by the expo-splash-screen plugin below,
+    // not a top-level `splash` key.
     ios: {
       supportsTablet: true,
       bundleIdentifier: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
@@ -187,6 +184,35 @@ module.exports = {
         },
       ],
       "expo-font",
+      // Native splash, handed off to the animated launch screen in App.js
+      // (LaunchScreen), which starts on the same #F8FAF9 and, on iOS, shows
+      // the same logo at the same size and centre - so SPLASH_LOGO_WIDTH in
+      // App.js must stay equal to ios.imageWidth here.
+      //   iOS: the full approved logo, imageWidth points wide, centred on the
+      //   whole screen by expo-splash-screen's storyboard.
+      //   Android: the U mark alone. Android 12+ draws the splash image as an
+      //   icon inside a circular mask two-thirds of its 288dp canvas (192dp),
+      //   so the wordmark would be cut off; a 140dp U (108 x 140, 177dp
+      //   diagonal) sits inside that circle.
+      [
+        "expo-splash-screen",
+        {
+          backgroundColor: "#F8FAF9",
+          resizeMode: "contain",
+          ios: {
+            backgroundColor: "#F8FAF9",
+            image: "./assets/uncluttrd-logo-full.png",
+            imageWidth: 260,
+            resizeMode: "contain",
+          },
+          android: {
+            backgroundColor: "#F8FAF9",
+            image: "./assets/splash-android-u.png",
+            imageWidth: 140,
+            resizeMode: "contain",
+          },
+        },
+      ],
       "@react-native-firebase/app",
       "@react-native-firebase/analytics",
       [
