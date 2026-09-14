@@ -19,13 +19,16 @@ const {
   assertFails,
 } = require("@firebase/rules-unit-testing");
 const {
-  doc, getDoc, setDoc, updateDoc, deleteDoc, serverTimestamp,
+  doc, getDoc, setDoc, updateDoc, deleteDoc, serverTimestamp, Timestamp,
 } = require("firebase/firestore");
 
 const PROJECT_ID = "demo-uncluttrd-rules";
 const RULES = fs.readFileSync(path.join(__dirname, "..", "firestore.rules"), "utf8");
 const ALICE = "alice-uid";
 const BOB = "bob-uid";
+// The email claim Firebase Auth puts in each user's ID token. The app signs in
+// with email/password only, so every real token carries one.
+const EMAILS = { [ALICE]: "alice@example.invalid", [BOB]: "bob@example.invalid" };
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error("FIRESTORE_EMULATOR_HOST is not set - run this suite through `firebase emulators:exec`.");
@@ -39,7 +42,7 @@ let env;
 // where extra = { referralSource, isNewSignup }).
 const signupPayload = (uid, overrides = {}) => ({
   uid,
-  email: "alice@example.invalid",
+  email: EMAILS[ALICE],
   displayName: "Alice",
   createdAt: serverTimestamp(),
   platform: "ios",
@@ -71,7 +74,9 @@ const existingProfile = {
   hasSeenTutorial: false,
 };
 
-const as = (uid) => env.authenticatedContext(uid).firestore();
+// Signed in the way the app signs in: an ID token whose email claim is the
+// account's own email.
+const as = (uid) => env.authenticatedContext(uid, { email: EMAILS[uid] }).firestore();
 const aliceDoc = (db) => doc(db, "users", ALICE);
 
 async function seed(data) {
@@ -154,6 +159,61 @@ test("h. analysisCountMonth present: DENY", async () => {
 
 test("i. unauthenticated create: DENY", async () => {
   await assertFails(setDoc(doc(env.unauthenticatedContext().firestore(), "users", ALICE), signupPayload(ALICE)));
+});
+
+// ---- create: identity and timestamp pins ------------------------------------
+
+test("s1. valid signup with matching authenticated email and server timestamp: ALLOW", async () => {
+  await assertSucceeds(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { email: EMAILS[ALICE], createdAt: serverTimestamp() })));
+});
+
+test("s2. stored email different from request.auth.token.email: DENY", async () => {
+  await assertFails(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { email: "someone-else@example.invalid" })));
+});
+
+test("s3. auth token without an email claim: DENY", async () => {
+  const noEmailClaim = env.authenticatedContext(ALICE).firestore();
+  await assertFails(setDoc(doc(noEmailClaim, "users", ALICE), signupPayload(ALICE)));
+});
+
+test("s4. stored email absent: DENY", async () => {
+  const p = signupPayload(ALICE);
+  delete p.email;
+  await assertFails(setDoc(aliceDoc(as(ALICE)), p));
+});
+
+test("s5. stored email empty string: DENY", async () => {
+  await assertFails(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { email: "" })));
+});
+
+test("s6. client-supplied createdAt (current client clock) instead of request.time: DENY", async () => {
+  await assertFails(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { createdAt: Timestamp.now() })));
+});
+
+test("s7. client-supplied createdAt in the re-engagement window (27h ago): DENY", async () => {
+  const backdated = Timestamp.fromMillis(Date.now() - 27 * 60 * 60 * 1000);
+  await assertFails(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { createdAt: backdated })));
+});
+
+test("s8. createdAt as a plain string: DENY", async () => {
+  await assertFails(setDoc(aliceDoc(as(ALICE)), signupPayload(ALICE, { createdAt: new Date().toISOString() })));
+});
+
+test("s9. createdAt absent: DENY", async () => {
+  const p = signupPayload(ALICE);
+  delete p.createdAt;
+  await assertFails(setDoc(aliceDoc(as(ALICE)), p));
+});
+
+test("s10. serverTimestamp() resolves to request.time and is stored as a timestamp: ALLOW", async () => {
+  await assertSucceeds(setDoc(aliceDoc(as(ALICE)), minimalPayload(ALICE)));
+  let stored;
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    stored = (await getDoc(doc(ctx.firestore(), "users", ALICE))).data();
+  });
+  assert.ok(stored.createdAt instanceof Timestamp, "createdAt is a Firestore Timestamp");
+  assert.ok(Math.abs(stored.createdAt.toMillis() - Date.now()) < 60 * 1000, "createdAt is the server's current time");
+  assert.equal(stored.email, EMAILS[ALICE]);
 });
 
 test("delete then recreate cannot forge isPro, but a valid recreate is allowed", async () => {

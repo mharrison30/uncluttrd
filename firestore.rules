@@ -21,8 +21,19 @@ service cloud.firestore {
       //   client-owned field can appear without a deliberate rule change.
       //   analysisCount stays on the list only as absent-or-zero, for
       //   compatibility with the check above.
+      // - email must equal the signed-in account's email claim. Cloud
+      //   Functions send the welcome, re-engagement and Pro emails to this
+      //   stored address, so without the pin a client could make Uncluttrd
+      //   mail any address it chose. The app signs in with email/password only
+      //   and always writes the Auth user's email; verification is not
+      //   required because signup does not require it.
+      // - createdAt must be the server timestamp (serverTimestamp() is
+      //   evaluated as request.time). reengagementNudge selects users by this
+      //   field, so a client-chosen value could trigger that email on demand.
       allow create: if request.auth != null && request.auth.uid == userId
         && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time
         && request.resource.data.keys().hasOnly([
              'uid', 'email', 'displayName', 'createdAt', 'platform', 'isPro',
              'isTestAccount', 'referralSource', 'isNewSignup', 'analysisCount'
