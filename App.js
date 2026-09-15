@@ -36,6 +36,7 @@ import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
 import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation, resolveSessionScope } from "./shared/spaceMigration";
 import { mergeUploadedPhotoUrl, buildComprehensivePlanPdf, comprehensivePdfAnalytics } from "./shared/pdfExport";
+import { createLaunchExitController, LAUNCH_EXIT_FADE_MS } from "./shared/launchTiming";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -14072,9 +14073,14 @@ async function countProductionLaunchForTracking() {
 // native splash shows the U mark alone (Android 12+ masks splash artwork to
 // a circle), and the full logo simply replaces it.
 //
-// EXIT. The moment `ready` turns true, every running animation is stopped
-// and the whole screen fades out over 200ms from wherever it is, then
-// unmounts. No minimum display time.
+// EXIT. The screen stays up for at least 700ms from the moment it became
+// visible (first layout, native splash hidden), so a fast startup does not
+// flash it; once that has passed and `ready` is true - whichever comes last -
+// every running animation is stopped and the whole screen fades out over
+// 200ms from wherever it is, then unmounts. The minimum never dismisses a
+// screen that is not ready, and there is no maximum. The decision lives in
+// shared/launchTiming.js (createLaunchExitController), which the tests drive
+// with a fake clock.
 const LAUNCH_BACKGROUND = "#F8FAF9"; // = expo-splash-screen backgroundColor
 const SPLASH_LOGO_WIDTH = 260; // = expo-splash-screen ios.imageWidth
 const FULL_LOGO = require("./assets/uncluttrd-logo-full.png");
@@ -14104,7 +14110,14 @@ function LaunchScreen({ ready, onExited }) {
   const dots = useRef([0, 1, 2].map(() => ({ opacity: new Animated.Value(0.3), scale: new Animated.Value(1) }))).current;
   const running = useRef([]);
   const exiting = useRef(false);
+  const mounted = useRef(true);
+  const layoutFrame = useRef(null);
+  const onExitedRef = useRef(onExited);
+  onExitedRef.current = onExited;
   const [reduceMotion, setReduceMotion] = useState(null); // null until the OS answers
+  // Touches stay blocked while the screen is up - including the minimum wait
+  // after startup is ready, when the destination is already rendered beneath.
+  const [exitStarted, setExitStarted] = useState(false);
 
   const stopAll = () => {
     running.current.forEach((a) => a.stop());
@@ -14160,19 +14173,41 @@ function LaunchScreen({ ready, onExited }) {
     return stopAll;
   }, [reduceMotion]);
 
-  // Exit as soon as startup is ready - interrupting the entrance if needed.
-  useEffect(() => {
-    if (!ready || exiting.current) return;
+  // Exit once both the 700ms minimum and readiness are in - interrupting
+  // the entrance if needed. The controller calls beginExit at most once.
+  const beginExit = () => {
+    if (!mounted.current || exiting.current) return;
     exiting.current = true;
+    setExitStarted(true);
     stopAll();
-    const fade = Animated.timing(screenOpacity, { toValue: 0, duration: 200, easing: Easing.out(Easing.quad), useNativeDriver: true });
+    const fade = Animated.timing(screenOpacity, { toValue: 0, duration: LAUNCH_EXIT_FADE_MS, easing: Easing.out(Easing.quad), useNativeDriver: true });
     running.current = [fade];
-    fade.start(({ finished }) => { if (finished) onExited(); });
-  }, [ready]);
+    fade.start(({ finished }) => { if (finished && mounted.current) onExitedRef.current(); });
+  };
+  const exitController = useRef(null);
+  if (exitController.current === null) exitController.current = createLaunchExitController({ startExit: beginExit });
 
-  // Safety net: stop everything on unmount, and never leave the native
-  // splash up if this screen goes away before it laid out.
-  useEffect(() => () => { stopAll(); hideNativeSplashOnce(); }, []);
+  useEffect(() => { exitController.current.setReady(ready); }, [ready]);
+
+  // Visible = laid out and the native splash hidden, on the same frame.
+  const handleLayout = () => {
+    if (layoutFrame.current !== null || exiting.current) return;
+    layoutFrame.current = requestAnimationFrame(() => {
+      hideNativeSplashOnce();
+      exitController.current.markVisible();
+    });
+  };
+
+  // Unmount: stop every animation, clear the minimum timer and the pending
+  // frame, and never leave the native splash up if this screen goes away
+  // before it laid out.
+  useEffect(() => () => {
+    mounted.current = false;
+    exitController.current.dispose();
+    if (layoutFrame.current !== null) cancelAnimationFrame(layoutFrame.current);
+    stopAll();
+    hideNativeSplashOnce();
+  }, []);
 
   const statusTop = windowHeight / 2 + logoHeight / 2 + 36;
   const dotColors = [BRAND.green, BRAND.blue, BRAND.ink];
@@ -14194,8 +14229,8 @@ function LaunchScreen({ ready, onExited }) {
   return (
     <Animated.View
       style={[StyleSheet.absoluteFill, { backgroundColor: LAUNCH_BACKGROUND, opacity: screenOpacity, zIndex: 1000 }]}
-      pointerEvents={ready ? "none" : "auto"}
-      onLayout={() => requestAnimationFrame(hideNativeSplashOnce)}
+      pointerEvents={exitStarted ? "none" : "auto"}
+      onLayout={handleLayout}
     >
       <Animated.View
         style={[StyleSheet.absoluteFill, { opacity: decorOpacity }]}
