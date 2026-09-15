@@ -10263,7 +10263,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setCompanionVisibleChange(null);
     setCompanionRevealReady(false);
   };
-  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setTierTouched(false); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
+  const reset = () => { dlog(`[PHOTO DEBUG] reset(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setPhoto(null); setResults(null); setShowCompanion(false); setErr(null); setVizImage({}); setVizLoading({}); setPhotoSize({ width: 1, height: 1 }); setVizModal(null); setVizModal(null); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); };
   const goHome = () => { dlog(`[PHOTO DEBUG] goHome(): companionBasePhotoRef ${companionBasePhotoRef.current} -> null | companionOriginalPhotoRef ${companionOriginalPhotoRef.current} -> null`); activePlanIdRef.current = null; setShowMenu(false); setShowHistory(false); setShowFaq(false); setShowAccount(false); setShowMergeReview(false); setShowSpaceInspector(false); setRoomDetailRoomId(null); setResultsCameFromRoomDetail(null); setCompanionEnteredFromResults(false); setResults(null); setShowCompanion(false); setPhoto(null); setErr(null); setVizImage({}); setVizLoading({}); setCurrentPlanId(null); setOrganizeAgainContext(null); setRoomConfirmation(null); recognitionPendingRef.current = null; setRoomFreeformInput(""); setPendingRoomConfirmationResult(null); setJustConfirmedRecognition(null); setCompanionStage("batch-active"); setBatchItems([]); setCompanionBatchIndex(1); setUnresolvedReview(null); setProgressPhoto(null); companionBasePhotoRef.current = null; companionOriginalPhotoRef.current = null; companionOriginalCompressedRef.current = null; setCompanionCompletionRecommended(false); setCompanionCompletionReason(null); setCompanionCompletedProject(null); analysisIdRef.current = null; lastFailedAnalysisRef.current = null; clearCompanionRevealState(); setTimeout(() => homeScrollRef.current?.scrollTo({ y: 0, animated: false }), 100); };
 
   // Android hardware/gesture back button: step back through in-app screens instead of
@@ -10454,12 +10454,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // server just deleted this Auth account server-side - it has to be
       // told) and clear local state, same fields the pre-Phase-C5 version
       // cleared (onAuthStateChanged's own sign-out branch already clears
-      // analysisCount/isPro, but not skipOnboarding or the login form's
-      // own fields - the just-deleted account's email shouldn't stay
-      // prefilled on the sign-in screen).
+      // analysisCount/isPro, but not skipOnboarding). The sign-in form's
+      // email and password live in AuthScreen, which mounts fresh after
+      // sign-out, so there is no form state to clear here - MainApp never
+      // had setEmail/setPassword, and calling them threw a ReferenceError
+      // that this try's catch reported as a failed deletion.
       await signOut(auth);
-      setEmail("");
-      setPassword("");
       await AsyncStorage.removeItem("analysisCount");
       await AsyncStorage.removeItem("isPro");
       await AsyncStorage.removeItem("skipOnboarding");
