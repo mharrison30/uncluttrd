@@ -4,16 +4,25 @@
 //
 // The screen stays up for at least MIN_VISIBLE_BEFORE_EXIT_MS after it
 // became visible - its first layout, with the native splash hidden - so a
-// fast startup does not flash it for a few frames. The exit fade that
-// follows (LAUNCH_EXIT_FADE_MS) brings the shortest total to about 900ms.
+// fast startup still shows the status line arrive and the dots move (900ms
+// was not enough on device). The exit fade that follows
+// (LAUNCH_EXIT_FADE_MS) brings the shortest total to about 1,500ms.
 //
 //   ready before the minimum  -> exit starts when the minimum elapses
 //   ready after the minimum   -> exit starts immediately
 //   not ready                 -> nothing; the minimum alone never exits
 //
 // startExit is called at most once, and never after dispose().
-const MIN_VISIBLE_BEFORE_EXIT_MS = 700;
+const MIN_VISIBLE_BEFORE_EXIT_MS = 1300;
 const LAUNCH_EXIT_FADE_MS = 200;
+
+// Entrance, in ms from the same visible frame. The status line starts at the
+// handoff; the dots start as it finishes, each 150ms after the one before,
+// so all three are moving well before the earliest exit.
+const LAUNCH_ANIMATION = Object.freeze({
+  statusFade: Object.freeze({ delay: 0, duration: 250 }),
+  dots: Object.freeze([0, 1, 2].map((i) => Object.freeze({ delay: 250 + i * 150 }))),
+});
 
 function createLaunchExitController({
   startExit,
@@ -65,4 +74,4 @@ function createLaunchExitController({
   };
 }
 
-module.exports = { createLaunchExitController, MIN_VISIBLE_BEFORE_EXIT_MS, LAUNCH_EXIT_FADE_MS };
+module.exports = { createLaunchExitController, MIN_VISIBLE_BEFORE_EXIT_MS, LAUNCH_EXIT_FADE_MS, LAUNCH_ANIMATION };

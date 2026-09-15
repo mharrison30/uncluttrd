@@ -36,7 +36,7 @@ import { getFunctions, httpsCallable } from "firebase/functions";
 import { evaluateSpaceShadowValidation } from "./shared/spaceShadowValidation";
 import { computeShadowIds, computeShadowBatchId, deriveFullReprojectionDocs, computeRoomSummaryFields, computeAreaSummaryFields, evaluateMigrationCompleteness, MIGRATION_VERSION, computeMergeCandidateId, CANDIDATE_KEY_VERSION, DETECTION_VERSION, getSpaceDisplayName, validateTargetSpace, resolveRecognitionCandidates, dedupeToKnownRooms, routeRoomConfirmation, resolveExistingRoomConfirmation, resolveNewRoomConfirmation, evaluateCandidateInvalidation, resolveSessionScope } from "./shared/spaceMigration";
 import { mergeUploadedPhotoUrl, buildComprehensivePlanPdf, comprehensivePdfAnalytics } from "./shared/pdfExport";
-import { createLaunchExitController, LAUNCH_EXIT_FADE_MS } from "./shared/launchTiming";
+import { createLaunchExitController, LAUNCH_EXIT_FADE_MS, LAUNCH_ANIMATION } from "./shared/launchTiming";
 import Purchases from "react-native-purchases";
 import { getAnalytics, logEvent } from "@react-native-firebase/analytics";
 import Constants from "expo-constants";
@@ -14073,12 +14073,17 @@ async function countProductionLaunchForTracking() {
 // native splash shows the U mark alone (Android 12+ masks splash artwork to
 // a circle), and the full logo simply replaces it.
 //
-// EXIT. The screen stays up for at least 700ms from the moment it became
-// visible (first layout, native splash hidden), so a fast startup does not
-// flash it; once that has passed and `ready` is true - whichever comes last -
-// every running animation is stopped and the whole screen fades out over
-// 200ms from wherever it is, then unmounts. The minimum never dismisses a
-// screen that is not ready, and there is no maximum. The decision lives in
+// ENTRANCE. Timed from the same visible frame (LAUNCH_ANIMATION): the status
+// line fades in over 250ms from the handoff, and the dots start pulsing at
+// 250ms, 150ms apart.
+//
+// EXIT. The screen stays up for at least 1,300ms from the moment it became
+// visible (first layout, native splash hidden), so a fast startup still
+// shows the status line and the dots moving; once that has passed and
+// `ready` is true - whichever comes last - every running animation is
+// stopped and the whole screen fades out over 200ms from wherever it is,
+// then unmounts - about 1,500ms at the shortest. The minimum never dismisses
+// a screen that is not ready, and there is no maximum. The decision lives in
 // shared/launchTiming.js (createLaunchExitController), which the tests drive
 // with a fake clock.
 const LAUNCH_BACKGROUND = "#F8FAF9"; // = expo-splash-screen backgroundColor
@@ -14118,6 +14123,8 @@ function LaunchScreen({ ready, onExited }) {
   // Touches stay blocked while the screen is up - including the minimum wait
   // after startup is ready, when the destination is already rendered beneath.
   const [exitStarted, setExitStarted] = useState(false);
+  // True from the handoff frame; the entrance is timed from it.
+  const [visible, setVisible] = useState(false);
 
   const stopAll = () => {
     running.current.forEach((a) => a.stop());
@@ -14132,10 +14139,10 @@ function LaunchScreen({ ready, onExited }) {
     return () => { alive = false; };
   }, []);
 
-  // Entrance and dot loop, once reduced-motion is known and unless the exit
-  // has already begun.
+  // Entrance and dot loop: from the handoff frame, once reduced-motion is
+  // known, and unless the exit has already begun.
   useEffect(() => {
-    if (reduceMotion === null || exiting.current) return;
+    if (!visible || reduceMotion === null || exiting.current) return;
     if (reduceMotion) {
       // Final state, no motion: text shown, dots still and fully visible.
       decorOpacity.setValue(1);
@@ -14149,12 +14156,12 @@ function LaunchScreen({ ready, onExited }) {
       // handoff frame identical.
       Animated.timing(decorOpacity, { toValue: 1, duration: 450, easing: easeOut, useNativeDriver: true }),
       Animated.sequence([
-        Animated.delay(150),
-        Animated.timing(statusOpacity, { toValue: 1, duration: 300, easing: easeOut, useNativeDriver: true }),
+        Animated.delay(LAUNCH_ANIMATION.statusFade.delay),
+        Animated.timing(statusOpacity, { toValue: 1, duration: LAUNCH_ANIMATION.statusFade.duration, easing: easeOut, useNativeDriver: true }),
       ]),
     ]);
     const pulse = (d, i) => Animated.sequence([
-      Animated.delay(i * 200),
+      Animated.delay(LAUNCH_ANIMATION.dots[i].delay),
       Animated.loop(Animated.sequence([
         Animated.parallel([
           Animated.timing(d.opacity, { toValue: 1, duration: 400, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
@@ -14171,9 +14178,9 @@ function LaunchScreen({ ready, onExited }) {
     running.current = all;
     all.forEach((a) => a.start());
     return stopAll;
-  }, [reduceMotion]);
+  }, [reduceMotion, visible]);
 
-  // Exit once both the 700ms minimum and readiness are in - interrupting
+  // Exit once both the 1,300ms minimum and readiness are in - interrupting
   // the entrance if needed. The controller calls beginExit at most once.
   const beginExit = () => {
     if (!mounted.current || exiting.current) return;
@@ -14195,6 +14202,7 @@ function LaunchScreen({ ready, onExited }) {
     layoutFrame.current = requestAnimationFrame(() => {
       hideNativeSplashOnce();
       exitController.current.markVisible();
+      if (mounted.current) setVisible(true);
     });
   };
 

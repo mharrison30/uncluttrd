@@ -18,7 +18,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const crypto = require("node:crypto");
-const { createLaunchExitController, MIN_VISIBLE_BEFORE_EXIT_MS, LAUNCH_EXIT_FADE_MS } = require(path.join(__dirname, "..", "shared", "launchTiming.js"));
+const { createLaunchExitController, MIN_VISIBLE_BEFORE_EXIT_MS, LAUNCH_EXIT_FADE_MS, LAUNCH_ANIMATION } = require(path.join(__dirname, "..", "shared", "launchTiming.js"));
 
 const ROOT = path.join(__dirname, "..");
 const APP = fs.readFileSync(path.join(ROOT, "App.js"), "utf8").replace(/\r\n/g, "\n");
@@ -142,7 +142,7 @@ test("the dismissal gate is the existing startup gate, and the screen is shown o
   assert.match(launch, /useEffect\(\(\) => \{ exitController\.current\.setReady\(ready\); \}, \[ready\]\);/);
   assert.match(launch, /Animated\.timing\(screenOpacity, \{ toValue: 0, duration: LAUNCH_EXIT_FADE_MS/);
   assert.equal(LAUNCH_EXIT_FADE_MS, 200);
-  assert.equal(MIN_VISIBLE_BEFORE_EXIT_MS, 700);
+  assert.equal(MIN_VISIBLE_BEFORE_EXIT_MS, 1300);
 });
 
 test("the native splash is held from module load and hidden exactly once, on the frame the screen becomes visible", () => {
@@ -197,14 +197,31 @@ function fakeClock() {
   };
 }
 
-function mountLaunchScreen(clock) {
+function mountLaunchScreen(clock, { reduceMotion = false } = {}) {
   const events = [];
   const screen = { mounted: true, exitStartedAt: null, unmountedAt: null, fadeTimer: null, stateUpdatesAfterUnmount: 0 };
+  // The entrance, as LaunchScreen runs it from LAUNCH_ANIMATION once visible:
+  // timers stand in for Animated.delay/timing/loop, and are stopped the way
+  // stopAll() stops the running animations.
+  const animationTimers = new Set();
+  const schedule = (label, ms) => {
+    const id = clock.setTimer(() => { animationTimers.delete(id); events.push([label, clock.now]); }, ms);
+    animationTimers.add(id);
+  };
+  const stopAll = () => { animationTimers.forEach((id) => clock.clearTimer(id)); animationTimers.clear(); };
+  const startEntrance = () => {
+    if (reduceMotion) { events.push(["final-state", clock.now]); return; }
+    const { statusFade, dots } = LAUNCH_ANIMATION;
+    schedule("status-fade-start", statusFade.delay);
+    schedule("status-fade-end", statusFade.delay + statusFade.duration);
+    dots.forEach((d, i) => schedule(`dot${i}-start`, d.delay));
+  };
   const controller = createLaunchExitController({
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
     startExit: () => {
       if (!screen.mounted) { screen.stateUpdatesAfterUnmount++; return; }
+      stopAll();
       events.push(["exit", clock.now]);
       screen.exitStartedAt = clock.now;
       screen.fadeTimer = clock.setTimer(() => {
@@ -215,39 +232,50 @@ function mountLaunchScreen(clock) {
       }, LAUNCH_EXIT_FADE_MS);
     },
   });
+  let visible = false;
   return {
     controller, screen, events,
-    layout: () => controller.markVisible(), // first layout + native splash hidden
+    // The handoff frame: native splash hidden, minimum starts, entrance starts.
+    layout: () => {
+      if (visible) return;
+      visible = true;
+      controller.markVisible();
+      if (!screen.exitStartedAt) startEntrance();
+    },
     setReady: (v) => controller.setReady(v),
+    animationsPending: () => animationTimers.size,
     unmount: () => { // the component's cleanup
       screen.mounted = false;
       controller.dispose();
+      stopAll();
       if (screen.fadeTimer !== null) { clock.clearTimer(screen.fadeTimer); screen.fadeTimer = null; }
     },
   };
 }
 
-test("ready before 700ms: stays up until 700ms, exits then, unmounts after the 200ms fade", () => {
+const exitEvents = (events) => events.filter(([e]) => e === "exit" || e === "unmount");
+
+test("ready before 1,300ms: stays up until 1,300ms, exits then, unmounts after the 200ms fade", () => {
   const clock = fakeClock();
   const s = mountLaunchScreen(clock);
   s.layout();
   clock.advance(120);
   s.setReady(true);
   assert.equal(s.screen.exitStartedAt, null, "not dismissed at readiness");
-  clock.advance(579);
-  assert.equal(s.screen.mounted, true, "still mounted at 699ms");
+  clock.advance(1179);
+  assert.equal(s.screen.mounted, true, "still mounted at 1,299ms");
   assert.equal(s.screen.exitStartedAt, null);
   clock.advance(1);
-  assert.equal(s.screen.exitStartedAt, 700, "exit begins at 700ms");
+  assert.equal(s.screen.exitStartedAt, 1300, "exit begins at 1,300ms");
   clock.advance(199);
-  assert.equal(s.screen.mounted, true, "fading, still mounted at 899ms");
+  assert.equal(s.screen.mounted, true, "fading, still mounted at 1,499ms");
   clock.advance(1);
-  assert.equal(s.screen.unmountedAt, 900, "removed after the fade, about 900ms in total");
-  assert.deepEqual(s.events, [["exit", 700], ["unmount", 900]]);
+  assert.equal(s.screen.unmountedAt, 1500, "removed after the fade, about 1,500ms in total");
+  assert.deepEqual(exitEvents(s.events), [["exit", 1300], ["unmount", 1500]]);
   assert.equal(clock.pending(), 0);
 });
 
-test("ready after 700ms: exit begins immediately, with no added wait", () => {
+test("ready after 1,300ms: exit begins immediately; only the 200ms fade remains", () => {
   const clock = fakeClock();
   const s = mountLaunchScreen(clock);
   s.layout();
@@ -255,15 +283,17 @@ test("ready after 700ms: exit begins immediately, with no added wait", () => {
   assert.equal(s.screen.exitStartedAt, null);
   s.setReady(true);
   assert.equal(s.screen.exitStartedAt, 2350, "same instant as readiness");
-  clock.advance(200);
-  assert.equal(s.screen.unmountedAt, 2550);
+  clock.advance(199);
+  assert.equal(s.screen.mounted, true);
+  clock.advance(1);
+  assert.equal(s.screen.unmountedAt, 2550, "exactly the fade after readiness");
 });
 
-test("not ready at 700ms: the screen stays visible, with no maximum", () => {
+test("not ready at 1,300ms: the screen stays visible, with no maximum", () => {
   const clock = fakeClock();
   const s = mountLaunchScreen(clock);
   s.layout();
-  clock.advance(700);
+  clock.advance(1300);
   assert.equal(s.screen.mounted, true);
   assert.equal(s.screen.exitStartedAt, null, "the minimum alone never dismisses");
   clock.advance(60000);
@@ -274,17 +304,53 @@ test("not ready at 700ms: the screen stays visible, with no maximum", () => {
   assert.equal(s.screen.exitStartedAt, null, "not-ready updates do nothing");
 });
 
+test("status text starts fading at the handoff and finishes at about 250ms", () => {
+  assert.deepEqual({ ...LAUNCH_ANIMATION.statusFade }, { delay: 0, duration: 250 });
+  const clock = fakeClock();
+  const s = mountLaunchScreen(clock);
+  clock.advance(400); // mounted, native splash still up: nothing yet
+  assert.deepEqual(s.events, []);
+  s.layout();
+  clock.advance(0);
+  assert.deepEqual(s.events[0], ["status-fade-start", 400], "fade starts on the handoff frame");
+  clock.advance(250);
+  assert.ok(s.events.some(([e, t]) => e === "status-fade-end" && t === 650), "fade complete 250ms after handoff");
+
+  // And LaunchScreen runs exactly that, from the handoff frame.
+  const launch = APP.slice(APP.indexOf("function LaunchScreen("), APP.indexOf("// ── ROOT"));
+  assert.match(launch, /if \(!visible \|\| reduceMotion === null \|\| exiting\.current\) return;/);
+  assert.match(launch, /\}, \[reduceMotion, visible\]\);/);
+  assert.match(launch, /Animated\.delay\(LAUNCH_ANIMATION\.statusFade\.delay\),\n\s*Animated\.timing\(statusOpacity, \{ toValue: 1, duration: LAUNCH_ANIMATION\.statusFade\.duration/);
+  assert.match(launch, /hideNativeSplashOnce\(\);\n\s*exitController\.current\.markVisible\(\);\n\s*if \(mounted\.current\) setVisible\(true\);/);
+});
+
+test("dots start pulsing at about 250ms after the handoff, 150ms apart, all before the earliest exit", () => {
+  assert.deepEqual(LAUNCH_ANIMATION.dots.map((d) => d.delay), [250, 400, 550]);
+  const clock = fakeClock();
+  const s = mountLaunchScreen(clock);
+  s.layout();
+  s.setReady(true);
+  clock.advance(1300);
+  const starts = s.events.filter(([e]) => /^dot\d-start$/.test(e));
+  assert.deepEqual(starts, [["dot0-start", 250], ["dot1-start", 400], ["dot2-start", 550]]);
+  assert.ok(starts.every(([, t]) => t < MIN_VISIBLE_BEFORE_EXIT_MS), "every dot is moving before the exit can begin");
+
+  const launch = APP.slice(APP.indexOf("function LaunchScreen("), APP.indexOf("// ── ROOT"));
+  assert.match(launch, /const pulse = \(d, i\) => Animated\.sequence\(\[\n\s*Animated\.delay\(LAUNCH_ANIMATION\.dots\[i\]\.delay\),\n\s*Animated\.loop\(/);
+  assert.doesNotMatch(launch, /Animated\.delay\(i \* 200\)/);
+});
+
 test("readiness and the minimum resolving together run exactly one exit", () => {
   for (const readyFirst of [true, false]) {
     const clock = fakeClock();
     const s = mountLaunchScreen(clock);
     s.layout();
-    clock.advance(699);
+    clock.advance(1299);
     if (readyFirst) { s.setReady(true); clock.advance(1); } else { clock.advance(1); s.setReady(true); }
     s.setReady(true); s.setReady(true); // repeated renders with ready
     s.controller.markVisible(); // a second layout
     clock.advance(1000);
-    assert.deepEqual(s.events, [["exit", 700], ["unmount", 900]], `readyFirst=${readyFirst}`);
+    assert.deepEqual(exitEvents(s.events), [["exit", 1300], ["unmount", 1500]], `readyFirst=${readyFirst}`);
   }
 });
 
@@ -295,39 +361,56 @@ test("the minimum is measured from visibility, not mount", () => {
   clock.advance(5000); // mounted but not yet laid out
   assert.equal(s.screen.exitStartedAt, null);
   s.layout();
-  clock.advance(699);
+  clock.advance(1299);
   assert.equal(s.screen.exitStartedAt, null);
   clock.advance(1);
-  assert.equal(s.screen.exitStartedAt, 5700);
+  assert.equal(s.screen.exitStartedAt, 6300);
 });
 
-test("unmount clears the timer; nothing fires or updates state afterwards", () => {
-  // Unmounted during the minimum wait.
+test("unmount clears every pending timer and animation; nothing fires or updates state afterwards", () => {
+  // Unmounted during the entrance and the minimum wait.
   let clock = fakeClock();
   let s = mountLaunchScreen(clock);
   s.layout();
   s.setReady(true);
-  clock.advance(300);
-  assert.equal(clock.pending(), 1, "minimum timer pending");
+  clock.advance(100);
+  assert.ok(s.animationsPending() > 0, "entrance still running");
+  assert.equal(s.controller.state.timerPending, true, "minimum timer pending");
   s.unmount();
-  assert.equal(clock.pending(), 0, "timer cleared on unmount");
+  assert.equal(clock.pending(), 0, "every timer and animation cleared on unmount");
+  assert.equal(s.animationsPending(), 0);
   assert.equal(s.controller.state.timerPending, false);
+  const before = s.events.length;
   clock.advance(5000);
   s.setReady(true);
   s.controller.markVisible();
-  assert.deepEqual(s.events, []);
+  assert.equal(s.events.length, before, "nothing after unmount");
   assert.equal(s.screen.stateUpdatesAfterUnmount, 0);
 
-  // Unmounted mid-fade.
+  // Exit stops the entrance; unmounted mid-fade.
   clock = fakeClock();
   s = mountLaunchScreen(clock);
-  s.layout(); s.setReady(true);
-  clock.advance(800);
+  s.layout();
+  clock.advance(200);
+  s.setReady(true);
+  clock.advance(1100); // exit at 1,300
+  assert.equal(s.animationsPending(), 0, "exit stopped the entrance animations");
+  clock.advance(100);
   s.unmount();
   clock.advance(5000);
-  assert.deepEqual(s.events, [["exit", 700]], "no onExited after unmount");
+  assert.deepEqual(exitEvents(s.events), [["exit", 1300]], "no onExited after unmount");
   assert.equal(s.screen.stateUpdatesAfterUnmount, 0);
   assert.equal(clock.pending(), 0);
+});
+
+test("reduced motion: final state at the handoff, no entrance timers, same minimum and exit", () => {
+  const clock = fakeClock();
+  const s = mountLaunchScreen(clock, { reduceMotion: true });
+  s.layout();
+  assert.equal(s.animationsPending(), 0, "no entrance or loop");
+  s.setReady(true);
+  clock.advance(1500);
+  assert.deepEqual(s.events, [["final-state", 0], ["exit", 1300], ["unmount", 1500]]);
 });
 
 test("the controller is the only exit path, on the platform timers by default", () => {
