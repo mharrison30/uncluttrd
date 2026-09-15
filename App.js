@@ -47,6 +47,12 @@ import * as Updates from "expo-updates";
 // itself (hideNativeSplashOnce). Called at module load, before the first
 // render, as expo-splash-screen requires.
 SplashScreen.preventAutoHideAsync().catch(() => {});
+// Hide the native splash instantly rather than with expo-splash-screen's
+// default 400ms fade-out (Android fades by default; iOS does not). The launch
+// screen beneath is on the same background, and its entrance is timed from
+// the handoff frame - a fading splash still covered most of the status
+// line's fade-in on device.
+try { SplashScreen.setOptions({ duration: 0, fade: false }); } catch (e) {}
 
 // TEMP DEBUG. Module-level (not a useRef inside MainApp) so components
 // outside MainApp's closure can log into the same buffer without
@@ -14074,15 +14080,16 @@ async function countProductionLaunchForTracking() {
 // a circle), and the full logo simply replaces it.
 //
 // ENTRANCE. Timed from the same visible frame (LAUNCH_ANIMATION): the status
-// line fades in over 250ms from the handoff, and the dots start pulsing at
-// 250ms, 150ms apart.
+// line fades in over 400ms from the handoff, and the dots start pulsing at
+// 300ms, 150ms apart. The native splash hides instantly (setOptions above),
+// so none of it plays underneath the splash.
 //
-// EXIT. The screen stays up for at least 1,300ms from the moment it became
+// EXIT. The screen stays up for at least 1,700ms from the moment it became
 // visible (first layout, native splash hidden), so a fast startup still
 // shows the status line and the dots moving; once that has passed and
 // `ready` is true - whichever comes last - every running animation is
-// stopped and the whole screen fades out over 200ms from wherever it is,
-// then unmounts - about 1,500ms at the shortest. The minimum never dismisses
+// stopped and the whole screen fades out over 300ms from wherever it is,
+// then unmounts - about 2,000ms at the shortest. The minimum never dismisses
 // a screen that is not ready, and there is no maximum. The decision lives in
 // shared/launchTiming.js (createLaunchExitController), which the tests drive
 // with a fake clock.
@@ -14180,7 +14187,7 @@ function LaunchScreen({ ready, onExited }) {
     return stopAll;
   }, [reduceMotion, visible]);
 
-  // Exit once both the 1,300ms minimum and readiness are in - interrupting
+  // Exit once both the 1,700ms minimum and readiness are in - interrupting
   // the entrance if needed. The controller calls beginExit at most once.
   const beginExit = () => {
     if (!mounted.current || exiting.current) return;
