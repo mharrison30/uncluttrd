@@ -7,6 +7,10 @@ const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const { toFile } = require("openai/uploads");
 const admin = require("firebase-admin");
+// Auth, input-size and replay guards shared by the three AI callables.
+// Everything it exports runs before any provider call, so a rejected
+// request costs nothing with Anthropic.
+const guards = require("./callableGuards");
 // Phase C4 (DeletionImplementation.md): the REAL Phase C3 hard-delete
 // engine, not a second implementation. Firebase Functions deploy only
 // bundles this "functions" source directory (firebase.json), so
@@ -137,91 +141,83 @@ exports.analyzePhoto = onCall(
   async (request) => {
     const { imageBase64, prompt, analysisId, priorPhotoBase64 } = request.data || {};
 
-    if (!imageBase64 || !prompt) {
-      throw new HttpsError("invalid-argument", "Missing image or prompt.");
+    // Auth and input validation first: nothing billable happens above this
+    // line. The 2026-07-15 compatibility shim that let a request through
+    // with no uid and no analysisId - skipping the free-plan limit, the
+    // RevenueCat check and idempotency with it - is removed. Its stated
+    // exit condition (build 15 no longer the live App Store version) was
+    // met at 2.0.0 on 2026-08-18; every supported released client sends
+    // both an ID token and a real analysisId (App.js:7509, canary below).
+    const uid = guards.requireUid(request);
+    guards.requireImage(imageBase64, "image");
+    guards.requirePrompt(prompt);
+    if (priorPhotoBase64 !== undefined && priorPhotoBase64 !== null) {
+      guards.requireImage(priorPhotoBase64, "prior photo");
     }
+    guards.requireAnalysisId(analysisId);
+    console.log(`[analyzePhoto] uid=${guards.uidTag(uid)} imageChars=${imageBase64.length} priorPhoto=${!!priorPhotoBase64} promptChars=${prompt.length}`);
 
-    // HOTFIX (2026-07-15): build 15, the live public App Store version at
-    // time of writing, predates analysisId entirely and calls this function
-    // without it. Requiring request.auth and analysisId as hard
-    // preconditions (added in 85168f3) rejected every real production call
-    // outright - restored to exactly analyzePhoto's pre-85168f3 shape (no
-    // auth requirement, imageBase64/prompt only) for the base call. Auth +
-    // free-plan enforcement + idempotency now only engage when BOTH a uid
-    // and an analysisId are present - the exact shape the Companion-era
-    // client sends. Anything older/different is processed with no count
-    // check and no idempotency protection, same as this function behaved
-    // before 85168f3. See BACKLOG.md - temporary compatibility shim until
-    // build 15 is no longer the live App Store version.
-    const uid = request.auth?.uid || null;
-    const enforceLimit = !!(uid && analysisId);
-    let userRef = null;
-    let idemRef = null;
     let month = null;
     // Authoritative Pro entitlement, resolved ONCE below and reused by both
     // the pre-check and the counting transaction. Declared here so the
-    // transaction can read it; false is the safe default for the
-    // no-uid/no-analysisId shape, which skips limit enforcement entirely
-    // anyway (see the hotfix note above).
+    // transaction can read it.
     let entitled = false;
 
-    if (enforceLimit) {
-      userRef = db.collection("users").doc(uid);
-      // Structured as a subcollection under the user's own doc so ownership is
-      // enforced by path, not a separate uid-match check in code or rules.
-      idemRef = userRef.collection("analysisIdempotency").doc(analysisId);
+    const userRef = db.collection("users").doc(uid);
+    // Structured as a subcollection under the user's own doc so ownership is
+    // enforced by path, not a separate uid-match check in code or rules.
+    const idemRef = userRef.collection("analysisIdempotency").doc(analysisId);
 
-      // Idempotency: a retry of the same analysisId (network retry, Cloud
-      // Function retry) replays the original result - no second Anthropic
-      // call, no second count, no double-counting.
-      const idemSnap = await idemRef.get();
-      if (idemSnap.exists) {
-        const cached = idemSnap.data();
-        return { text: cached.text, analysesRemaining: cached.analysesRemaining };
-      }
+    // Idempotency: a retry of the same analysisId (network retry, Cloud
+    // Function retry) replays the original result - no second Anthropic
+    // call, no second count, no double-counting.
+    const idemSnap = await idemRef.get();
+    if (idemSnap.exists) {
+      const cached = idemSnap.data();
+      return { text: cached.text, analysesRemaining: cached.analysesRemaining };
+    }
 
-      // Pre-check (plain read, outside any transaction) - reject before paying
-      // for an Anthropic call the user isn't entitled to make.
-      const userSnap = await userRef.get();
-      const userData = userSnap.exists ? userSnap.data() : {};
-      month = currentMonthUTC();
+    // Pre-check (plain read, outside any transaction) - reject before paying
+    // for an Anthropic call the user isn't entitled to make.
+    const userSnap = await userRef.get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+    month = currentMonthUTC();
 
-      // Pro entitlement is verified against RevenueCat, NOT read from
-      // users/{uid}.isPro. That field is client-writable under the current
-      // Firestore rules (affectedKeys().hasOnly(['isPro','hasSeenTutorial'])),
-      // so trusting it here meant one updateDoc bought unlimited Anthropic
-      // vision calls. Same authority generateVisualization already uses.
-      //
-      // CANARY_TEST_UID is unconditionally exempt from the free-plan limit,
-      // independent of isPro/RevenueCat state - the canary exists to monitor
-      // analyzePhoto's own availability, not to test subscription gating, and
-      // its entitlement can legitimately lapse on its own (e.g. a sandbox
-      // subscription naturally expiring) without that being a real incident.
-      // Short-circuited BEFORE the RevenueCat call so the canary never
-      // depends on RevenueCat being reachable at all.
-      // Structural fix, not a per-incident Firestore patch - see DecisionLog.md.
-      if (uid === CANARY_TEST_UID.value()) {
-        entitled = true;
+    // Pro entitlement is verified against RevenueCat, NOT read from
+    // users/{uid}.isPro. That field is client-writable under the current
+    // Firestore rules (affectedKeys().hasOnly(['isPro','hasSeenTutorial'])),
+    // so trusting it here meant one updateDoc bought unlimited Anthropic
+    // vision calls. Same authority generateVisualization already uses.
+    //
+    // CANARY_TEST_UID is unconditionally exempt from the free-plan limit,
+    // independent of isPro/RevenueCat state - the canary exists to monitor
+    // analyzePhoto's own availability, not to test subscription gating, and
+    // its entitlement can legitimately lapse on its own (e.g. a sandbox
+    // subscription naturally expiring) without that being a real incident.
+    // Short-circuited BEFORE the RevenueCat call so the canary never
+    // depends on RevenueCat being reachable at all.
+    // Structural fix, not a per-incident Firestore patch - see DecisionLog.md.
+    if (uid === CANARY_TEST_UID.value()) {
+      entitled = true;
+    } else {
+      const verified = await verifyProEntitlement(uid);
+      if (verified === null) {
+        // RevenueCat unreachable or unparseable. Falling back to the cached
+        // mirror rather than denying: an outage must not lock paying users
+        // out of the app's core feature. Same outage policy as
+        // generateVisualization. The exposure this leaves is narrowed to
+        // "forged isPro AND RevenueCat down simultaneously".
+        entitled = userData.isPro === true;
+        console.warn(`[analyzePhoto] uid=${guards.uidTag(uid)} RevenueCat unreachable, falling back to cached isPro=${entitled}`);
       } else {
-        const verified = await verifyProEntitlement(uid);
-        if (verified === null) {
-          // RevenueCat unreachable or unparseable. Falling back to the cached
-          // mirror rather than denying: an outage must not lock paying users
-          // out of the app's core feature. Same outage policy as
-          // generateVisualization. The exposure this leaves is narrowed to
-          // "forged isPro AND RevenueCat down simultaneously".
-          entitled = userData.isPro === true;
-          console.warn(`[analyzePhoto] uid=${uid} RevenueCat unreachable, falling back to cached isPro=${entitled}`);
-        } else {
-          entitled = verified;
-        }
+        entitled = verified;
       }
+    }
 
-      if (!entitled) {
-        const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
-        if (effectiveCount >= FREE_MONTHLY_LIMIT) {
-          throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
-        }
+    if (!entitled) {
+      const effectiveCount = userData.analysisCountMonth === month ? (userData.analysisCount || 0) : 0;
+      if (effectiveCount >= FREE_MONTHLY_LIMIT) {
+        throw new HttpsError("resource-exhausted", "Free plan limit reached for this month.");
       }
     }
 
@@ -313,67 +309,62 @@ exports.analyzePhoto = onCall(
     // accepted per the approved design rather than building a reservation
     // system for a rare concurrency edge case. The user still sees their
     // plan; it's simply not charged against their limit either way.
-    // Skipped entirely for a request with no uid/analysisId (see the
-    // hotfix note above) - there's no safe, idempotency-protected way to
-    // count against a limit for a caller shape that can't dedupe a retry.
     let analysesRemaining = null;
-    if (enforceLimit) {
-      try {
-        await db.runTransaction(async (tx) => {
-          const freshSnap = await tx.get(userRef);
-          const freshData = freshSnap.exists ? freshSnap.data() : {};
-          const expiresAt = admin.firestore.Timestamp.fromMillis(
-            Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
-          );
+    try {
+      await db.runTransaction(async (tx) => {
+        const freshSnap = await tx.get(userRef);
+        const freshData = freshSnap.exists ? freshSnap.data() : {};
+        const expiresAt = admin.firestore.Timestamp.fromMillis(
+          Date.now() + IDEMPOTENCY_TTL_DAYS * 24 * 60 * 60 * 1000
+        );
 
-          // Reuses `entitled` from the pre-check rather than re-reading
-          // isPro or re-querying RevenueCat. Two reasons: a second network
-          // call would double the added latency and could disagree with the
-          // decision the request was already admitted under, and re-reading
-          // freshData.isPro here would reintroduce the exact forgeable path
-          // this change removes. `entitled` already folds in the
-          // CANARY_TEST_UID exemption, which still matters here - without it
-          // canary's analysisCount would climb indefinitely in the background
-          // even though it can never actually be blocked, which is confusing
-          // bookkeeping for an account that isn't really free-tier-metered.
-          //
-          // The transaction still re-reads the COUNT (freshData below), which
-          // is the value that genuinely races between concurrent requests.
-          // Entitlement does not race on that timescale.
-          if (entitled) {
-            analysesRemaining = null;
-            tx.set(idemRef, {
-              text,
-              analysesRemaining: null,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              expiresAt,
-            });
-            return;
-          }
-
-          const freshEffectiveCount = freshData.analysisCountMonth === month ? (freshData.analysisCount || 0) : 0;
-          if (freshEffectiveCount >= FREE_MONTHLY_LIMIT) {
-            // Lost the race - do not increment, do not cache. Anthropic cost
-            // is accepted as spent; the user still gets to see this result.
-            analysesRemaining = 0;
-            return;
-          }
-
-          const newCount = freshEffectiveCount + 1;
-          tx.set(userRef, { analysisCount: newCount, analysisCountMonth: month }, { merge: true });
-          analysesRemaining = FREE_MONTHLY_LIMIT - newCount;
+        // Reuses `entitled` from the pre-check rather than re-reading
+        // isPro or re-querying RevenueCat. Two reasons: a second network
+        // call would double the added latency and could disagree with the
+        // decision the request was already admitted under, and re-reading
+        // freshData.isPro here would reintroduce the exact forgeable path
+        // this change removes. `entitled` already folds in the
+        // CANARY_TEST_UID exemption, which still matters here - without it
+        // canary's analysisCount would climb indefinitely in the background
+        // even though it can never actually be blocked, which is confusing
+        // bookkeeping for an account that isn't really free-tier-metered.
+        //
+        // The transaction still re-reads the COUNT (freshData below), which
+        // is the value that genuinely races between concurrent requests.
+        // Entitlement does not race on that timescale.
+        if (entitled) {
+          analysesRemaining = null;
           tx.set(idemRef, {
             text,
-            analysesRemaining,
+            analysesRemaining: null,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             expiresAt,
           });
+          return;
+        }
+
+        const freshEffectiveCount = freshData.analysisCountMonth === month ? (freshData.analysisCount || 0) : 0;
+        if (freshEffectiveCount >= FREE_MONTHLY_LIMIT) {
+          // Lost the race - do not increment, do not cache. Anthropic cost
+          // is accepted as spent; the user still gets to see this result.
+          analysesRemaining = 0;
+          return;
+        }
+
+        const newCount = freshEffectiveCount + 1;
+        tx.set(userRef, { analysisCount: newCount, analysisCountMonth: month }, { merge: true });
+        analysesRemaining = FREE_MONTHLY_LIMIT - newCount;
+        tx.set(idemRef, {
+          text,
+          analysesRemaining,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt,
         });
-      } catch (txErr) {
-        // The analysis itself already succeeded - don't fail the whole
-        // request over bookkeeping. Log and still return the plan.
-        console.error("analyzePhoto count transaction failed:", txErr.message);
-      }
+      });
+    } catch (txErr) {
+      // The analysis itself already succeeded - don't fail the whole
+      // request over bookkeeping. Log and still return the plan.
+      console.error("analyzePhoto count transaction failed:", txErr.message);
     }
 
     return { text, analysesRemaining };
@@ -399,14 +390,49 @@ exports.compareAreaCandidates = onCall(
   async (request) => {
     const { todayImageBase64, candidates } = request.data || {};
 
-    if (!todayImageBase64 || !Array.isArray(candidates) || candidates.length === 0) {
+    // Auth and validation before any billable work. This function had no
+    // auth check of any kind from its first commit (2cdee90, 2026-08-09)
+    // until this one.
+    const uid = guards.requireUid(request);
+    if (!Array.isArray(candidates) || candidates.length === 0) {
       throw new HttpsError("invalid-argument", "Missing today's photo or candidate reference images.");
     }
+    guards.requireImage(todayImageBase64, "today's photo");
+    if (candidates.length > guards.MAX_CANDIDATES) {
+      throw new HttpsError("invalid-argument", "Too many candidate areas.");
+    }
+    let totalImages = 0;
     for (const c of candidates) {
       if (!c || !c.areaId || !Array.isArray(c.images) || c.images.length === 0) {
         throw new HttpsError("invalid-argument", "Each candidate needs an areaId and at least one reference image.");
       }
+      guards.requireString(c.areaId, "areaId", 200);
+      for (const img of c.images) guards.requireImage(img, "reference image");
+      totalImages += c.images.length;
     }
+    if (totalImages > guards.MAX_TOTAL_IMAGES) {
+      throw new HttpsError("invalid-argument", "Too many reference images.");
+    }
+    console.log(`[compareAreaCandidates] uid=${guards.uidTag(uid)} candidates=${candidates.length} images=${totalImages}`);
+
+    // Replay protection: the same user sending a byte-identical comparison
+    // again (double tap, client retry, replayed payload) gets the stored
+    // answer instead of a second Anthropic call. Ordered by areaId so an
+    // identical set of candidates hashes the same regardless of array order.
+    const normalized = [...candidates]
+      .map((c) => ({ areaId: c.areaId, images: c.images }))
+      .sort((a, b) => String(a.areaId).localeCompare(String(b.areaId)));
+    const requestHash = guards.hashRequest(uid, [
+      "compareAreaCandidates",
+      todayImageBase64,
+      ...normalized.flatMap((c) => [c.areaId, ...c.images]),
+    ]);
+    const replayed = await guards.lookupReplay(db, uid, requestHash);
+    if (replayed) {
+      console.log(`[compareAreaCandidates] uid=${guards.uidTag(uid)} replayed=true`);
+      return replayed;
+    }
+    await guards.consumeSafetyLimit(db, uid, "compareAreaCandidates");
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
     const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
@@ -441,7 +467,9 @@ exports.compareAreaCandidates = onCall(
       });
       const text = message.content.find((b) => b.type === "text")?.text || "";
       console.log(`compareAreaCandidates: candidateAreas=${candidates.length} totalImages=${content.length - 1} stop_reason=${message.stop_reason} inputTokens=${message.usage?.input_tokens} outputTokens=${message.usage?.output_tokens}`);
-      return { text, usage: message.usage || null };
+      const result = { text, usage: message.usage || null };
+      await guards.storeReplay(db, uid, requestHash, result);
+      return result;
     } catch (err) {
       throw new HttpsError("internal", err.message || "Area comparison failed.");
     }
@@ -453,9 +481,30 @@ exports.generateNextAction = onCall(
   async (request) => {
     const { originalImageBase64, beforeImageBase64, afterImageBase64, prompt } = request.data || {};
 
-    if (!originalImageBase64 || !beforeImageBase64 || !afterImageBase64 || !prompt) {
-      throw new HttpsError("invalid-argument", "Missing original/before/after image or prompt.");
+    // Auth and validation before any billable work. The prompt is supplied
+    // by the caller and forwarded to Anthropic, so an unauthenticated
+    // request here was an open arbitrary-prompt proxy onto our key. It is
+    // never forwarded now without a verified uid behind it.
+    const uid = guards.requireUid(request);
+    guards.requireImage(originalImageBase64, "original photo");
+    guards.requireImage(beforeImageBase64, "before photo");
+    guards.requireImage(afterImageBase64, "after photo");
+    guards.requirePrompt(prompt);
+    console.log(`[generateNextAction] uid=${guards.uidTag(uid)} promptChars=${prompt.length}`);
+
+    const requestHash = guards.hashRequest(uid, [
+      "generateNextAction",
+      originalImageBase64,
+      beforeImageBase64,
+      afterImageBase64,
+      prompt,
+    ]);
+    const replayed = await guards.lookupReplay(db, uid, requestHash);
+    if (replayed) {
+      console.log(`[generateNextAction] uid=${guards.uidTag(uid)} replayed=true`);
+      return replayed;
     }
+    await guards.consumeSafetyLimit(db, uid, "generateNextAction");
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
     const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
@@ -484,7 +533,9 @@ exports.generateNextAction = onCall(
       });
 
       const text = message.content.find((b) => b.type === "text")?.text || "";
-      return { text };
+      const result = { text };
+      await guards.storeReplay(db, uid, requestHash, result);
+      return result;
     } catch (err) {
       throw new HttpsError("internal", err.message || "Next action generation failed.");
     }
