@@ -133,7 +133,12 @@ test("the dismissal gate is the existing startup gate, and the screen is shown o
   assert.match(APP, /const startupReady = !loading && fontsLoaded;/);
   assert.match(APP, /const \[showLaunch, setShowLaunch\] = useState\(true\);/);
   assert.equal((APP.match(/setShowLaunch\(/g) || []).length, 1, "only ever set false, by onExited");
-  assert.match(APP, /\{showLaunch \? <LaunchScreen ready=\{startupReady\} onExited=\{\(\) => setShowLaunch\(false\)\} \/> : null\}/);
+  // The gate is still <LaunchScreen ready={startupReady}>, dismissed by its
+  // own onExited. That handler now also starts the ATT flow (covered by
+  // scripts/attMetaFlow.test.js), so the element spans several lines.
+  assert.match(APP, /\{showLaunch \? \(\s*<LaunchScreen\s+ready=\{startupReady\}\s+onExited=\{\(\) => \{/);
+  assert.match(APP, /onExited=\{\(\) => \{\s*setShowLaunch\(false\);/);
+  assert.match(APP, /\/>\s*\) : null\}/);
   // The only timer is the controller's minimum; LaunchScreen adds no maximum
   // and no timer of its own.
   const launch = APP.slice(APP.indexOf("function LaunchScreen("), APP.indexOf("// ── ROOT"));
@@ -383,7 +388,7 @@ test("exit fades the whole container over 300ms, from its current opacity, and u
   // Unmount only on completion.
   assert.match(launch, /fade\.start\(\(\{ finished \}\) => \{ if \(finished && mounted\.current\) onExitedRef\.current\(\); \}\);/);
   // The destination is rendered beneath while it fades.
-  assert.match(APP, /<View style=\{\{ flex: 1 \}\}>\n\s*\{screen\}\n\s*\{showLaunch \? <LaunchScreen/);
+  assert.match(APP, /<View style=\{\{ flex: 1 \}\}>\n\s*\{screen\}\n\s*\{showLaunch \? \(\n\s*<LaunchScreen/);
 });
 
 test("readiness and the minimum resolving together run exactly one exit", () => {

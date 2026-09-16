@@ -69,20 +69,31 @@ const PRODUCTION_ONLY_PLUGINS = IS_PRODUCTION
           clientToken: META_CLIENT_TOKEN,
           displayName: "Uncluttrd",
           scheme: `fb${META_APP_ID}`,
-          // Automatic logging is what records App Install and App Launch -
-          // react-native-fbsdk-next 13.4.3 exposes no activateApp() to call.
-          autoLogAppEventsEnabled: true,
-          advertiserIDCollectionEnabled: true,
-          // Android initialises from its manifest provider at process start;
-          // iOS has no auto-init and is started from App.js.
-          isAutoInitEnabled: true,
+          // ALL THREE OFF, ON BOTH PLATFORMS. Apple rejected build 41 because
+          // the SDK initialised itself, logged events and collected the IDFA
+          // before ATT was answered: that build shipped FacebookAutoInitEnabled,
+          // FacebookAutoLogAppEventsEnabled and
+          // FacebookAdvertiserIDCollectionEnabled all true, so on iOS all of it
+          // happened before JS ran at all.
+          //
+          // These props are global, not per-platform - withFacebook in 13.4.3
+          // merges one flat prop set and hands it to both the iOS and Android
+          // writers, so auto-init cannot be disabled for iOS alone. App.js
+          // initialises explicitly instead (startMetaOnce): after ATT resolves
+          // on iOS, at startup on Android. Automatic event logging is turned
+          // back on there via Settings.setAutoLogAppEventsEnabled(true) before
+          // initializeSDK(), which is what records App Install and App Launch -
+          // 13.4.3 exposes no activateApp() to call.
+          autoLogAppEventsEnabled: false,
+          advertiserIDCollectionEnabled: false,
+          isAutoInitEnabled: false,
         },
       ],
       [
         "expo-tracking-transparency",
         {
           userTrackingPermission:
-            "This identifier will be used to measure the effectiveness of advertising and provide more relevant ads.",
+            "Your permission helps us measure whether our ads lead to app installs and improve how we reach people who may benefit from Uncluttrd.",
         },
       ],
     ]

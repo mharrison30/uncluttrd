@@ -6951,7 +6951,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // savePlanToHistory before confirmedPlan (which has none) is shown.
     setResults(mergeUploadedPhotoUrl(confirmedPlan, newPlanId, lastPhotoUploadRef.current));
     logEvent(getAnalytics(), "plan_completed");
-    requestTrackingPermissionWhenClear();
 
     // Approach Selection: same "usable content produced" analytics proxy as
     // finalizeAnalysisResult's identical check - see its own comment.
@@ -7168,7 +7167,6 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       || returningContext.spaceName || parsed.spaceName || null;
     setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: resolvedRoomName, analysisStage: "summary-ready" });
     logEvent(getAnalytics(), "plan_completed");
-    requestTrackingPermissionWhenClear();
     setOrganizeAgainContext(null);
 
     const resolvedAreaId = (areaIntent && areaIntent.kind !== "new") ? areaIntent.areaId : null;
@@ -7660,8 +7658,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         || returningContext.spaceName || parsed.spaceName || null;
       setResults({ ...parsed, canonicalSpaceId: returningContext.spaceId, spaceName: returningRoomName, analysisStage: "summary-ready" });
       logEvent(getAnalytics(), "plan_completed");
-      requestTrackingPermissionWhenClear();
-      // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
+        // Remembered Home v1 Step 2 (RememberedHomeDesign.md §1d): a
       // returning visit (organizeAgainContext set) creates its plan via
       // createReturningPlan - the Step 1 wrapper around this exact same
       // savePlanToHistory, with canonicalSpaceId supplied - rather than a
@@ -13886,8 +13883,7 @@ async function checkForAppUpdate() {
       : `https://play.google.com/store/apps/details?id=${androidPackage}`;
 
     // Awaited until a button dismisses it, so this function's promise means
-    // "the nudge is finished", not merely "the nudge was asked for". The ATT
-    // prompt waits on exactly that - see requestTrackingPermissionWhenClear.
+    // "the nudge is finished", not merely "the nudge was asked for".
     await new Promise((resolve) => {
       Alert.alert(
         "Update Available",
@@ -13923,143 +13919,123 @@ async function checkForAppUpdate() {
 // App Install and App Launch are logged by Meta's automatic event logging
 // (autoLogAppEventsEnabled in app.config.js) once the SDK is initialised.
 // No custom or conversion events are logged here.
-function startMetaSdk() {
-  if (!IS_PRODUCTION) return;
+// Initialises at most once per JS runtime. metaStarted is set BEFORE the
+// first await, so a second caller landing in the same frame cannot start a
+// second initialisation, and it is not cleared on failure - a retry would
+// risk exactly the double-init this guards against.
+//
+// advertiserTracking is the ATT answer on iOS (granted -> true) and always
+// true on Android, which has no ATT. It decides two things: the SDK-level
+// advertiser tracking flag, and whether the advertising identifier may be
+// collected at all. With it false the SDK runs in a configuration that uses
+// no IDFA and no tracking identifier; SKAdNetwork attribution, which needs
+// neither, is unaffected either way.
+let metaStarted = false;
+async function startMetaOnce(advertiserTracking) {
+  if (!IS_PRODUCTION || metaStarted) return;
+  metaStarted = true;
   try {
-    require("react-native-fbsdk-next").Settings.initializeSDK();
+    const { Settings } = require("react-native-fbsdk-next");
+    // iOS only in 13.4.3 (FBSettings resolves to false on Android). Set
+    // before initializeSDK so the very first automatic event carries the
+    // right tracking state.
+    if (Platform.OS === "ios") {
+      await Settings.setAdvertiserTrackingEnabled(advertiserTracking);
+    }
+    Settings.setAdvertiserIDCollectionEnabled(advertiserTracking);
+    // app.config.js ships autoLogAppEventsEnabled false, so nothing is
+    // logged before this point. Enabling it here, before initializeSDK, is
+    // what records App Install and App Launch - 13.4.3 has no activateApp().
+    Settings.setAutoLogAppEventsEnabled(true);
+    Settings.initializeSDK();
   } catch (e) {
     console.log("Meta SDK init error:", e.message);
   }
 }
 
-// ── ATT TIMING ───────────────────────────────────────────────
-// iOS production only. Meta SDK initialisation above never waits on any of it.
-//
-// WHEN: never during the first production launch. From the second launch on,
-// the prompt is requested at startup, and again whenever a plan is completed,
-// but only while the system status is still "undetermined" - once the user has
-// answered (or the OS has decided), it is never requested again. A first plan
-// completed during launch one is therefore answered on launch two.
-//
-// NOTHING ELSE ON SCREEN: the prompt is only presented after the startup
-// "Update Available" check has fully finished (its dialog shown AND dismissed,
-// or never needed), with no alert or modal visible, and with the app active.
-// Visibility is tracked centrally rather than at the 55 alert and 12 modal call
-// sites: Alert.alert is wrapped to count open alerts until a button closes
-// them, and <Modal> below is a thin wrapper that counts while visible. Both
-// render exactly what they did before. Not covered: overlays that are plain
-// Views rather than Modals, and system sheets (share, print, photo picker).
-//
-// No IDFA is read here. getTrackingPermissionsAsync reads the authorisation
-// status only; this code never calls getAdvertisingId.
-const TRACKS_OVERLAYS = IS_PRODUCTION && Platform.OS === "ios";
-const ATT_LAUNCH_COUNT_KEY = "attProductionLaunchCount";
-// How long "nothing visible" must hold before presenting, so a dismissal
-// animation or an alert chained from a button press is not raced.
-const OVERLAY_SETTLE_MS = 800;
-
-let visibleOverlays = 0;
-const overlayListeners = new Set();
-function changeVisibleOverlays(delta) {
-  visibleOverlays = Math.max(0, visibleOverlays + delta);
-  overlayListeners.forEach((listener) => listener());
-}
-
-if (TRACKS_OVERLAYS) {
-  const presentAlert = Alert.alert;
-  Alert.alert = (title, message, buttons, options) => {
-    let open = true;
-    const close = () => {
-      if (open) { open = false; changeVisibleOverlays(-1); }
-    };
-    // A lone button with no text is what RN itself sends when a caller passes no
-    // buttons: iOS still shows its localised default "OK", and the callback now
-    // reports the dismissal.
-    const source = Array.isArray(buttons) && buttons.length ? buttons : [{}];
-    const tracked = source.map((button) => ({
-      ...button,
-      onPress: (...args) => {
-        close();
-        return button.onPress ? button.onPress(...args) : undefined;
-      },
-    }));
-    changeVisibleOverlays(1);
-    presentAlert.call(Alert, title, message, tracked, options);
-  };
-}
-
-// Stands in for react-native's Modal throughout this file (imported as
-// NativeModal). RN's Modal defaults `visible` to true, so only an explicit
-// false counts as hidden.
-function Modal(props) {
-  const shown = props.visible !== false;
-  useEffect(() => {
-    if (!TRACKS_OVERLAYS || !shown) return undefined;
-    changeVisibleOverlays(1);
-    return () => changeVisibleOverlays(-1);
-  }, [shown]);
-  return <NativeModal {...props} />;
-}
-
-function waitUntilNothingIsPresented() {
-  return new Promise((resolve) => {
-    let timer = null;
-    let appStateSub = null;
-    const clear = () => visibleOverlays === 0 && AppState.currentState === "active";
-    function finish() {
-      clearTimeout(timer);
-      overlayListeners.delete(check);
-      if (appStateSub) appStateSub.remove();
-      resolve();
-    }
-    function check() {
-      clearTimeout(timer);
-      if (!clear()) return;
-      timer = setTimeout(() => { if (clear()) finish(); }, OVERLAY_SETTLE_MS);
-    }
-    overlayListeners.add(check);
-    appStateSub = AppState.addEventListener("change", check);
-    check();
-  });
-}
-
-// Settled by AppRoot once checkForAppUpdate has finished, dialog included.
-let settleAppUpdateCheck;
-const appUpdateCheckSettled = new Promise((resolve) => { settleAppUpdateCheck = resolve; });
-
-// Null until this launch has been counted. A plan completed before then is
-// not eligible, which errs toward not asking.
-let productionLaunchNumber = null;
-let trackingRequestInFlight = false;
-
-async function requestTrackingPermissionWhenClear() {
-  if (!TRACKS_OVERLAYS || trackingRequestInFlight) return;
-  if (productionLaunchNumber === null || productionLaunchNumber < 2) return;
-  trackingRequestInFlight = true;
+// The only sanctioned way to send a Meta event. Before a compliant
+// initialisation it is a no-op: it never initialises the SDK implicitly, so
+// an event added later cannot resurrect the pre-ATT tracking this fixes.
+// Nothing calls it yet - the app logs no custom Meta events.
+function logMetaEvent(eventName, params) {
+  if (!IS_PRODUCTION || !metaStarted) return;
   try {
-    const tracking = require("expo-tracking-transparency");
-    if ((await tracking.getTrackingPermissionsAsync()).status !== "undetermined") return;
-    await appUpdateCheckSettled;
-    await waitUntilNothingIsPresented();
-    // Re-read: the wait can be long, and the answer may have changed meanwhile.
-    if ((await tracking.getTrackingPermissionsAsync()).status !== "undetermined") return;
-    await tracking.requestTrackingPermissionsAsync();
+    require("react-native-fbsdk-next").AppEventsLogger.logEvent(eventName, params || {});
   } catch (e) {
-    console.log("Tracking permission error:", e.message);
-  } finally {
-    trackingRequestInFlight = false;
+    console.log("Meta event error:", e.message);
   }
 }
 
-async function countProductionLaunchForTracking() {
-  if (!TRACKS_OVERLAYS) return;
+// ── ATT ────────────────────────
+// iOS production only, on the FIRST launch, before Meta exists.
+//
+// Apple rejected build 41 (submission 9c79a096) because the prompt was not
+// visible on a fresh install: the old flow skipped launch one entirely,
+// counted launches in AsyncStorage, and then waited for the update dialog to
+// settle and for every alert and modal to close. A reviewer cold-launching
+// once never saw it, while the SDK - auto-initialising natively before JS -
+// had already logged an install and read the IDFA.
+//
+// Now: the launch screen finishes (which already means auth resolved), then
+// the system ATT status is read. Still undetermined, the prompt is requested
+// immediately; already answered, it is never requested again and that system
+// status alone decides. Meta is initialised only after the answer, once.
+//
+// The answer changes nothing the user can see or do. Every screen, feature
+// and account path behaves identically either way; the only difference is
+// whether the Meta SDK is configured with advertiser tracking on or off.
+//
+// No IDFA is read here. getTrackingPermissionsAsync reads the authorisation
+// status only; this code never calls getAdvertisingId.
+const REQUESTS_ATT = IS_PRODUCTION && Platform.OS === "ios";
+
+// Stands in for the react-native Modal throughout this file (imported as
+// NativeModal), so every <Modal> call site keeps rendering what it always
+// did. It used to count visible overlays for the old ATT delay; that delay,
+// and the Alert.alert wrapper that fed it, are gone.
+function Modal(props) {
+  return <NativeModal {...props} />;
+}
+
+// Resolves once the app is foreground-active, so the prompt is never
+// requested while iOS would refuse to present it.
+function whenAppIsActive() {
+  if (AppState.currentState === "active") return Promise.resolve();
+  return new Promise((resolve) => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") { sub.remove(); resolve(); }
+    });
+  });
+}
+
+// Single entry point, called when the launch screen has finished. Every path
+// ends with Meta either started with a definite tracking answer, or (staging)
+// never started at all.
+let trackingResolutionStarted = false;
+async function resolveTrackingThenStartMeta() {
+  if (!IS_PRODUCTION || trackingResolutionStarted) return;
+  trackingResolutionStarted = true;
+  // Android has no ATT: initialise straight away with tracking enabled,
+  // exactly as the released Android binary behaves today.
+  if (!REQUESTS_ATT) {
+    await startMetaOnce(true);
+    return;
+  }
   try {
-    const previous = parseInt(await AsyncStorage.getItem(ATT_LAUNCH_COUNT_KEY), 10) || 0;
-    productionLaunchNumber = previous + 1;
-    await AsyncStorage.setItem(ATT_LAUNCH_COUNT_KEY, String(productionLaunchNumber));
-    requestTrackingPermissionWhenClear();
+    const tracking = require("expo-tracking-transparency");
+    await whenAppIsActive();
+    // The system status is the authority - never a locally stored copy.
+    let { status } = await tracking.getTrackingPermissionsAsync();
+    if (status === "undetermined") {
+      ({ status } = await tracking.requestTrackingPermissionsAsync());
+    }
+    // "granted" is the only authorised outcome. iOS reports both .denied and
+    // .restricted as "denied" (expo-tracking-transparency maps them together),
+    // so anything else initialises Meta without tracking rather than not at all.
+    await startMetaOnce(status === "granted");
   } catch (e) {
-    console.log("Tracking launch count error:", e.message);
+    console.log("Tracking permission error:", e.message);
+    await startMetaOnce(false);
   }
 }
 
@@ -14367,18 +14343,10 @@ function AppRoot() {
   }, []);
 
   useEffect(() => {
-    // Meta SDK first and unconditionally. ATT eligibility is counted separately
-    // and never gates it - see startMetaSdk and the ATT TIMING section. Both
-    // are no-ops outside production.
-    startMetaSdk();
-    countProductionLaunchForTracking();
-  }, []);
-
-  useEffect(() => {
     // Soft update-availability nudge - see checkForAppUpdate's own comment.
     // Runs once per app launch, independent of auth state (this is a
     // dismissible nudge about the app itself, not account data).
-    checkForAppUpdate().finally(settleAppUpdateCheck);
+    checkForAppUpdate();
   }, []);
 
   useEffect(() => {
@@ -14564,7 +14532,18 @@ function AppRoot() {
   return (
     <View style={{ flex: 1 }}>
       {screen}
-      {showLaunch ? <LaunchScreen ready={startupReady} onExited={() => setShowLaunch(false)} /> : null}
+      {showLaunch ? (
+        <LaunchScreen
+          ready={startupReady}
+          onExited={() => {
+            setShowLaunch(false);
+            // The launch screen only exits once startup has resolved, so this
+            // is the first moment the app is on screen with auth settled -
+            // where Apple expects the prompt on a fresh install.
+            resolveTrackingThenStartMeta();
+          }}
+        />
+      ) : null}
     </View>
   );
 }
