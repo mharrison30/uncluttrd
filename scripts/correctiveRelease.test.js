@@ -360,10 +360,21 @@ test("the Pro FAQ answer carries both prices and names only what is gated", () =
   assert.match(a, /branded PDF sharing/);
 });
 
-test("My Rooms and working a plan are not described as Pro features", () => {
-  const a = faqsFor("ios").find((f) => f.q === "Where are my saved rooms?").a;
-  assert.match(a, /part of the free plan, and so is working through a plan's checklist/);
-  assert.match(a, /send a progress photo to get their next set of steps/);
+test("the saved-rooms answer answers only the question, with no tier language", () => {
+  // It says where My Rooms is and what it holds. It makes no claim about what
+  // Free includes or what Pro adds, in either direction - those belong in the
+  // Pro answer and on the paywall, stated once.
+  for (const os of ["ios", "android"]) {
+    const a = faqsFor(os).find((f) => f.q === "Where are my saved rooms?").a;
+    assert.equal(
+      a,
+      "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account.",
+      `${os}: saved-rooms answer`,
+    );
+    for (const claim of [/\bfree\b/i, /\bpro\b/i, /upgrade/i, /subscription/i]) {
+      assert.ok(!claim.test(a), `${os}: tier language ${claim} crept back into this answer`);
+    }
+  }
 });
 
 test("no user-facing string sells ordinary Companion guidance as a Pro benefit", () => {
@@ -406,14 +417,6 @@ test("no user-facing string sells ordinary Companion guidance as a Pro benefit",
     }
   }
   assert.deepEqual(offenders, [], offenders.join("\n"));
-});
-
-test("the free side of Companion is still described as free somewhere", () => {
-  // The mirror of the test above: removing the false claim must not leave the
-  // user with no statement at all about what the free plan includes.
-  const a = faqsFor("ios").find((f) => f.q === "Where are my saved rooms?").a;
-  assert.match(a, /free plan/);
-  assert.match(a, /checklist/);
 });
 
 test("onboarding no longer oversells the product links", () => {

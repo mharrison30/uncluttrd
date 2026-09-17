@@ -11861,7 +11861,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro is $2.99 per month or $24.99 per year. It gives you unlimited analyses, AI visualization of your transformed room, photo-based progress check-ins that generate your next set of steps from what changed in the room, and branded PDF sharing. Free users get 3 analyses per month." },
       { q: "What is the AI Visualization feature?", a: "After getting your organization plan, open any approach and tap 'See the transformation' to preview the result: an AI-created image showing what your space could look like under that approach. Each approach has its own visualization, so you can generate one, several, or all three and compare them. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
-      { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. My Rooms is part of the free plan, and so is working through a plan's checklist. Pro members can also send a progress photo to get their next set of steps, and can share a branded PDF." },
+      // Answers only the question asked. The tier language that used to
+      // follow was never part of it: what Pro costs and what it adds are
+      // stated once, in the Pro answer above, and on the paywall.
+      { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account." },
       { q: "How do I cancel my subscription?", a: Platform.OS === "android"
         ? "You can cancel anytime in the Google Play Store: tap your profile icon, then Payments and subscriptions, then Subscriptions, then Uncluttrd. Your Pro access continues until the end of your billing period."
         : "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
