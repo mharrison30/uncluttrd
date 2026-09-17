@@ -301,6 +301,48 @@ test("the paywall claims only what Pro actually does", () => {
   assert.ok(paywall.includes('"Branded PDF exports"'), "kept");
 });
 
+/** The two comparison columns, as ordered lists of their benefit strings. */
+function compareColumns() {
+  const block = region("{/* Free vs Pro comparison */}", "{/* Plan selector */}");
+  const freeStart = block.indexOf("<Text style={s.compareColHeader}>Free</Text>");
+  const proStart = block.indexOf("Pro</Text>");
+  assert.ok(freeStart > 0 && proStart > freeStart, "could not locate both column headers");
+  const strings = (src) => [...src.matchAll(/^\s*"([^"]+)",$/gm)].map((m) => m[1]);
+  return { free: strings(block.slice(freeStart, proStart)), pro: strings(block.slice(proStart)) };
+}
+
+test("the Pro column names the one gated Companion action, in its place", () => {
+  const { pro } = compareColumns();
+  assert.deepEqual(pro, [
+    "Unlimited analyses",
+    "AI visualizations",
+    "Photo check-ins with next steps",
+    "Branded PDF exports",
+  ], "Pro benefits, in display order");
+});
+
+test("the Free column is unchanged", () => {
+  const { free } = compareColumns();
+  assert.deepEqual(free, [
+    "3 analyses/month",
+    "Text sharing",
+    "Great for getting started",
+  ], "Free benefits, in display order");
+});
+
+test("the new Pro row names the photo check-in, not the guidance around it", () => {
+  // The row has to survive the accuracy assertion below, which is the whole
+  // point of wording it as the ACTION (send a photo, get steps) rather than as
+  // the guidance a free user already has.
+  const { pro } = compareColumns();
+  const row = pro.find((t) => /check-in/i.test(t));
+  assert.ok(row, "no check-in row found");
+  assert.ok(!/checklist/i.test(row));
+  assert.ok(!/\bguidance\b/i.test(row));
+  assert.ok(!/task/i.test(row));
+  assert.ok(!/complete/i.test(row));
+});
+
 test("the Go Unlimited subtitle no longer claims room history", () => {
   const sub = region("<Text style={s.paywallSubtitle}>", "</Text>");
   assert.ok(!/room history/i.test(sub), sub);

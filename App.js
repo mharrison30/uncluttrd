@@ -10806,6 +10806,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                   // Same unit as the Free column, so the two are comparable.
                   "Unlimited analyses",
                   "AI visualizations",
+                  // The one genuinely gated action in Companion, and until
+                  // now the only paid capability this column did not name.
+                  // Worded as the ACTION - send a photo, get the next steps -
+                  // because everything around it is free, and a row phrased
+                  // as guidance would claim otherwise.
+                  "Photo check-ins with next steps",
                   "Branded PDF exports",
                   // The priority-results claim is gone because no such path
                   // ever existed: entitlement changes quotas, never
