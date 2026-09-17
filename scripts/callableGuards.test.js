@@ -356,3 +356,153 @@ test("no log line inside the three guarded callables interpolates a raw uid", ()
   }
   assert.deepEqual(offenders, [], "these log lines interpolate a raw uid; use guards.uidTag(uid)");
 });
+
+// ---- 9. analyzePhotoDetail hardening ---------------------------------------
+
+// Before this, analyzePhotoDetail required auth and nothing else: no prompt
+// cap, no quota, no rate limit, and an ownership check that only ran when the
+// caller chose to send planId. Any signed-in account could send unlimited
+// arbitrary prompts at max_tokens 6000 through the Anthropic key.
+
+const DETAIL_PROMPT = "Write the detail for each approach. ".repeat(600); // ~23k chars, a real-sized Call 2 prompt
+const detailData = (over = {}) => ({ prompt: DETAIL_PROMPT, planId: `plan-${uniq()}`, ...over });
+
+/** Creates the plan document analyzePhotoDetail checks ownership against. */
+async function givenPlan(uid, planId) {
+  await db.collection("users").doc(uid).collection("plans").doc(planId).set({ analysisStage: "summary-ready" });
+  return planId;
+}
+
+test("analyzePhotoDetail rejects an unauthenticated call before any provider work", async () => {
+  const err = await expectCode(callAs(fns.analyzePhotoDetail, null, detailData()), "unauthenticated", "no auth");
+  assert.notEqual(err.code, "internal");
+});
+
+test("analyzePhotoDetail requires planId - the hole that skipped ownership entirely", async () => {
+  const uid = `user-${uniq()}`;
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, detailData({ planId: undefined })), "invalid-argument", "missing");
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, detailData({ planId: "" })), "invalid-argument", "empty");
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, detailData({ planId: "a/b" })), "invalid-argument", "path separator");
+});
+
+test("analyzePhotoDetail rejects a plan owned by someone else", async () => {
+  const owner = `user-${uniq()}`;
+  const planId = await givenPlan(owner, `plan-${uniq()}`);
+  const attacker = `user-${uniq()}`;
+  await expectCode(callAs(fns.analyzePhotoDetail, attacker, detailData({ planId })), "permission-denied", "other owner");
+});
+
+test("analyzePhotoDetail rejects a planId that does not exist", async () => {
+  const uid = `user-${uniq()}`;
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, detailData()), "permission-denied", "nonexistent");
+});
+
+test("a real-sized 23,222-character detail prompt is accepted", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const prompt = "x".repeat(23222); // the largest prompt measured across staging and production
+  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt, planId }));
+  assert.equal(err.code, "internal", "must pass the guards and fail only at the invalid provider key");
+});
+
+test("a detail prompt over 40,000 characters is rejected", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const prompt = "x".repeat(guards.MAX_DETAIL_PROMPT_CHARS + 1);
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt, planId }), "invalid-argument", "over detail cap");
+});
+
+test("REGRESSION: analyzePhoto still rejects a prompt over 20,000 characters", async () => {
+  const uid = `user-${uniq()}`;
+  await expectCode(
+    callAs(fns.analyzePhoto, uid, analyzeData({ prompt: "p".repeat(guards.MAX_PROMPT_CHARS + 1) })),
+    "invalid-argument",
+    "analyzePhoto cap unchanged",
+  );
+  assert.equal(guards.MAX_PROMPT_CHARS, 20000, "the deployed Call 1 cap must not move");
+});
+
+test("the per-plan cap rejects the 7th call for that plan", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  for (let i = 0; i < guards.MAX_DETAIL_CALLS_PER_PLAN; i++) {
+    const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+    assert.equal(err.code, "internal", `call ${i + 1} should reach the provider`);
+  }
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }), "resource-exhausted", "7th");
+
+  // A different plan for the same user is unaffected by that plan's counter.
+  const other = await givenPlan(uid, `plan-${uniq()}`);
+  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: other }));
+  assert.equal(err.code, "internal", "per-plan counters must be per plan");
+});
+
+test("a non-entitled user is cut off on the 11th call of the UTC day", async () => {
+  const uid = `user-${uniq()}`;
+  // Spread across plans so the per-plan cap of 6 is never the limiter.
+  for (let i = 0; i < guards.MAX_DETAIL_CALLS_PER_DAY_FREE; i++) {
+    const planId = await givenPlan(uid, `plan-${uniq()}`);
+    const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+    assert.equal(err.code, "internal", `call ${i + 1} of 10 should be allowed`);
+  }
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }), "resource-exhausted", "11th");
+});
+
+test("an entitled user passes 10 and is cut off on the 51st", async () => {
+  // CANARY_TEST_UID takes the entitled branch without reaching RevenueCat,
+  // which is the same short-circuit analyzePhoto uses.
+  const uid = CANARY_UID;
+  await db.collection("users").doc(uid).collection("aiCallGuards").doc("daily_analyzePhotoDetail").delete();
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  // Seed the daily counter just under the entitled cap; per-plan is separate.
+  await db.collection("users").doc(uid).collection("aiCallGuards").doc("daily_analyzePhotoDetail")
+    .set({ day: guards.utcDayKey(), calls: guards.MAX_DETAIL_CALLS_PER_DAY_FREE + 5 });
+  const allowed = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+  assert.equal(allowed.code, "internal", "an entitled user is not stopped at the free ceiling");
+
+  await db.collection("users").doc(uid).collection("aiCallGuards").doc("daily_analyzePhotoDetail")
+    .set({ day: guards.utcDayKey(), calls: guards.MAX_DETAIL_CALLS_PER_DAY_ENTITLED });
+  const planId2 = await givenPlan(uid, `plan-${uniq()}`);
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: planId2 }), "resource-exhausted", "51st");
+});
+
+test("a call that fails validation consumes no count", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const counters = db.collection("users").doc(uid).collection("aiCallGuards");
+
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: "", planId }), "invalid-argument", "empty prompt");
+  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: "nope" }), "permission-denied", "bad plan");
+  await expectCode(callAs(fns.analyzePhotoDetail, null, { prompt: DETAIL_PROMPT, planId }), "unauthenticated", "no auth");
+
+  assert.equal((await counters.doc(`detail_${planId}`).get()).exists, false, "no per-plan count written");
+  assert.equal((await counters.doc("daily_analyzePhotoDetail").get()).exists, false, "no daily count written");
+});
+
+test("the normal success path passes every guard and counts exactly once", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+  // The invalid test key is the only thing between the guards and a real call.
+  assert.equal(err.code, "internal");
+
+  const counters = db.collection("users").doc(uid).collection("aiCallGuards");
+  assert.equal((await counters.doc(`detail_${planId}`).get()).data().calls, 1);
+  const daily = (await counters.doc("daily_analyzePhotoDetail").get()).data();
+  assert.equal(daily.calls, 1);
+  assert.equal(daily.day, guards.utcDayKey(), "counted against the UTC day");
+});
+
+test("an accepted call logs prompt size and cap, and warns past 80% of the cap", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const lines = await captureLogs(async () => {
+    await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: "x".repeat(35000), planId }));
+  });
+  const joined = lines.join("\n");
+  assert.match(joined, /promptChars=35000/);
+  assert.match(joined, /cap=40000/);
+  assert.match(joined, /APPROACHING_PROMPT_CAP/, "88% of the cap must warn");
+  assert.ok(!joined.includes("xxxxxxxxxx"), "prompt content must never be logged");
+});

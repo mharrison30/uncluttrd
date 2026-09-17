@@ -150,12 +150,13 @@ exports.analyzePhoto = onCall(
     // both an ID token and a real analysisId (App.js:7509, canary below).
     const uid = guards.requireUid(request);
     guards.requireImage(imageBase64, "image");
-    guards.requirePrompt(prompt);
+    guards.requirePrompt(prompt, guards.MAX_PROMPT_CHARS);
     if (priorPhotoBase64 !== undefined && priorPhotoBase64 !== null) {
       guards.requireImage(priorPhotoBase64, "prior photo");
     }
     guards.requireAnalysisId(analysisId);
     console.log(`[analyzePhoto] uid=${guards.uidTag(uid)} imageChars=${imageBase64.length} priorPhoto=${!!priorPhotoBase64} promptChars=${prompt.length}`);
+    guards.logPromptSize("analyzePhoto", uid, prompt.length, guards.MAX_PROMPT_CHARS);
 
     let month = null;
     // Authoritative Pro entitlement, resolved ONCE below and reused by both
@@ -565,31 +566,73 @@ exports.generateNextAction = onCall(
 exports.analyzePhotoDetail = onCall(
   { secrets: [ANTHROPIC_KEY], maxInstances: 10, timeoutSeconds: 300 },
   async (request) => {
-    const uid = request.auth?.uid;
-    if (!uid) {
-      throw new HttpsError("unauthenticated", "You must be signed in to finish an analysis.");
-    }
     const { prompt, planId } = request.data || {};
-    if (!prompt) {
-      throw new HttpsError("invalid-argument", "Missing prompt.");
+
+    // Order matters: the cheap checks reject before the Firestore read, and
+    // nothing is counted until all four have passed (auth, planId, ownership,
+    // prompt). A caller who fails validation spends none of their budget.
+    const uid = guards.requireUid(request);
+    // planId is now mandatory. It was optional, and the ownership check below
+    // sat inside `if (planId)` - so omitting it skipped ownership entirely and
+    // left an authenticated, unmetered prompt proxy onto the Anthropic key.
+    // Every client shipped since 7e9f605 sends it (verified across builds 40-43
+    // and vc13-vc15), and runDetailCall returns early without one (App.js:6623),
+    // so requiring it breaks no released build.
+    guards.requirePlanId(planId);
+    // Call 2's prompt is a different shape from Call 1's - an 18,179-character
+    // fixed scaffold plus the entire Call 1 result rendered back as JSON - so it
+    // gets its own ceiling through the same guard, not a second guard.
+    guards.requirePrompt(prompt, guards.MAX_DETAIL_PROMPT_CHARS);
+
+    // Ownership, always - never conditionally. Note this proves the document
+    // exists and belongs to the caller, NOT that it came from a counted
+    // analyzePhoto run: firestore.rules:89-91 lets a signed-in user write
+    // anything into their own plans collection. The caps below are what
+    // actually bound the spend.
+    let snap;
+    try {
+      snap = await db.collection("users").doc(uid).collection("plans").doc(String(planId)).get();
+    } catch (e) {
+      console.error(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} ownership lookup failed: ${e.message}`);
+      throw new HttpsError("internal", "Couldn't verify this plan. Please try again.");
     }
-    // Ownership, same shape as generateVisualization's: a supplied planId
-    // must resolve under this caller's own subcollection. Call 2 always has
-    // one (it exists to finish a plan that has already been written), so
-    // unlike the visualization case there is no null fallback.
-    if (planId) {
-      let snap;
-      try {
-        snap = await db.collection("users").doc(uid).collection("plans").doc(String(planId)).get();
-      } catch (e) {
-        console.error(`[analyzePhotoDetail] uid=${uid} planId=${planId} ownership lookup failed: ${e.message}`);
-        throw new HttpsError("internal", "Couldn't verify this plan. Please try again.");
-      }
-      if (!snap.exists) {
-        console.warn(`[analyzePhotoDetail] uid=${uid} requested planId=${planId} it does not own`);
-        throw new HttpsError("permission-denied", "You don't have access to this plan.");
+    if (!snap.exists) {
+      console.warn(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} requested a plan it does not own`);
+      throw new HttpsError("permission-denied", "You don't have access to this plan.");
+    }
+
+    // Same entitlement authority analyzePhoto uses, for the same reason: the
+    // Firestore isPro mirror is server-owned but RevenueCat is the source of
+    // truth, and an outage must not lock a paying user out. It only selects
+    // which daily ceiling applies.
+    let entitled = false;
+    if (uid === CANARY_TEST_UID.value()) {
+      entitled = true;
+    } else {
+      const verified = await verifyProEntitlement(uid);
+      if (verified === null) {
+        try {
+          const userSnap = await db.collection("users").doc(uid).get();
+          entitled = userSnap.exists && userSnap.data().isPro === true;
+        } catch (e) {
+          entitled = false;
+        }
+        console.warn(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} RevenueCat unreachable, falling back to cached isPro=${entitled}`);
+      } else {
+        entitled = verified;
       }
     }
+    const dailyCap = entitled
+      ? guards.MAX_DETAIL_CALLS_PER_DAY_ENTITLED
+      : guards.MAX_DETAIL_CALLS_PER_DAY_FREE;
+
+    // Both counters are transactional and are never refunded: a failed
+    // Anthropic call still consumed the attempt.
+    await guards.consumeDetailPlanLimit(db, uid, String(planId));
+    await guards.consumeDetailDailyLimit(db, uid, dailyCap);
+
+    guards.logPromptSize("analyzePhotoDetail", uid, prompt.length, guards.MAX_DETAIL_PROMPT_CHARS);
+    console.log(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} accepted entitled=${entitled} dailyCap=${dailyCap}`);
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
     try {

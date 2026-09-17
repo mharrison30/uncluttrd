@@ -36,8 +36,18 @@ const admin = require("firebase-admin");
 // (resize to 768-1568px, compress 0.5), so this is a generous abuse ceiling,
 // not a product limit.
 const MAX_IMAGE_B64_CHARS = 8 * 1024 * 1024;
-// Client prompts run ~2-6k characters.
+// analyzePhoto's prompt is the Call 1 scaffold plus the user's photo context:
+// measured 16,894-17,146 characters across every shape it takes, so 20,000 is
+// a real ceiling with headroom. This value is what production already
+// enforces and it does not move.
 const MAX_PROMPT_CHARS = 20000;
+// analyzePhotoDetail's prompt is a DIFFERENT shape: an 18,179-character fixed
+// instruction scaffold plus the whole Call 1 result rendered back as JSON.
+// Measured 19,573-23,222 across staging and 20,292-23,767 across 18 production
+// plans, so the 20,000 cap would reject roughly nine calls in ten. 40,000
+// leaves ~68% headroom over the largest real prompt while still bounding a
+// hostile one.
+const MAX_DETAIL_PROMPT_CHARS = 40000;
 // The client narrows to at most 3 candidate Areas (App.js:477) with at most
 // 2 distinct reference photos each, plus today's photo.
 const MAX_CANDIDATES = 4;
@@ -81,8 +91,27 @@ function requireImage(value, field) {
   return requireString(value, field, MAX_IMAGE_B64_CHARS);
 }
 
-function requirePrompt(value) {
-  return requireString(value, "prompt", MAX_PROMPT_CHARS);
+// ONE guard, parameterised - not a second differently-configured copy. The
+// default keeps every existing caller on 20,000; analyzePhotoDetail passes
+// MAX_DETAIL_PROMPT_CHARS explicitly.
+function requirePrompt(value, maxChars = MAX_PROMPT_CHARS) {
+  return requireString(value, "prompt", maxChars);
+}
+
+/**
+ * One structured line per accepted call, so prompt growth is visible in Cloud
+ * Logging before it becomes a rejection. Never logs prompt content.
+ * Warns at 80% of the cap: that is the signal to raise the cap deliberately
+ * rather than discover it through a user-facing invalid-argument.
+ */
+function logPromptSize(fnName, uid, promptChars, maxChars) {
+  const pct = Math.round((promptChars / maxChars) * 100);
+  const line = `[${fnName}] uid=${uidTag(uid)} promptChars=${promptChars} cap=${maxChars} pctOfCap=${pct}`;
+  if (pct >= 80) {
+    console.warn(`${line} APPROACHING_PROMPT_CAP`);
+  } else {
+    console.log(line);
+  }
 }
 
 /**
@@ -96,6 +125,19 @@ function requireAnalysisId(value) {
   requireString(value, "analysisId", 128);
   if (!/^[A-Za-z0-9_.:-]+$/.test(value) || value === "." || value === "..") {
     throw new HttpsError("invalid-argument", "analysisId is malformed.");
+  }
+  return value;
+}
+
+/**
+ * planId is a client-supplied Firestore document id, so it carries exactly the
+ * same constraints as analysisId: present, bounded, path-safe. analyzePhotoDetail
+ * requires it - without one its ownership check was skipped entirely.
+ */
+function requirePlanId(value) {
+  requireString(value, "planId", 128);
+  if (!/^[A-Za-z0-9_.:-]+$/.test(value) || value === "." || value === "..") {
+    throw new HttpsError("invalid-argument", "planId is malformed.");
   }
   return value;
 }
@@ -180,9 +222,79 @@ async function consumeSafetyLimit(db, uid, fnName) {
   }
 }
 
+// analyzePhotoDetail is the only AI callable a client can aim at a document
+// it created itself: Firestore rules let a signed-in user write anything into
+// users/{uid}/plans (firestore.rules:89-91), so "this plan exists and you own
+// it" is a necessary check, not a sufficient one. These two caps are what
+// actually bound the spend.
+//
+// Counted AFTER auth, planId, ownership and prompt validation pass, and never
+// refunded when the provider call fails - a failure that consumed our own
+// retry budget is still work we performed.
+const MAX_DETAIL_CALLS_PER_PLAN = 6;
+// A plan legitimately triggers Call 2 on creation, again if the user upgrades
+// mid-session, and once per manual retry. Six leaves four retries after the
+// two automatic runs, well past the point a persistent failure is the cause.
+const MAX_DETAIL_CALLS_PER_DAY_FREE = 10;
+const MAX_DETAIL_CALLS_PER_DAY_ENTITLED = 50;
+// A free account can start at most 3 analyses a month, so 10 detail calls in
+// one UTC day is unreachable through the product. An entitled account has no
+// analysis limit; 50 covers a heavy day (20+ analyses plus retries and the
+// launch sweep healing stranded plans) with room to spare. Both matter because
+// the shipped clients render every rejection as "Tap to retry" - a user who
+// reaches one of these gets a button that cannot succeed until the day rolls.
+
+const utcDayKey = (now = Date.now()) => new Date(now).toISOString().slice(0, 10);
+
+/**
+ * Per-plan ceiling. One transaction, so concurrent calls for the same plan
+ * cannot both pass the last slot.
+ */
+async function consumeDetailPlanLimit(db, uid, planId, max = MAX_DETAIL_CALLS_PER_PLAN) {
+  const ref = guardsCollection(db, uid).doc(`detail_${planId}`);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const used = (snap.exists && typeof snap.data().calls === "number") ? snap.data().calls : 0;
+    if (used >= max) {
+      throw new HttpsError("resource-exhausted", "This plan has been refreshed too many times. Please try again later.");
+    }
+    tx.set(ref, {
+      calls: used + 1,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+}
+
+/**
+ * Per-user ceiling across every plan, reset on the UTC day boundary - the same
+ * calendar basis analyzePhoto's monthly counter uses, so the two agree about
+ * when a day starts.
+ */
+async function consumeDetailDailyLimit(db, uid, max) {
+  const ref = guardsCollection(db, uid).doc("daily_analyzePhotoDetail");
+  const today = utcDayKey();
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : {};
+    const used = data.day === today && typeof data.calls === "number" ? data.calls : 0;
+    if (used >= max) {
+      throw new HttpsError("resource-exhausted", "Daily limit reached. Please try again tomorrow.");
+    }
+    tx.set(ref, {
+      day: today,
+      calls: used + 1,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+}
+
 module.exports = {
   MAX_IMAGE_B64_CHARS,
   MAX_PROMPT_CHARS,
+  MAX_DETAIL_PROMPT_CHARS,
+  MAX_DETAIL_CALLS_PER_PLAN,
+  MAX_DETAIL_CALLS_PER_DAY_FREE,
+  MAX_DETAIL_CALLS_PER_DAY_ENTITLED,
   MAX_CANDIDATES,
   MAX_TOTAL_IMAGES,
   SAFETY_LIMIT_CALLS,
@@ -194,8 +306,13 @@ module.exports = {
   requireImage,
   requirePrompt,
   requireAnalysisId,
+  requirePlanId,
   hashRequest,
   lookupReplay,
   storeReplay,
   consumeSafetyLimit,
+  consumeDetailPlanLimit,
+  consumeDetailDailyLimit,
+  logPromptSize,
+  utcDayKey,
 };
