@@ -75,6 +75,12 @@ const CONTINUED_HEIGHT = 30;
 
 const DEFAULT_APPROACH_NAMES = { simple: "Keep It Simple", polished: "Polished & Practical", elevated: "Elevated Finish" };
 const NO_PRODUCTS_MESSAGE = "No additional products needed for this approach.";
+// Rendered only on an approach that actually lists products, because that is
+// the only place the document carries a recommendation an affiliate link is
+// built from in the app. An approach with none gets NO_PRODUCTS_MESSAGE and
+// no disclosure - there is nothing to disclose about. Wording is identical to
+// the app's Results screen and to uncluttrd.app/disclosure.
+const AFFILIATE_DISCLOSURE = "As an Amazon Associate, Uncluttrd earns from qualifying purchases.";
 const SELECTED_LABEL = "Your Selected Approach";
 
 const escHtml = (v) => String(v ?? "")
@@ -299,8 +305,11 @@ function approachBlocks(model, a, index) {
       const row = `<div class="prodrow">${cell(pair[0])}${pair[1] ? cell(pair[1]) : `<div class="product-card empty-cell"></div>`}</div>`;
       blocks.push(i === 0
         ? {
-          section: a.id, height: 30 + 22 + height, gapBefore: 20,
-          html: (first) => `<div ${gapStyle(20, first)}>${productHeading}<div class="sublbl">A quick shopping list. Open Uncluttrd to browse options for each recommendation.</div>${row}</div>`,
+          // +20 for the disclosure line below the sub-label. Generous by one
+          // line, per this file's own estimate policy: unused space at the
+          // foot of a page is invisible, an underestimate clips.
+          section: a.id, height: 30 + 22 + 20 + height, gapBefore: 20,
+          html: (first) => `<div ${gapStyle(20, first)}>${productHeading}<div class="sublbl">A quick shopping list. Open Uncluttrd to browse options for each recommendation.</div><div class="affiliate">${AFFILIATE_DISCLOSURE}</div>${row}</div>`,
         }
         : { section: a.id, height, html: () => row });
     }
@@ -475,6 +484,7 @@ const CSS = `
   .h2 { font-size:25px; line-height:30px; font-weight:700; color:#0F2A52; letter-spacing:-0.4px; margin-bottom:8px; }
   .lbl { font-size:9px; line-height:12px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:#64748B; margin-bottom:10px; }
   .sublbl { font-size:11px; line-height:16px; color:#64748B; margin:-4px 0 6px 0; }
+  .affiliate { font-size:10px; line-height:14px; color:#8A94A6; margin:0 0 6px 0; }
   .body { font-size:12.5px; line-height:21px; color:#3D4A5C; }
   .lead { font-weight:700; color:#0F2A52; }
 
@@ -599,5 +609,6 @@ module.exports = {
   estimateLines,
   PDF_PAGE: PAGE,
   NO_PRODUCTS_MESSAGE,
+  AFFILIATE_DISCLOSURE,
   SELECTED_LABEL,
 };

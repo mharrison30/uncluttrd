@@ -302,6 +302,31 @@ function buildShadowDocs({ planId, entry, photoUrl }) {
 // for the same planId overwrites the same four documents rather than
 // creating new ones - this is what Task 3's idempotency invariant
 // actually verifies.
+// ---- My Rooms: the one way a Room enters or updates the local list -------
+// The Space document id is the identity key everywhere - the Firestore doc
+// id, the `rooms` entry's `id`, and the React key on the My Rooms card. Every
+// local insertion goes through this, so "is it already here?" is answered the
+// same way each time.
+//
+// Before this, each call site rolled its own: restore filtered by id first,
+// the classify path used an explicit some()/map()/prepend, and
+// submitNewRoomName prepended with no check at all. That last one was safe
+// only because the Room had just been created and could not already be in the
+// list - a property of that call site, not of the operation, and not one a
+// new call site would inherit.
+//
+// An existing entry is MERGED, not replaced, so a refresh that carries only
+// some fields cannot blank the rest; a new one is prepended, matching the
+// newest-first order loadRooms sorts into.
+function upsertRoomById(list, room) {
+  if (!room || !room.id) return list;
+  const i = list.findIndex((r) => r.id === room.id);
+  if (i === -1) return [room, ...list];
+  const next = list.slice();
+  next[i] = { ...next[i], ...room };
+  return next;
+}
+
 // ---- My Rooms -> True Room Grouping, Phase A: Room summary maintenance ----
 // Best-effort, non-transactional, run AFTER a Space/Project write has
 // already committed - never inside the same transaction/batch. Reading a
@@ -913,7 +938,10 @@ async function writeSpaceShadowStructure(uid, planId, entry, photoUrl) {
     if (entry.areaId) {
       await updateAreaSummary(uid, spaceId, entry.areaId);
     }
-    return { outcome: "written", sessionCount: shadow.sessions.length, batchCount };
+    // spaceId travels back so the caller can refresh My Rooms from the Space
+    // this write actually touched, rather than recomputing the id and risking
+    // a different answer than the one that was written.
+    return { outcome: "written", spaceId, sessionCount: shadow.sessions.length, batchCount };
   } catch (e) {
     // A genuine atomic-write failure. No shadow docs exist for this plan
     // at all (writeBatch is all-or-nothing) - there is no document to
@@ -3563,8 +3591,12 @@ const SLIDES = [
   {
     icon: "🛍️",
     title: "Shop the Look",
-    subtitle: "Curated products at every price",
-    desc: "Every plan includes hand-picked product recommendations with direct product links. One tap and you're ready to transform your room.",
+    // The old subtitle and description overstated all of this: nothing is
+    // curated or chosen by us. The recommendation is a product TYPE, and
+    // tapping it opens an Amazon search for that type, never a listing we
+    // picked.
+    subtitle: "Know what to look for",
+    desc: "Every plan includes product recommendations for the space. Tap one to open Amazon search results for that type of product and browse the options available.",
     bg: "#E6F7EE",
   },
 ];
@@ -5672,34 +5704,101 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // in this codebase, e.g. checkOrphanedUserDeletions), and the
   // overwhelming majority of real Spaces never have `retired` set at all.
   // Same isPro-dependency mount-timing reasoning as loadHistory above.
-  useEffect(() => {
-    const loadRooms = async () => {
-      try {
-        const snapshot = await getDocs(collection(db, "users", user.uid, "spaces"));
-        const allSpaces = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-        const nonRetired = allSpaces.filter(s => s.retired !== true);
-        const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
-        nonRetired.sort((a, b) => toMillis(b.lastOrganizedAt || b.createdAt) - toMillis(a.lastOrganizedAt || a.createdAt));
-        console.log("Loaded", nonRetired.length, "rooms from Firestore (", allSpaces.length - nonRetired.length, "retired, filtered)");
-        setRooms(nonRetired);
-
-        // Phase C2: Recently Deleted - deletedAt is the load-bearing
-        // filter, not retired alone (a bare merge tombstone has retired
-        // but no deletedAt, and must never appear here - see
-        // DeletionImplementation.md's contract). 30-day window enforced
-        // client-side too, defense in depth ahead of the eventual
-        // background purge sweep.
-        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-        const recentlyDeleted = allSpaces
-          .filter((s) => s.retired === true && s.deletedAt && (Date.now() - toMillis(s.deletedAt)) <= THIRTY_DAYS_MS)
-          .sort((a, b) => toMillis(b.deletedAt) - toMillis(a.deletedAt));
-        setRecentlyDeletedRooms(recentlyDeleted);
-      } catch (e) {
-        console.log("Load rooms error:", e.message, e.code);
+  //
+  // THE STALE-RELOAD GUARD. loadRooms replaces the whole array, so a reload
+  // that started before a local change and finished after it would undo that
+  // change - and the change this matters most for is a Room that was only
+  // just created, whose Space write may not have committed when the query
+  // ran. The user would watch their new Room appear and then vanish.
+  //
+  // Every local mutation bumps a revision; a load captures it on the way out
+  // and compares on the way back. A mismatch means the answer in hand
+  // describes a list that no longer exists, so it is DISCARDED rather than
+  // merged: local state is already correct for whatever the mutation was
+  // (every mutation path patches `rooms` itself), and merging would have to
+  // guess whether a Room present on the server but missing locally is a
+  // newer arrival or one this device just deleted. Discarding needs no such
+  // guess and can neither drop an insertion nor resurrect a deletion. The
+  // cost is one skipped refresh, and the next open reloads anyway.
+  const roomsRevisionRef = useRef(0);
+  // The ONLY way `rooms` is changed outside loadRooms. Bumping the revision
+  // is not optional bookkeeping - a mutation that skipped it would be the one
+  // an in-flight reload silently reverts.
+  const mutateRooms = (updater) => {
+    roomsRevisionRef.current += 1;
+    setRooms(updater);
+  };
+  // Not memoised, and deliberately not in either dependency array below: it
+  // closes over nothing that changes between renders except user.uid, which
+  // is guarded inside. Listing it would re-run both effects on every render.
+  const loadRooms = async (reason) => {
+    if (!user?.uid) return;
+    const revisionAtStart = roomsRevisionRef.current;
+    try {
+      const snapshot = await getDocs(collection(db, "users", user.uid, "spaces"));
+      const allSpaces = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      const nonRetired = allSpaces.filter(s => s.retired !== true);
+      const toMillis = (t) => (typeof t === "string" ? Date.parse(t) : (t && typeof t.toMillis === "function" ? t.toMillis() : 0));
+      nonRetired.sort((a, b) => toMillis(b.lastOrganizedAt || b.createdAt) - toMillis(a.lastOrganizedAt || a.createdAt));
+      if (roomsRevisionRef.current !== revisionAtStart) {
+        dlog(`[MY ROOMS] discarded a ${reason} reload: rooms changed locally while it was in flight (rev ${revisionAtStart} -> ${roomsRevisionRef.current})`);
+        return;
       }
-    };
-    loadRooms();
+      console.log("Loaded", nonRetired.length, "rooms from Firestore (", allSpaces.length - nonRetired.length, "retired, filtered)");
+      setRooms(nonRetired);
+
+      // Phase C2: Recently Deleted - deletedAt is the load-bearing
+      // filter, not retired alone (a bare merge tombstone has retired
+      // but no deletedAt, and must never appear here - see
+      // DeletionImplementation.md's contract). 30-day window enforced
+      // client-side too, defense in depth ahead of the eventual
+      // background purge sweep.
+      const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+      const recentlyDeleted = allSpaces
+        .filter((s) => s.retired === true && s.deletedAt && (Date.now() - toMillis(s.deletedAt)) <= THIRTY_DAYS_MS)
+        .sort((a, b) => toMillis(b.deletedAt) - toMillis(a.deletedAt));
+      setRecentlyDeletedRooms(recentlyDeleted);
+    } catch (e) {
+      console.log("Load rooms error:", e.message, e.code);
+    }
+  };
+
+  // Refreshes ONE Room from its Space document. This is the single point
+  // every analysis-creation path reaches My Rooms through: savePlanToHistory
+  // calls it when the Space/Project shadow write resolves, and
+  // finishRoomConfirmationSave and finishOrganizeAnotherAreaSave both create
+  // their plans through savePlanToHistory (directly or via
+  // createReturningPlan), so none of the three needs its own copy.
+  //
+  // Serves a new Room and a returning visit alike: upsertRoomById inserts the
+  // first and merges the second, which is what keeps a revisit's
+  // lastOrganizedAt current without a full reload.
+  const refreshRoomFromSpace = async (spaceId) => {
+    if (!user?.uid || !spaceId) return;
+    try {
+      const snap = await getDoc(doc(db, "users", user.uid, "spaces", spaceId));
+      // A Space that is absent or already retired must not be added: the
+      // second is how a merge loser looks, and loadRooms filters it out for
+      // exactly that reason.
+      if (!snap.exists() || snap.data().retired === true) return;
+      mutateRooms((prev) => upsertRoomById(prev, { id: spaceId, ...snap.data() }));
+    } catch (e) {
+      dlog(`[MY ROOMS] could not refresh Room ${spaceId}: ${e.message}`);
+    }
+  };
+
+  useEffect(() => {
+    loadRooms("mount");
   }, [isPro]);
+
+  // Reload when My Rooms is opened. The screen is an early return inside this
+  // same component - not a navigator screen - so it never remounts and gets
+  // no focus event; without this it renders whatever the last load left in
+  // state, which for a first-ever analysis is an empty list under the words
+  // "No rooms yet". Guarded by the same revision check as every other load.
+  useEffect(() => {
+    if (showHistory) loadRooms("my-rooms-open");
+  }, [showHistory]);
 
   // ---- Session Recovery: the recovery query (SessionRecoveryDesign.md §7).
   // The uncapped uid-scoped subcollection query, deliberately NOT the
@@ -6105,7 +6204,20 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // awaited into the caller's critical path beyond this point, and
       // its own try/catch already guarantees it never throws - fire and
       // forget is intentional here, not an oversight.
-      writeSpaceShadowStructure(user.uid, docRef.id, entry, shadowPhotoUrl).then(() => {
+      //
+      // THE SINGLE POINT MY ROOMS IS UPDATED FROM on a new analysis. The
+      // Space document is created by this write and by nothing else, so
+      // anywhere earlier would be announcing a Room that does not exist yet.
+      // Only on outcome "written": the write is all-or-nothing (writeBatch),
+      // so a failure means there is no Space to show, and showing one would
+      // be a lie the next reload silently corrects.
+      //
+      // All three analysis-creation paths reach this line - savePlanToHistory
+      // directly, finishRoomConfirmationSave via savePlanToHistory or
+      // createReturningPlan, finishOrganizeAnotherAreaSave via
+      // finalizeAnalysisResult into the same two - so this is the only copy.
+      writeSpaceShadowStructure(user.uid, docRef.id, entry, shadowPhotoUrl).then((shadowResult) => {
+        if (shadowResult?.outcome === "written") refreshRoomFromSpace(shadowResult.spaceId);
         if (__DEV__) validateSpaceShadowMigration(user.uid, docRef.id);
       });
 
@@ -6912,12 +7024,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // finalizeAnalysisResult. Not awaited - Results renders now and the
     // detail lands underneath it.
     //
-    // The stamp below matters just as much. setResults was handed
-    // confirmedPlan, which carries no analysisStage, so planAnalysisStage()
-    // read it as "complete" and the auto-resume effect - the backstop that
-    // should have caught this - bailed on every render. Stamping the
-    // in-memory object makes that effect a real universal safety net
-    // instead of dead code, for this path and any future one.
+    // The stamp below is now a belt-and-braces one, and it is honest about
+    // that. It only ever patched a NON-null `prev`, and on this path
+    // analyze() has already set results to null before the confirmation
+    // screen appears - so it was a no-op precisely when it was needed, and
+    // the absolute setResults further down overwrote it in the case where it
+    // was not. The real fix is on confirmedPlan itself, at construction in
+    // completeRoomConfirmation: the object this function commits to results
+    // carries analysisStage, so the committed state is correct whatever
+    // results held beforehand. This line stays only to cover the window
+    // between here and that commit when a previous plan is still on screen.
     setResults((prev) => (prev ? { ...prev, analysisStage: "summary-ready" } : prev));
     runDetailCall(newPlanId, confirmedPlan);
 
@@ -6949,6 +7065,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     setRoomConfirmation(null);
     // photoUrl from this plan's own upload, which finished inside
     // savePlanToHistory before confirmedPlan (which has none) is shown.
+    // confirmedPlan carries analysisStage "summary-ready" from its own
+    // construction, so this absolute set - which wins over anything above it -
+    // is what puts the Results screen into the loading state rather than the
+    // empty-detail one. mergeUploadedPhotoUrl only ever adds photoUrl.
     setResults(mergeUploadedPhotoUrl(confirmedPlan, newPlanId, lastPhotoUploadRef.current));
     logEvent(getAnalytics(), "plan_completed");
 
@@ -7013,6 +7133,24 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       spaceName: resolvedResult.confirmedRoomName,
       areaName: resolvedResult.areaName,
       areaScope: resolvedResult.areaScope,
+      // Two-Stage Analysis, stamped HERE, at construction, because this is
+      // the object finishRoomConfirmationSave hands to setResults as an
+      // absolute value (not a functional update) once the save completes.
+      // Without it planAnalysisStage() read the committed results as
+      // "complete" - its backward-compatibility default for plans written
+      // before the split - and the expander took the detail branch with no
+      // detail to show, which rendered an empty card for the whole ~30-70s
+      // Call 2 takes. Stamping the source is what makes the fix independent
+      // of whatever results held beforehand: analyze() sets results to null
+      // before the confirmation screen, so a functional stamp on `prev` was
+      // a no-op on this path and could never have covered it.
+      //
+      // Matches the value savePlanToHistory writes to Firestore for the same
+      // plan, and the explicit stamps finishOrganizeAnotherAreaSave and the
+      // returning-visit path already carry. NOT persisted from here -
+      // savePlanToHistory builds its document from an explicit field list and
+      // never spreads this object.
+      analysisStage: "summary-ready",
     };
 
     if (resolvedResult.outcome === "existing-room" && confirmedPlan.areaScope === "sub-area") {
@@ -7500,7 +7638,16 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
 
       logEvent(getAnalytics(), "plan_started");
 
-      const analyzePhotoFn = httpsCallable(functions, "analyzePhoto");
+      // 310s, deliberately ABOVE the function's own 300s timeoutSeconds. A
+      // client deadline below the server's lets the app give up on a call the
+      // server is still running and about to answer - here that means burning
+      // a month's free analysis on a result the app threw away. This is a
+      // ceiling, not a wait: when the container is killed at 300s the
+      // connection closes and the callable rejects on the transport error
+      // immediately. A planned server-side operation deadline near 280s will
+      // return a controlled error before the platform limit; this number must
+      // stay above that one.
+      const analyzePhotoFn = httpsCallable(functions, "analyzePhoto", { timeout: 310000 });
       let raw = "";
       let analysesRemaining = null; // server's real count, per this analysis - not a local guess
       try {
@@ -8943,7 +9090,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // "stick" on either screen until the next loadRooms() re-fetch.
       const renamedRoomId = resolveRenameTargetRoomId();
       if (renamedRoomId) {
-        setRooms((prev) => prev.map((r) => (r.id === renamedRoomId ? { ...r, displayName: trimmed } : r)));
+        mutateRooms((prev) => prev.map((r) => (r.id === renamedRoomId ? { ...r, displayName: trimmed } : r)));
       }
       setRoomDetailPlans((prev) => prev.map((p) => (p.id === renamePlanTarget.id ? { ...p, spaceName: trimmed } : p)));
       setRenamePlanTarget(null);
@@ -9026,7 +9173,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (result.outcome !== "completed") {
         throw new Error(`${result.movedCount}/${result.totalCount} plans moved - one or more failed. Please try again.`);
       }
-      setRooms((prev) => prev.filter((r) => r.id !== renameDuplicateDialog.sourceRoomId));
+      mutateRooms((prev) => prev.filter((r) => r.id !== renameDuplicateDialog.sourceRoomId));
       if (roomDetailRoomId === renameDuplicateDialog.sourceRoomId) {
         setRoomDetailRoomId(null);
         setShowHistory(true);
@@ -9454,7 +9601,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           getDoc(doc(db, "users", user.uid, "spaces", sourceRoomId)),
           getDoc(doc(db, "users", user.uid, "spaces", targetRoom.id)),
         ]);
-        setRooms((prev) => prev.map((r) => {
+        mutateRooms((prev) => prev.map((r) => {
           if (r.id === sourceRoomId && freshSource.exists()) return { id: r.id, ...freshSource.data() };
           if (r.id === targetRoom.id && freshTarget.exists()) return { id: r.id, ...freshTarget.data() };
           return r;
@@ -9473,7 +9620,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         // once its last Project is gone) - same post-merge state patch
         // handleMovePlansIntoExisting already applies for the identical
         // outcome via the rename-duplicate path.
-        setRooms((prev) => prev.filter((r) => r.id !== room.id));
+        mutateRooms((prev) => prev.filter((r) => r.id !== room.id));
         setMoveConfirmTarget(null);
         setShowHistory(false);
         setRoomDetailRoomId(targetRoom.id);
@@ -9552,10 +9699,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       }
       const freshRoom = await getDoc(doc(db, "users", user.uid, "spaces", targetRoomId));
       if (freshRoom.exists()) {
-        setRooms((prev) => {
-          const next = { id: targetRoomId, ...freshRoom.data() };
-          return prev.some((r) => r.id === targetRoomId) ? prev.map((r) => (r.id === targetRoomId ? next : r)) : [next, ...prev];
-        });
+        mutateRooms((prev) => upsertRoomById(prev, { id: targetRoomId, ...freshRoom.data() }));
       }
       logEvent(getAnalytics(), "session_classified", { planId: classifyFor.id, scope: (targetAreaId || newAreaName) ? "area" : "room" });
       // Release the guard BEFORE closeClassify, which now refuses to run while
@@ -9591,7 +9735,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       if (created.outcome !== "created") throw new Error("Couldn't create that Room. Please try again.");
       const snap = await getDoc(doc(db, "users", user.uid, "spaces", created.roomId));
       const room = { id: created.roomId, ...snap.data() };
-      setRooms((prev) => [room, ...prev]);
+      mutateRooms((prev) => upsertRoomById(prev, room));
       setClassifyName("");
       // Straight into the Area step for the new Room. Its first entry is
       // "Whole Room", so this covers both "new Room, whole-room session"
@@ -10083,7 +10227,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
             try {
               if (swipeableMethods) await new Promise((resolve) => setTimeout(resolve, 300));
               await softDeleteRoom(user.uid, room.id);
-              setRooms((prev) => prev.filter((r) => r.id !== room.id));
+              mutateRooms((prev) => prev.filter((r) => r.id !== room.id));
               // No-ops when the swipe came from My Rooms (already there);
               // load-bearing when the button was tapped inside Room Detail,
               // which must not stay open on a Room that no longer exists.
@@ -10201,7 +10345,7 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       const spaceSnap = await getDoc(doc(db, "users", user.uid, "spaces", room.id));
       const restored = { id: room.id, ...spaceSnap.data() };
       setRecentlyDeletedRooms((prev) => prev.filter((r) => r.id !== room.id));
-      setRooms((prev) => [restored, ...prev.filter((r) => r.id !== room.id)]);
+      mutateRooms((prev) => upsertRoomById(prev, restored));
     } catch (e) {
       Alert.alert("Couldn't restore", e.message);
     } finally {
@@ -10443,7 +10587,11 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       // fully succeeds or leaves nothing half-done - a caught error here
       // means it's genuinely safe to retry, never a reason to fall back
       // to any client-side cleanup of its own.
-      const hardDeleteAccountFn = httpsCallable(functions, "hardDeleteAccount");
+      // 310s, for the same reason as analyzePhoto above and with more at
+      // stake: at the old 70s default a deletion that took longer was reported
+      // to the user as a failure while the server went on to complete it, so
+      // they were told their account was still there when it was already gone.
+      const hardDeleteAccountFn = httpsCallable(functions, "hardDeleteAccount", { timeout: 310000 });
       await hardDeleteAccountFn();
 
       // Only now, after the server has confirmed the account is actually
@@ -10553,10 +10701,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
         await updateSpaceRoomSummary(uid, spaceId);
         const refreshedSpaceSnap = await getDoc(doc(db, "users", uid, "spaces", spaceId));
         if (refreshedSpaceSnap.exists()) {
-          setRooms(prev => prev.map(r => r.id === spaceId ? { id: spaceId, ...refreshedSpaceSnap.data() } : r));
+          mutateRooms(prev => prev.map(r => r.id === spaceId ? { id: spaceId, ...refreshedSpaceSnap.data() } : r));
         }
       } else if (shadowResult.spaceDeleted) {
-        setRooms(prev => prev.filter(r => r.id !== spaceId));
+        mutateRooms(prev => prev.filter(r => r.id !== spaceId));
       }
 
       // Area Identity, Phase A §5, item (j)/(i): recompute the owning
@@ -10626,7 +10774,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
           <View style={s.paywallHeader}>
             <View style={{ alignItems: "center", marginBottom: 12 }}><DrawerIcon size={80} dark={false} /></View>
             <Text style={s.paywallTitle}>Go Unlimited</Text>
-            <Text style={s.paywallSubtitle}>AI visualizations, branded PDFs, and full room history.</Text>
+            {/* The room-history claim is gone: My Rooms is not gated, so it
+                was never a Pro feature. What is left is what Pro actually
+                unlocks. */}
+            <Text style={s.paywallSubtitle}>Unlimited analyses, AI visualizations, and branded PDFs.</Text>
           </View>
 
           {/* Free vs Pro comparison */}
@@ -10636,7 +10787,10 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <View style={[s.compareCol, { borderColor: BRAND.stone }]}>
                 <Text style={s.compareColHeader}>Free</Text>
                 {[
-                  "3 rooms/month",
+                  // "rooms" was the wrong unit: the server meters ANALYSES
+                  // (FREE_MONTHLY_LIMIT), and three analyses of one room is
+                  // three, not one.
+                  "3 analyses/month",
                   "Text sharing",
                   "Great for getting started",
                 ].map((t, i) => (
@@ -10649,11 +10803,14 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
               <View style={[s.compareCol, { borderColor: BRAND.green, backgroundColor: "#F8FBF9", borderWidth: 2 }]}>
                 <Text style={[s.compareColHeader, { color: BRAND.green }]}>Pro</Text>
                 {[
-                  "Unlimited rooms",
+                  // Same unit as the Free column, so the two are comparable.
+                  "Unlimited analyses",
                   "AI visualizations",
-                  "Full room history",
                   "Branded PDF exports",
-                  "Priority results",
+                  // The priority-results claim is gone because no such path
+                  // ever existed: entitlement changes quotas, never
+                  // scheduling. The room-history claim is gone because My
+                  // Rooms is not gated on Pro at all.
                 ].map((t, i) => (
                   <View key={i} style={s.compareRow}>
                     <View style={{ width: 16 }}><Check size={14} color={BRAND.green} strokeWidth={2.5} /></View>
@@ -11695,13 +11852,15 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
       { q: "How does Uncluttrd work?", a: "Take a photo of any room or organizing area, such as a closet, garage, kitchen, or pantry. Uncluttrd's AI analyzes what it sees and offers three different approaches to transforming it, each with its own guidance, first-session checklist, and product recommendations." },
       { q: "What can I organize?", a: "Any space! Closets, garages, kitchens, pantries, home offices, bedrooms, laundry rooms, storage units. If you can photograph it, Uncluttrd can help organize it." },
       { q: "What's the difference between the three approaches?", a: "They differ in ambition, not just price. Keep It Simple makes the space work and look noticeably better using what you already own. Polished & Practical solves the organization problems and finishes the space with a few targeted purchases. Elevated Finish is a full transformation, addressing every problem and every opportunity the photo shows. Open any approach to see its full guidance, checklist, and recommendations before you choose." },
-      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro ($2.99/mo) gives you unlimited analyses, full room history saved to your account, AI visualization of your transformed room, and branded PDF sharing. Free users get 3 free transformations per month." },
+      { q: "What is Uncluttrd Pro?", a: "Uncluttrd Pro is $2.99 per month or $24.99 per year. It gives you unlimited analyses, AI visualization of your transformed room, continuing guidance as you work through a plan, and branded PDF sharing. Free users get 3 analyses per month." },
       { q: "What is the AI Visualization feature?", a: "After getting your organization plan, open any approach and tap 'See the transformation' to preview the result: an AI-created image showing what your space could look like under that approach. Each approach has its own visualization, so you can generate one, several, or all three and compare them. This is a Pro feature." },
       { q: "How do I share my organization plan?", a: "Tap the share icon in the top right of your results. Free users can share as text. Pro users can also share a beautifully branded PDF with your full room." },
-      { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. Pro members also get unlimited continuing guidance on each room and can share a branded PDF." },
-      { q: "How do I cancel my subscription?", a: "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
-      { q: "Is my data secure?", a: "Yes. Your photos are sent securely to our AI for analysis and are not stored on our servers. Your account data is secured through Firebase, Google's enterprise-grade platform." },
-      { q: "The product links aren't working. What do I do?", a: "Make sure you have a stable internet connection. The product links open Google Shopping with a search for the recommended item." },
+      { q: "Where are my saved rooms?", a: "Tap the ☰ menu and select 'My Rooms' to see all your past organization plans, synced across devices via your account. My Rooms is part of the free plan. Pro members can also get continuing guidance as they work through a room, and can share a branded PDF." },
+      { q: "How do I cancel my subscription?", a: Platform.OS === "android"
+        ? "You can cancel anytime in the Google Play Store: tap your profile icon, then Payments and subscriptions, then Subscriptions, then Uncluttrd. Your Pro access continues until the end of your billing period."
+        : "You can cancel anytime through your iPhone Settings → Apple ID → Subscriptions → Uncluttrd. Your Pro access continues until the end of your billing period." },
+      { q: "Is my data secure?", a: "Your photos are sent securely to our AI service providers to analyze your space. We store a resized copy of each photo with its saved plan, along with any progress photos you add and any AI visualization images you generate, in your account using Google Firebase. When you delete a plan it is kept for 30 days, after which the plan's photos, visualization images, and progress photos are permanently removed from Uncluttrd's storage systems. A record of the deleted plan, without those images, remains in your account until you delete your account. Deleting your account deletes your plans, photos, visualization images, and progress photos from Uncluttrd's systems. Our Privacy Policy has the full detail." },
+      { q: "The product links aren't working. What do I do?", a: "Make sure you have a stable internet connection. Tapping a recommendation opens Amazon search results for that type of product, so you can browse the options available. As an Amazon Associate, Uncluttrd earns from qualifying purchases." },
       { q: "How do I contact support?", a: "Email us at hello@uncluttrd.app and we'll get back to you within 24 hours." },
     ];
     return (
@@ -13305,6 +13464,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
                                 </TouchableOpacity>
                               );
                             }))}
+                            {/* AFFILIATE DISCLOSURE. Every "Find options" link
+                                above is an Amazon search URL carrying our
+                                Associates tag, so the disclosure belongs
+                                here, with the links, not only on the website.
+                                Inside the same recommendationGroups.length
+                                guard as the rows, so it appears exactly when
+                                there is an affiliate link on screen and never
+                                on an approach with no products. It is inside
+                                the expanded region, so collapsing the card
+                                takes the links and this line away together. */}
+                            <Text style={s.affiliateDisclosure}>
+                              As an Amazon Associate, Uncluttrd earns from qualifying purchases.
+                            </Text>
                           </>
                         )}
                         {/* Approach-Aware Visualization: each approach owns
@@ -15281,6 +15453,9 @@ const s = StyleSheet.create({
   recName: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: BRAND.ink },
   recReason: { fontSize: 12, fontFamily: "Inter_400Regular", color: BRAND.slateText, marginTop: 2 },
   recLink: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: BRAND.greenText, marginTop: 4 },
+  // Quiet but legible: this has to be readable to do its job, so it is not
+  // dropped below the 11px the rest of the secondary text on this card uses.
+  affiliateDisclosure: { fontSize: 11, lineHeight: 15, fontFamily: "Inter_400Regular", color: BRAND.mist, marginTop: 10 },
   amznBadge: { backgroundColor: BRAND.white, borderWidth: 1, borderColor: BRAND.stone, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 },
   amznText: { fontSize: 9, fontFamily: "Inter_700Bold", color: BRAND.slateText },
   approachCard: { backgroundColor: BRAND.white, borderWidth: 1.5, borderRadius: 16, padding: 16, marginBottom: 12 },
