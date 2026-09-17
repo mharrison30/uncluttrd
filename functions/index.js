@@ -478,7 +478,7 @@ exports.compareAreaCandidates = onCall(
 );
 
 exports.generateNextAction = onCall(
-  { secrets: [ANTHROPIC_KEY], maxInstances: 10 },
+  { secrets: [ANTHROPIC_KEY, REVENUECAT_SECRET_API_KEY], maxInstances: 10 },
   async (request) => {
     const { originalImageBase64, beforeImageBase64, afterImageBase64, prompt } = request.data || {};
 
@@ -492,6 +492,26 @@ exports.generateNextAction = onCall(
     guards.requireImage(afterImageBase64, "after photo");
     guards.requirePrompt(prompt);
     console.log(`[generateNextAction] uid=${guards.uidTag(uid)} promptChars=${prompt.length}`);
+
+    // ---- Pro gate, and it goes HERE for a reason -----------------------
+    // The progress check-in is the one thing Companion actually charges
+    // for: the checklist, ticking items off, carrying work forward,
+    // switching approach and finishing a plan are all free. Until now the
+    // only thing stopping a free account was a client-side `if (!isPro)`
+    // in App.js, which stops a tap and not a request.
+    //
+    // Placed after validation and BEFORE the replay lookup, the safety
+    // counter and Anthropic, so a refused caller reads no state, writes no
+    // state, spends no ceiling and costs nothing. In particular a caller
+    // who is now not entitled cannot be served a cached answer they
+    // generated while they still were - the lookup is downstream of this.
+    const access = await decideProAccess(uid, "generateNextAction");
+    if (!access.allowed) {
+      // permission-denied, distinct from unauthenticated (not signed in),
+      // resource-exhausted (over a limit) and internal (we broke), so the
+      // client can tell "you need Pro" from every other failure.
+      throw new HttpsError("permission-denied", "Progress check-ins are an Uncluttrd Pro feature.");
+    }
 
     const requestHash = guards.hashRequest(uid, [
       "generateNextAction",
@@ -1004,9 +1024,53 @@ async function sendCanaryAlertEmail(errorMessage) {
 // purchased - and collapsing that into "unavailable" let a forged
 // users/{uid}.isPro through the fallback. A real test caught exactly that.
 //
-// Returns: true (active), false (definitively not entitled), or null
-// (RevenueCat genuinely unreachable - 5xx, network, malformed).
+// Returns: true (active), false (definitively not entitled, OR a non-404 4xx
+// - see the note in the body), or null (RevenueCat genuinely unreachable -
+// 5xx, network, malformed).
+//
+// This is now a compatibility wrapper over resolveProEntitlement below, which
+// is the one a new gate should use: it separates "RevenueCat says no" from
+// "RevenueCat did not answer", which this three-value shape cannot express.
 async function verifyProEntitlement(uid) {
+  const result = await resolveProEntitlement(uid);
+  if (result.state === "entitled") return true;
+  if (result.state === "not-entitled") return false;
+  // BEHAVIOUR-PRESERVING, deliberately. resolveProEntitlement below treats a
+  // non-404 4xx as UNVERIFIABLE, which is the right reading for a new gate: a
+  // missing or misbound key answers 401, and that is a fact about us, not
+  // about the caller. This wrapper keeps the original mapping for the three
+  // callers that already shipped with it, so hardening generateNextAction
+  // changes nothing for analyzePhoto, analyzePhotoDetail or
+  // generateVisualization. Those callers can be moved onto the structured
+  // result deliberately, one at a time, with their own tests.
+  if (result.reason === "client-error") return false;
+  return null;
+}
+
+/**
+ * The structured entitlement answer, in three states an authorization gate
+ * can actually reason about:
+ *
+ *   entitled       RevenueCat answered, and this customer holds PRO.
+ *   not-entitled   RevenueCat answered, and this customer does not. Either a
+ *                  200 with no matching entitlement, or a 404 - an unknown
+ *                  customer has definitively never purchased, which is an
+ *                  answer and not an outage. Collapsing 404 into unverifiable
+ *                  once let a forged users/{uid}.isPro through the fallback,
+ *                  and a test caught it; it stays an answer for that reason.
+ *   unverifiable   We did not get an answer. 401 and 403 (missing, misbound
+ *                  or revoked key), 429 (we are being rate limited), any 5xx,
+ *                  a network failure, a timeout, or a body we cannot parse.
+ *
+ * The distinction that matters: NONE of the unverifiable cases may be read as
+ * "this is a free account". 76cb682 is the worked example - an undeclared
+ * secret produced an empty credential, RevenueCat answered 401, the old code
+ * read that as a definite "not entitled", and every paying subscriber was
+ * silently demoted with one log line to show for it.
+ *
+ * `status` is the HTTP status when there was one, for the log line.
+ */
+async function resolveProEntitlement(uid) {
   let resp;
   try {
     resp = await fetch(
@@ -1014,28 +1078,84 @@ async function verifyProEntitlement(uid) {
       { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
     );
   } catch (e) {
+    // Covers a DNS failure, a refused connection and a timeout alike: fetch
+    // rejects for all of them, and none of them says anything about whether
+    // this customer pays us.
     console.error(`[entitlement] network failure for uid=${guards.uidTag(uid)}: ${e.message}`);
-    return null;
+    return { state: "unverifiable", reason: "network-failure", status: null };
   }
   // Unknown customer. Not an outage - an answer.
-  if (resp.status === 404) return false;
-  // 4xx other than 404 means our request was wrong (bad key, bad project),
-  // which must not silently grant access either.
+  if (resp.status === 404) return { state: "not-entitled", reason: "unknown-customer", status: 404 };
   if (resp.status >= 400 && resp.status < 500) {
     console.error(`[entitlement] client-error response for uid=${guards.uidTag(uid)}: HTTP ${resp.status}`);
-    return false;
+    return { state: "unverifiable", reason: "client-error", status: resp.status };
   }
   if (!resp.ok) {
     console.error(`[entitlement] upstream unavailable for uid=${guards.uidTag(uid)}: HTTP ${resp.status}`);
-    return null;
+    return { state: "unverifiable", reason: "upstream-unavailable", status: resp.status };
   }
   try {
     const data = await resp.json();
-    return (data.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
+    const entitled = (data.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
+    return entitled
+      ? { state: "entitled", reason: "active", status: resp.status }
+      : { state: "not-entitled", reason: "no-active-entitlement", status: resp.status };
   } catch (e) {
     console.error(`[entitlement] unparseable response for uid=${guards.uidTag(uid)}: ${e.message}`);
-    return null;
+    return { state: "unverifiable", reason: "unparseable", status: resp.status };
   }
+}
+
+/**
+ * The Pro gate itself: resolves entitlement, applies the outage policy, and
+ * logs exactly one outcome line per call.
+ *
+ * The outage policy is the same one analyzePhoto and analyzePhotoDetail
+ * already run, for the same reason - a RevenueCat outage must not lock a
+ * paying subscriber out of what they bought. What it falls back to is
+ * users/{uid}.isPro, which is SERVER-OWNED: firestore.rules restricts client
+ * updates on that document to hasOnly(['hasSeenTutorial']), so the only
+ * writer is revenueCatWebhook -> syncProStatus through the Admin SDK. That is
+ * what makes the fallback a mirror of a verified fact rather than a value the
+ * caller could have set for themselves.
+ *
+ * Outcomes, all logged with the hashed uid tag and never a raw uid:
+ *   verified-entitled      allowed, RevenueCat said yes
+ *   cached-fallback        allowed on the mirror while RevenueCat is unreachable
+ *   rejected-not-entitled  refused, RevenueCat said no
+ *   unverifiable-rejected  refused, no answer and no trusted mirror either
+ */
+async function decideProAccess(uid, fnName) {
+  const entitlement = await resolveProEntitlement(uid);
+
+  if (entitlement.state === "entitled") {
+    console.log(`[${fnName}] uid=${guards.uidTag(uid)} entitlement=verified-entitled`);
+    return { allowed: true, outcome: "verified-entitled" };
+  }
+
+  if (entitlement.state === "not-entitled") {
+    console.warn(`[${fnName}] uid=${guards.uidTag(uid)} entitlement=rejected-not-entitled reason=${entitlement.reason}`);
+    return { allowed: false, outcome: "rejected-not-entitled" };
+  }
+
+  let cachedIsPro = false;
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    cachedIsPro = snap.exists && snap.data().isPro === true;
+  } catch (e) {
+    // Fail closed: if we can read neither RevenueCat nor the mirror, we know
+    // nothing, and "we know nothing" is not a reason to spend the AI budget.
+    console.error(`[${fnName}] uid=${guards.uidTag(uid)} cached isPro read failed: ${e.message}`);
+    cachedIsPro = false;
+  }
+
+  const detail = `reason=${entitlement.reason} status=${entitlement.status ?? "none"}`;
+  if (cachedIsPro) {
+    console.warn(`[${fnName}] uid=${guards.uidTag(uid)} entitlement=cached-fallback ${detail}`);
+    return { allowed: true, outcome: "cached-fallback" };
+  }
+  console.warn(`[${fnName}] uid=${guards.uidTag(uid)} entitlement=unverifiable-rejected ${detail}`);
+  return { allowed: false, outcome: "unverifiable-rejected" };
 }
 
 async function syncProStatus(uid) {

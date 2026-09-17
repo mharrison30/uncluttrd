@@ -116,6 +116,37 @@ test("the parse found the functions and secrets it is meant to check", () => {
   }
 });
 
+test("every function that gates on entitlement declares REVENUECAT_SECRET_API_KEY by name", () => {
+  // Named explicitly, not just caught by the reachability sweep below, so
+  // removing a gate's secret fails with the gate's own name rather than as a
+  // generic graph result. generateNextAction joined this list when its Pro
+  // gate landed; before that a free account could call it directly.
+  for (const name of ["analyzePhoto", "analyzePhotoDetail", "generateVisualization", "generateNextAction"]) {
+    const fn = deployed.find((f) => f.name === name);
+    assert.ok(fn, `${name} must be found by the static parse`);
+    assert.ok(
+      fn.declared.includes("REVENUECAT_SECRET_API_KEY"),
+      `${name} (functions/index.js:${fn.line}) gates on entitlement but does not declare ` +
+        `REVENUECAT_SECRET_API_KEY (declared: ${fn.declared.join(", ") || "none"}). The credential would be ` +
+        `empty, RevenueCat would answer 401, and the gate would decide on an answer it never got.`,
+    );
+  }
+});
+
+test("the entitlement resolver separates a definite NO from no answer at all", () => {
+  // The property the generateNextAction gate depends on: 401/403/429/5xx and
+  // a network failure must all be unverifiable, never "not entitled".
+  const resolver = SRC.slice(SRC.indexOf("async function resolveProEntitlement(uid)"));
+  const body = resolver.slice(0, resolver.indexOf("\n}\n"));
+  assert.match(body, /state: "unverifiable", reason: "client-error"/, "a non-404 4xx must be unverifiable");
+  assert.match(body, /state: "unverifiable", reason: "upstream-unavailable"/);
+  assert.match(body, /state: "unverifiable", reason: "network-failure"/);
+  assert.match(body, /state: "unverifiable", reason: "unparseable"/);
+  assert.match(body, /state: "not-entitled", reason: "unknown-customer"/, "404 stays a definite answer");
+  assert.match(body, /state: "not-entitled", reason: "no-active-entitlement"/);
+  assert.match(body, /state: "entitled"/);
+});
+
 test("every function that can reach verifyProEntitlement declares REVENUECAT_SECRET_API_KEY", () => {
   const callers = deployed.filter((f) => f.handler && reachableIdentifiers(f.handler).has("verifyProEntitlement"));
   assert.ok(callers.length >= 3, `expected the entitlement callers, found ${callers.map((f) => f.name).join(", ")}`);

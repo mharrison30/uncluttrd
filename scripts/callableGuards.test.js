@@ -99,6 +99,60 @@ const nextActionData = (over = {}) => ({
   ...over,
 });
 
+// ---- RevenueCat, stubbed -------------------------------------------------
+// Every entitlement check is intercepted here, so no test reaches
+// api.revenuecat.com: these run offline, deterministically, and cannot be
+// affected by a real account's state. Only that host is intercepted - a
+// provider stub elsewhere in this file still sees its own traffic.
+//
+// The DEFAULT, for any test that does not opt in, is a definitive "not
+// entitled": a plain 200 with an empty entitlement list. That is the shape a
+// free account really has, so a test that forgets to declare its entitlement
+// fails closed rather than passing on an accident.
+const PRO_ENTITLEMENT_ID = "entl16a5fcafc4"; // asserted against the source below
+
+const jsonResponse = (body, status = 200) => new Response(
+  typeof body === "string" ? body : JSON.stringify(body),
+  { status, headers: { "content-type": "application/json" } },
+);
+
+const ENTITLED = () => jsonResponse({ items: [{ entitlement_id: PRO_ENTITLEMENT_ID }] });
+const NOT_ENTITLED = () => jsonResponse({ items: [] });
+const HTTP = (status) => () => jsonResponse({ message: "stub" }, status);
+const NETWORK_FAILURE = () => { throw new Error("connect ECONNREFUSED 127.0.0.1:443"); };
+const TIMEOUT = () => { throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }); };
+const UNPARSEABLE = () => new Response("<html>not json</html>", { status: 200, headers: { "content-type": "text/html" } });
+
+let entitlementResponder = NOT_ENTITLED;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+  const url = typeof input === "string" ? input : input?.url ?? String(input);
+  if (url.includes("api.revenuecat.com")) return entitlementResponder();
+  return realFetch(input, init);
+};
+
+/** Runs `run` with RevenueCat answering however `responder` says. */
+async function withEntitlement(responder, run) {
+  const previous = entitlementResponder;
+  entitlementResponder = responder;
+  try {
+    return await run();
+  } finally {
+    entitlementResponder = previous;
+  }
+}
+
+/** Counters and replay documents, for proving a rejected call spent nothing. */
+const guardDoc = (uid, id) => db.collection("users").doc(uid).collection("aiCallGuards").doc(id);
+const safetyCount = async (uid, fnName) => {
+  const snap = await guardDoc(uid, `limit_${fnName}`).get();
+  return snap.exists ? (snap.data().calls || []).length : 0;
+};
+const nextActionHash = (uid, data) => guards.hashRequest(uid, [
+  "generateNextAction", data.originalImageBase64, data.beforeImageBase64, data.afterImageBase64, data.prompt,
+]);
+const replayExists = async (uid, hash) => (await guardDoc(uid, `replay_${hash.slice(0, 48)}`).get()).exists;
+
 // ---- 1. authentication -----------------------------------------------------
 
 test("unauthenticated requests are rejected by all three functions, before any provider call", async () => {
@@ -260,10 +314,14 @@ test("an identical next-action request replays the stored result without a secon
   ]);
   await guards.storeReplay(db, uid, hash, stored);
 
-  assert.deepEqual(await callAs(fns.generateNextAction, uid, data), stored);
-  // A different prompt is a different request and must not replay.
-  const changed = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} Also mention lighting.` })));
-  assert.equal(changed.code, "internal");
+  // Entitled, because the Pro gate now sits ahead of the replay lookup - a
+  // free caller never reaches the cache at all (see section 11).
+  await withEntitlement(ENTITLED, async () => {
+    assert.deepEqual(await callAs(fns.generateNextAction, uid, data), stored);
+    // A different prompt is a different request and must not replay.
+    const changed = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} Also mention lighting.` })));
+    assert.equal(changed.code, "internal");
+  });
 });
 
 // ---- 7. per-uid safety limit ----------------------------------------------
@@ -285,7 +343,7 @@ test("the 31st unique compare request in 24 hours is rejected, per user", async 
   // other function is unaffected.
   const otherUser = await errorFrom(callAs(fns.compareAreaCandidates, other, compareData()));
   assert.equal(otherUser.code, "internal", "limits must be per-user");
-  const otherFn = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData()));
+  const otherFn = await withEntitlement(ENTITLED, () => errorFrom(callAs(fns.generateNextAction, uid, nextActionData())));
   assert.equal(otherFn.code, "internal", "limits must be per-function");
 });
 
@@ -294,11 +352,11 @@ test("the 31st unique next-action request in 24 hours is rejected", async () => 
   for (let i = 0; i < guards.SAFETY_LIMIT_CALLS; i++) {
     await guards.consumeSafetyLimit(db, uid, "generateNextAction");
   }
-  await expectCode(
+  await withEntitlement(ENTITLED, () => expectCode(
     callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} ${uniq()}` })),
     "resource-exhausted",
     "31st next action",
-  );
+  ));
 });
 
 test("calls outside the rolling 24-hour window do not count", async () => {
@@ -689,4 +747,242 @@ test("each outcome is logged by name, without prompt content", async () => {
     });
   });
   assert.match(truncLines.join("\n"), /outcome=counted-parse-failure/);
+});
+
+// ---- 11. generateNextAction: the Pro gate ----------------------------------
+
+// The progress check-in is the one paid thing in Companion - the checklist,
+// ticking items off, carrying work forward, switching approach and finishing a
+// plan are all free. Until this change the only thing standing between a free
+// account and the Anthropic bill was `if (!isPro)` in App.js, which stops a tap
+// and not a request.
+//
+// The load-bearing distinction: RevenueCat saying NO is not the same as
+// RevenueCat not answering. 76cb682 is the worked example of getting that
+// wrong - an undeclared secret produced an empty credential, RevenueCat
+// answered 401, the old code read it as a definite "not entitled", and every
+// paying subscriber was quietly demoted.
+
+test("the stub matches the entitlement id the shipping code looks for", () => {
+  // Guards against the stub drifting away from the source and making every
+  // "entitled" test below vacuous.
+  const src = require("node:fs").readFileSync(path.join(FUNCTIONS_DIR, "index.js"), "utf8");
+  assert.ok(src.includes(`PRO_ENTITLEMENT_ID = "${PRO_ENTITLEMENT_ID}"`), "stub entitlement id is stale");
+});
+
+test("an unauthenticated next-action call is refused before the entitlement check", async () => {
+  // Still unauthenticated, not permission-denied: requireUid runs first, and
+  // an anonymous caller must not even cost us a RevenueCat round trip.
+  let revenueCatCalls = 0;
+  await withEntitlement(() => { revenueCatCalls++; return ENTITLED(); }, async () => {
+    await expectCode(callAs(fns.generateNextAction, null, nextActionData()), "unauthenticated", "no auth");
+  });
+  assert.equal(revenueCatCalls, 0, "entitlement must not be resolved for an anonymous caller");
+});
+
+test("a verified free account is refused with permission-denied", async () => {
+  const uid = `user-${uniq()}`;
+  await withEntitlement(NOT_ENTITLED, async () => {
+    const err = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData()));
+    assert.equal(err.code, "permission-denied", err.message);
+    // Distinguishable from every other failure the client can see:
+    // unauthenticated, invalid-argument, resource-exhausted, internal.
+    assert.match(err.message, /Pro/);
+  });
+});
+
+test("a refused caller spends nothing: no safety count, no replay entry, no provider call", async () => {
+  const uid = `user-${uniq()}`;
+  const data = nextActionData();
+  const hash = nextActionHash(uid, data);
+
+  await withEntitlement(NOT_ENTITLED, async () => {
+    await expectCode(callAs(fns.generateNextAction, uid, data), "permission-denied", "free account");
+  });
+
+  assert.equal(await safetyCount(uid, "generateNextAction"), 0, "a refused call must not consume the ceiling");
+  assert.equal(await replayExists(uid, hash), false, "a refused call must not write replay state");
+  // Reaching Anthropic would surface as "internal" (the key is invalid), never
+  // as permission-denied, so the code above already proves the call was not made.
+});
+
+test("a refused caller cannot be served a cached answer from when they WERE entitled", async () => {
+  // Entitlement lapses between two identical requests. The gate sits ahead of
+  // the replay lookup precisely so the cache cannot outlive the subscription.
+  const uid = `user-${uniq()}`;
+  const data = nextActionData();
+  const stored = { text: "Fold the blankets on the left shelf." };
+  await guards.storeReplay(db, uid, nextActionHash(uid, data), stored);
+
+  await withEntitlement(ENTITLED, async () => {
+    assert.deepEqual(await callAs(fns.generateNextAction, uid, data), stored, "entitled: served from cache");
+  });
+  await withEntitlement(NOT_ENTITLED, async () => {
+    await expectCode(callAs(fns.generateNextAction, uid, data), "permission-denied", "lapsed");
+  });
+});
+
+test("a verified Pro account passes the gate and reaches the provider", async () => {
+  const uid = `user-${uniq()}`;
+  await withEntitlement(ENTITLED, async () => {
+    const err = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} ${uniq()}` })));
+    // "internal" is the invalid test key failing at Anthropic, which is the
+    // signal the request got all the way past every guard.
+    assert.equal(err.code, "internal", "an entitled caller must reach the provider");
+  });
+});
+
+test("replay caching still works for an entitled caller", async () => {
+  const uid = `user-${uniq()}`;
+  const data = nextActionData({ prompt: `${PROMPT} ${uniq()}` });
+  const stored = { text: "Clear the top shelf next." };
+  await guards.storeReplay(db, uid, nextActionHash(uid, data), stored);
+  await withEntitlement(ENTITLED, async () => {
+    assert.deepEqual(await callAs(fns.generateNextAction, uid, data), stored);
+  });
+  assert.equal(await safetyCount(uid, "generateNextAction"), 0, "a replayed call consumes no ceiling");
+});
+
+// Each of these is RevenueCat failing to answer, not answering "no". None of
+// them may be read as a confirmed free account.
+const UNVERIFIABLE_CASES = [
+  ["HTTP 401 (missing or misbound key)", HTTP(401)],
+  ["HTTP 403 (revoked key)", HTTP(403)],
+  ["HTTP 429 (we are rate limited)", HTTP(429)],
+  ["HTTP 500", HTTP(500)],
+  ["HTTP 503", HTTP(503)],
+  ["network failure", NETWORK_FAILURE],
+  ["timeout", TIMEOUT],
+  ["unparseable body", UNPARSEABLE],
+];
+
+test("every unverifiable case falls back to the mirror, and allows a cached Pro user", async () => {
+  for (const [label, responder] of UNVERIFIABLE_CASES) {
+    const uid = `user-${uniq()}`;
+    // Server-owned mirror: firestore.rules restricts client updates on this
+    // document to hasOnly(['hasSeenTutorial']), so only revenueCatWebhook
+    // writes isPro. Written here with the Admin SDK, as the webhook does.
+    await db.collection("users").doc(uid).set({ isPro: true });
+    await withEntitlement(responder, async () => {
+      const err = await errorFrom(callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} ${uniq()}` })));
+      assert.equal(err.code, "internal", `${label}: a paying user must not be locked out by our own outage`);
+    });
+  }
+});
+
+test("every unverifiable case is REFUSED when there is no trusted mirror", async () => {
+  for (const [label, responder] of UNVERIFIABLE_CASES) {
+    for (const [mirrorLabel, seed] of [
+      ["no user document", null],
+      ["isPro false", { isPro: false }],
+      ["isPro absent", { email: "x" }],
+    ]) {
+      const uid = `user-${uniq()}`;
+      if (seed) await db.collection("users").doc(uid).set(seed);
+      await withEntitlement(responder, async () => {
+        await expectCode(
+          callAs(fns.generateNextAction, uid, nextActionData({ prompt: `${PROMPT} ${uniq()}` })),
+          "permission-denied",
+          `${label} / ${mirrorLabel}`,
+        );
+      });
+    }
+  }
+});
+
+test("an unverifiable REJECTION still spends nothing", async () => {
+  const uid = `user-${uniq()}`;
+  const data = nextActionData();
+  await withEntitlement(HTTP(401), async () => {
+    await expectCode(callAs(fns.generateNextAction, uid, data), "permission-denied", "401 with no mirror");
+  });
+  assert.equal(await safetyCount(uid, "generateNextAction"), 0);
+  assert.equal(await replayExists(uid, nextActionHash(uid, data)), false);
+});
+
+test("404 stays a definite NO, and is not softened into an outage", async () => {
+  // A customer RevenueCat has never seen has definitively never purchased.
+  // Collapsing that into "unverifiable" would route it through the mirror,
+  // which is exactly the hole an earlier test caught. It must be refused even
+  // WITH a mirror saying otherwise.
+  const uid = `user-${uniq()}`;
+  await db.collection("users").doc(uid).set({ isPro: true });
+  await withEntitlement(HTTP(404), async () => {
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData()), "permission-denied", "unknown customer");
+  });
+});
+
+test("payload caps are unchanged, and still reject before the entitlement check", async () => {
+  const uid = `user-${uniq()}`;
+  const huge = "A".repeat(guards.MAX_IMAGE_B64_CHARS + 1);
+  let revenueCatCalls = 0;
+  await withEntitlement(() => { revenueCatCalls++; return ENTITLED(); }, async () => {
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData({ originalImageBase64: huge })), "invalid-argument", "original");
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData({ beforeImageBase64: huge })), "invalid-argument", "before");
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData({ afterImageBase64: huge })), "invalid-argument", "after");
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData({ prompt: "p".repeat(guards.MAX_PROMPT_CHARS + 1) })), "invalid-argument", "prompt");
+    await expectCode(callAs(fns.generateNextAction, uid, nextActionData({ prompt: "" })), "invalid-argument", "empty prompt");
+  });
+  assert.equal(revenueCatCalls, 0, "validation must reject before any entitlement round trip");
+});
+
+test("each entitlement outcome is logged by name, with a hashed uid and no prompt", async () => {
+  const uid = "gate-raw-uid-must-not-appear";
+  const marker = "GATE-PROMPT-CANARY-must-not-be-logged";
+
+  const casesUnderTest = [
+    ["verified-entitled", ENTITLED, null],
+    ["rejected-not-entitled", NOT_ENTITLED, null],
+    ["unverifiable-rejected", HTTP(401), null],
+    ["cached-fallback", HTTP(503), { isPro: true }],
+  ];
+
+  for (const [expected, responder, seed] of casesUnderTest) {
+    const caseUid = `${uid}-${uniq()}`;
+    if (seed) await db.collection("users").doc(caseUid).set(seed);
+    const lines = await captureLogs(async () => {
+      await withEntitlement(responder, async () => {
+        await errorFrom(callAs(fns.generateNextAction, caseUid, nextActionData({ prompt: `${marker} ${uniq()}` })));
+      });
+    });
+    const joined = lines.join("\n");
+    assert.match(joined, new RegExp(`entitlement=${expected}`), `${expected}: outcome line missing`);
+    assert.ok(!joined.includes(caseUid), `${expected}: raw uid appeared in logs`);
+    assert.ok(!joined.includes(marker), `${expected}: prompt text appeared in logs`);
+    assert.ok(joined.includes(guards.uidTag(caseUid)), `${expected}: expected the hashed tag`);
+  }
+});
+
+test("the other entitlement callers are unchanged by the structured result", async () => {
+  // verifyProEntitlement is now a wrapper over resolveProEntitlement, and it
+  // must still map a non-404 4xx to FALSE - the reading the three shipped
+  // callers were written against. Only the new gate treats that as
+  // unverifiable. analyzePhotoDetail is the observable one: it picks the daily
+  // cap from the same answer.
+  const uid = `user-${uniq()}`;
+  await db.collection("users").doc(uid).collection("plans").doc("plan-x").set({ analysisStage: "summary-ready" });
+
+  const lines = await captureLogs(async () => {
+    await withEntitlement(HTTP(401), async () => {
+      await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: "plan-x" }));
+    });
+  });
+  const joined = lines.join("\n");
+  assert.match(joined, /accepted entitled=false/, "a 401 must still read as not-entitled for this caller");
+  assert.ok(!/RevenueCat unreachable/.test(joined), "a 401 must not take the outage branch here either");
+});
+
+test("a 5xx still reads as an outage for the older callers, as it always did", async () => {
+  const uid = `user-${uniq()}`;
+  await db.collection("users").doc(uid).set({ isPro: true });
+  await db.collection("users").doc(uid).collection("plans").doc("plan-y").set({ analysisStage: "summary-ready" });
+
+  const lines = await captureLogs(async () => {
+    await withEntitlement(HTTP(503), async () => {
+      await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: "plan-y" }));
+    });
+  });
+  const joined = lines.join("\n");
+  assert.match(joined, /RevenueCat unreachable, falling back to cached isPro=true/);
+  assert.match(joined, /accepted entitled=true/);
 });
