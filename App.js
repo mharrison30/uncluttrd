@@ -14487,6 +14487,51 @@ function AppRoot() {
     return unsub;
   }, []);
 
+  // INBOUND LINKS. Measured, never acted on: a link that arrives while
+  // someone is mid-plan must not move them, so this logs and returns. The
+  // app opens wherever it would have opened anyway.
+  //
+  // getInitialURL covers a cold start from a link; the listener covers a
+  // link arriving while the app is already running. Both feed one recorder,
+  // and a URL is only ever counted once - on iOS a cold start can deliver
+  // the same URL through both paths.
+  useEffect(() => {
+    const seen = new Set();
+    const record = (url) => {
+      if (!url || seen.has(url)) return;
+      seen.add(url);
+      try {
+        // Parsed by hand rather than with URL/searchParams, which Hermes
+        // does not implement completely enough to rely on here.
+        const query = url.split("?")[1];
+        const params = {};
+        if (query) {
+          for (const pair of query.split("#")[0].split("&")) {
+            const eq = pair.indexOf("=");
+            if (eq <= 0) continue;
+            try {
+              params[decodeURIComponent(pair.slice(0, eq))] =
+                decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " "));
+            } catch (e) { /* a malformed escape must not lose the event */ }
+          }
+        }
+        const path = url.split("?")[0].replace(/^https?:\/\/[^/]+/, "") || "/";
+        dlog(`[DEEP LINK] path=${path} utm_source=${params.utm_source || "-"} utm_medium=${params.utm_medium || "-"} utm_campaign=${params.utm_campaign || "-"}`);
+        logEvent(getAnalytics(), "deep_link_opened", {
+          link_path: path.slice(0, 100),
+          utm_source: (params.utm_source || "none").slice(0, 100),
+          utm_medium: (params.utm_medium || "none").slice(0, 100),
+          utm_campaign: (params.utm_campaign || "none").slice(0, 100),
+        }).catch(() => {});
+      } catch (e) {
+        console.log("Deep link handling error:", e.message);
+      }
+    };
+
+    Linking.getInitialURL().then(record).catch(() => {});
+    const sub = Linking.addEventListener("url", ({ url }) => record(url));
+    return () => sub.remove();
+  }, []);
   // Startup gate: unchanged conditions - Inter loaded, and the first
   // onAuthStateChanged resolved (signed out, or signed in with the user
   // reloaded and RevenueCat linked or its 8s bound reached).

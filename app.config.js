@@ -103,6 +103,11 @@ module.exports = {
   expo: {
     name: IS_PRODUCTION ? "Uncluttrd" : "Uncluttrd Staging",
     slug: "cluttrd",
+    // Fallback for the cases universal links do not cover: a link opened
+    // inside an in-app browser that refuses the hand-off, or a QR code.
+    // Staging gets its own scheme so that a device with both builds
+    // installed never has to guess which app an uncluttrd:// link meant.
+    scheme: IS_PRODUCTION ? "uncluttrd" : "uncluttrd-staging",
     // Staging's version is FROZEN, and that is the whole point.
     //
     // `version` is a fingerprint input, so bumping it for a store release
@@ -140,6 +145,16 @@ module.exports = {
     ios: {
       supportsTablet: true,
       bundleIdentifier: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
+      // PRODUCTION ONLY. uncluttrd.app is claimed by the production bundle
+      // and nothing else: the apple-app-site-association file on the site
+      // names D372SHAVT3.com.mharrison.uncluttrd alone, so a staging build
+      // claiming the same domain would fail verification and could only
+      // take links away from the real app.
+      //
+      // This adds the associated-domains entitlement, which the current
+      // provisioning profile does not carry - EAS regenerates the profile
+      // on the next build.
+      ...(IS_PRODUCTION ? { associatedDomains: ["applinks:uncluttrd.app"] } : {}),
       googleServicesFile: GOOGLE_SERVICES_IOS,
       infoPlist: {
         NSCameraUsageDescription: "Uncluttrd needs camera access to photograph your space.",
@@ -153,6 +168,22 @@ module.exports = {
         backgroundColor: "#0F2A52",
       },
       package: IS_PRODUCTION ? "com.mharrison.uncluttrd" : "com.mharrison.uncluttrd.staging",
+      // PRODUCTION ONLY, for the same reason as associatedDomains above.
+      // autoVerify makes Android check /.well-known/assetlinks.json on
+      // uncluttrd.app at install time; until that file lists the Play app
+      // signing certificate, verification fails and links keep opening in
+      // the browser - which is the current behaviour, so nothing regresses
+      // while the fingerprint is outstanding.
+      ...(IS_PRODUCTION ? {
+        intentFilters: [
+          {
+            action: "VIEW",
+            autoVerify: true,
+            data: [{ scheme: "https", host: "uncluttrd.app" }],
+            category: ["BROWSABLE", "DEFAULT"],
+          },
+        ],
+      } : {}),
       googleServicesFile: GOOGLE_SERVICES_ANDROID,
       permissions: ["android.permission.CAMERA"],
       // The app captures still photos only (image-picker, mediaTypes images)
