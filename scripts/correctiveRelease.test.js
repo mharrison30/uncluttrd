@@ -347,17 +347,73 @@ test("cancellation instructions match the platform the user is on", () => {
   assert.match(android, /until the end of your billing period/);
 });
 
-test("the Pro FAQ answer carries both prices and drops room history", () => {
+test("the Pro FAQ answer carries both prices and names only what is gated", () => {
   const a = faqsFor("ios").find((f) => f.q === "What is Uncluttrd Pro?").a;
   assert.match(a, /\$2\.99 per month/);
   assert.match(a, /\$24\.99 per year/);
   assert.ok(!/room history/i.test(a));
   assert.match(a, /3 analyses per month/);
+  // The single gated action, named as itself.
+  assert.match(a, /photo-based progress check-ins that generate your next set of steps from what changed in the room/);
+  assert.match(a, /unlimited analyses/);
+  assert.match(a, /AI visualization/);
+  assert.match(a, /branded PDF sharing/);
 });
 
-test("My Rooms is not described as a Pro feature", () => {
+test("My Rooms and working a plan are not described as Pro features", () => {
   const a = faqsFor("ios").find((f) => f.q === "Where are my saved rooms?").a;
-  assert.match(a, /part of the free plan/);
+  assert.match(a, /part of the free plan, and so is working through a plan's checklist/);
+  assert.match(a, /send a progress photo to get their next set of steps/);
+});
+
+test("no user-facing string sells ordinary Companion guidance as a Pro benefit", () => {
+  // The audit behind this: the checklist, ticking items off, carry-forward
+  // and skip-with-reason, resuming a plan later, a fresh batch from switching
+  // approach, and finishing a plan are ALL free - the only gated action is
+  // submitting a progress photo (App.js, submitCompanionProgressPhoto's
+  // isPro check) and what runs after it. A Pro claim over any of the rest is
+  // contradicted by the user's own session, which is the worst kind to make.
+  //
+  // Phrases that would only ever appear in such a claim. Deliberately narrow:
+  // "guidance" alone is fine and true when describing the plan itself, which
+  // is why "How does Uncluttrd work?" and the three-approaches answer are
+  // untouched.
+  const FORBIDDEN = [
+    /continuing guidance/i,
+    /ongoing guidance/i,
+    /step-by-step guidance[^.]{0,40}\bpro\b/i,
+    /\bpro\b[^.]{0,60}\bchecklists?\b/i,
+    /\bpro\b[^.]{0,60}\btask (completion|tracking)\b/i,
+    /\bpro\b[^.]{0,60}\bcomplete (a |your )?plan\b/i,
+    /\bpro\b[^.]{0,60}\bmark (tasks|items) (as )?done\b/i,
+  ];
+
+  // Every string a user can read that makes a Pro claim: both FAQ variants,
+  // the paywall comparison columns, the paywall subtitle, and the
+  // paywall-prompt card Companion shows at the photo step.
+  const surfaces = [];
+  for (const os of ["ios", "android"]) {
+    for (const f of faqsFor(os)) surfaces.push([`faq(${os}): ${f.q}`, f.a]);
+  }
+  surfaces.push(["paywall comparison", region("{/* Free vs Pro comparison */}", "{/* Plan selector */}")]);
+  surfaces.push(["paywall subtitle", region("<Text style={s.paywallSubtitle}>", "</Text>")]);
+  surfaces.push(["paywall-prompt card", region('if (stage === "paywall-prompt") {', "\n  }")]);
+
+  const offenders = [];
+  for (const [where, text] of surfaces) {
+    for (const pattern of FORBIDDEN) {
+      if (pattern.test(text)) offenders.push(`${where} matches ${pattern}`);
+    }
+  }
+  assert.deepEqual(offenders, [], offenders.join("\n"));
+});
+
+test("the free side of Companion is still described as free somewhere", () => {
+  // The mirror of the test above: removing the false claim must not leave the
+  // user with no statement at all about what the free plan includes.
+  const a = faqsFor("ios").find((f) => f.q === "Where are my saved rooms?").a;
+  assert.match(a, /free plan/);
+  assert.match(a, /checklist/);
 });
 
 test("onboarding no longer oversells the product links", () => {
