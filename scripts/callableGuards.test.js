@@ -401,8 +401,10 @@ test("a real-sized 23,222-character detail prompt is accepted", async () => {
   const uid = `user-${uniq()}`;
   const planId = await givenPlan(uid, `plan-${uniq()}`);
   const prompt = "x".repeat(23222); // the largest prompt measured across staging and production
-  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt, planId }));
-  assert.equal(err.code, "internal", "must pass the guards and fail only at the invalid provider key");
+  await withProvider(OK_RESPONSE, async () => {
+    const res = await callAs(fns.analyzePhotoDetail, uid, { prompt, planId });
+    assert.equal(res.stopReason, "end_turn", "a real-sized prompt must pass every guard");
+  });
 });
 
 test("a detail prompt over 40,000 characters is rejected", async () => {
@@ -422,19 +424,22 @@ test("REGRESSION: analyzePhoto still rejects a prompt over 20,000 characters", a
   assert.equal(guards.MAX_PROMPT_CHARS, 20000, "the deployed Call 1 cap must not move");
 });
 
-test("the per-plan cap rejects the 7th call for that plan", async () => {
+test("the per-plan cap rejects the 7th SUCCESSFUL call for that plan", async () => {
+  // Rewritten for the counting fix: only billed responses consume the budget,
+  // so reaching the cap now requires six successes rather than six attempts.
   const uid = `user-${uniq()}`;
   const planId = await givenPlan(uid, `plan-${uniq()}`);
-  for (let i = 0; i < guards.MAX_DETAIL_CALLS_PER_PLAN; i++) {
-    const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
-    assert.equal(err.code, "internal", `call ${i + 1} should reach the provider`);
-  }
-  await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }), "resource-exhausted", "7th");
+  await withProvider(OK_RESPONSE, async () => {
+    for (let i = 0; i < guards.MAX_DETAIL_CALLS_PER_PLAN; i++) {
+      await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    }
+    await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }), "resource-exhausted", "7th");
 
-  // A different plan for the same user is unaffected by that plan's counter.
-  const other = await givenPlan(uid, `plan-${uniq()}`);
-  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: other }));
-  assert.equal(err.code, "internal", "per-plan counters must be per plan");
+    // A different plan for the same user is unaffected by that plan's counter.
+    const other = await givenPlan(uid, `plan-${uniq()}`);
+    const res = await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: other });
+    assert.equal(res.stopReason, "end_turn", "per-plan counters must be per plan");
+  });
 });
 
 test("a non-entitled user is cut off on the 11th call of the UTC day", async () => {
@@ -483,9 +488,10 @@ test("a call that fails validation consumes no count", async () => {
 test("the normal success path passes every guard and counts exactly once", async () => {
   const uid = `user-${uniq()}`;
   const planId = await givenPlan(uid, `plan-${uniq()}`);
-  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
-  // The invalid test key is the only thing between the guards and a real call.
-  assert.equal(err.code, "internal");
+  await withProvider(OK_RESPONSE, async () => {
+    const res = await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    assert.equal(res.stopReason, "end_turn");
+  });
 
   const counters = db.collection("users").doc(uid).collection("aiCallGuards");
   assert.equal((await counters.doc(`detail_${planId}`).get()).data().calls, 1);
@@ -505,4 +511,182 @@ test("an accepted call logs prompt size and cap, and warns past 80% of the cap",
   assert.match(joined, /cap=40000/);
   assert.match(joined, /APPROACHING_PROMPT_CAP/, "88% of the cap must warn");
   assert.ok(!joined.includes("xxxxxxxxxx"), "prompt content must never be logged");
+});
+
+// ---- 10. per-plan counting follows the bill --------------------------------
+
+// Anthropic does not charge for error responses, so a count consumed by a 429,
+// a 529 or a timeout protects no spend - it only burns a plan's lifetime
+// budget. The launch sweep and the auto-resume effect retry summary-ready
+// plans automatically, so an outage plus a few launches could otherwise leave
+// a plan's details permanently unreachable.
+
+/**
+ * Stands in for Anthropic by replacing Messages.prototype.create, which every
+ * client instance shares - including the one the handler constructs per
+ * request. Patching the SDK's fetch is not enough: the client captures it at
+ * construction, and the SDK's own retry logic would fire on 429/529 anyway.
+ *
+ * respond() returns a message object for a billed response, or throws to stand
+ * for an error status, a connection failure or a timeout - the cases where
+ * Anthropic never billed us.
+ */
+const AnthropicSdk = require(require.resolve("@anthropic-ai/sdk", { paths: [FUNCTIONS_DIR] }));
+const AnthropicCtor = AnthropicSdk.default || AnthropicSdk;
+const MESSAGES_PROTO = Object.getPrototypeOf(new AnthropicCtor({ apiKey: "stub-never-used" }).messages);
+
+async function withProvider(respond, run) {
+  const realCreate = MESSAGES_PROTO.create;
+  MESSAGES_PROTO.create = async () => respond();
+  try {
+    await run();
+  } finally {
+    MESSAGES_PROTO.create = realCreate;
+  }
+}
+
+const OK_RESPONSE = () => ({
+  content: [{ type: "text", text: "{}" }],
+  stop_reason: "end_turn",
+  usage: { output_tokens: 10 },
+});
+
+const planCount = async (uid, planId) => {
+  const snap = await db.collection("users").doc(uid).collection("aiCallGuards").doc(`detail_${planId}`).get();
+  return snap.exists ? (snap.data().calls ?? 0) : 0;
+};
+const dailyCount = async (uid) => {
+  const snap = await db.collection("users").doc(uid).collection("aiCallGuards").doc("daily_analyzePhotoDetail").get();
+  return snap.exists ? (snap.data().calls ?? 0) : 0;
+};
+
+test("a provider error status releases the per-plan count but keeps the daily count", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+
+  // The invalid ANTHROPIC_KEY makes every real call fail with an API error,
+  // which is exactly the shape this path exists for.
+  const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+  assert.equal(err.code, "internal", "the provider call must have been attempted");
+
+  assert.equal(await planCount(uid, planId), 0, "per-plan count released");
+  assert.equal(await dailyCount(uid), 1, "daily count stands - it is the abuse bound");
+});
+
+test("a 529 overloaded and a timeout both release the per-plan count", async () => {
+  for (const [label, thrown] of [
+    ["529 overloaded", Object.assign(new Error("Overloaded"), { status: 529 })],
+    ["429 rate limited", Object.assign(new Error("Rate limited"), { status: 429 })],
+    ["timeout", Object.assign(new Error("Request timed out."), { name: "APIConnectionTimeoutError" })],
+  ]) {
+    const uid = `user-${uniq()}`;
+    const planId = await givenPlan(uid, `plan-${uniq()}`);
+    await withProvider(() => { throw thrown; }, async () => {
+      const err = await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+      assert.equal(err.code, "internal", label);
+    });
+    assert.equal(await planCount(uid, planId), 0, `${label}: per-plan released`);
+    assert.equal(await dailyCount(uid), 1, `${label}: daily kept`);
+  }
+});
+
+test("a billed response that comes back truncated keeps the per-plan count", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  await withProvider(() => ({
+    content: [{ type: "text", text: '{"approaches":{"simple"' }], // truncated mid-JSON
+    stop_reason: "max_tokens",
+    usage: { output_tokens: 6000 },
+  }), async () => {
+    const res = await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    assert.equal(res.stopReason, "max_tokens");
+  });
+  assert.equal(await planCount(uid, planId), 1, "Anthropic billed this response, so the attempt stands");
+  assert.equal(await dailyCount(uid), 1);
+});
+
+test("six provider failures leave the plan fully usable, and the next success is counted", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+
+  for (let i = 0; i < 6; i++) {
+    await withProvider(() => { throw Object.assign(new Error("Overloaded"), { status: 529 }); }, async () => {
+      await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }));
+    });
+  }
+  assert.equal(await planCount(uid, planId), 0, "an outage must not exhaust the plan");
+
+  await withProvider(() => ({
+    content: [{ type: "text", text: "{}" }], stop_reason: "end_turn", usage: { output_tokens: 10 },
+  }), async () => {
+    const res = await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    assert.equal(res.stopReason, "end_turn");
+  });
+  assert.equal(await planCount(uid, planId), 1, "the successful call is the first that counts");
+});
+
+test("six successes exhaust the plan and the seventh is refused", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const ok = () => ({ content: [{ type: "text", text: "{}" }], stop_reason: "end_turn", usage: { output_tokens: 10 } });
+
+  await withProvider(ok, async () => {
+    for (let i = 0; i < guards.MAX_DETAIL_CALLS_PER_PLAN; i++) {
+      await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    }
+    await expectCode(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId }), "resource-exhausted", "7th");
+  });
+  assert.equal(await planCount(uid, planId), guards.MAX_DETAIL_CALLS_PER_PLAN, "stops at the cap, never above");
+});
+
+test("a release never drives the counter below zero, and never fires twice", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = `plan-${uniq()}`;
+
+  // No counter document at all: releasing must be a no-op, not a negative.
+  await guards.releaseDetailPlanLimit(db, uid, planId);
+  assert.equal(await planCount(uid, planId), 0);
+
+  // One consumed, released three times.
+  await guards.consumeDetailPlanLimit(db, uid, planId);
+  assert.equal(await planCount(uid, planId), 1);
+  await guards.releaseDetailPlanLimit(db, uid, planId);
+  await guards.releaseDetailPlanLimit(db, uid, planId);
+  await guards.releaseDetailPlanLimit(db, uid, planId);
+  assert.equal(await planCount(uid, planId), 0, "clamped at zero");
+
+  // And the handler itself releases at most once per attempt.
+  const planId2 = await givenPlan(uid, `plan-${uniq()}`);
+  await withProvider(() => { throw Object.assign(new Error("Overloaded"), { status: 529 }); }, async () => {
+    await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId: planId2 }));
+  });
+  assert.equal(await planCount(uid, planId2), 0);
+});
+
+test("each outcome is logged by name, without prompt content", async () => {
+  const uid = `user-${uniq()}`;
+  const planId = await givenPlan(uid, `plan-${uniq()}`);
+  const marker = "MARKER-PROMPT-TEXT-MUST-NOT-APPEAR";
+
+  const failLines = await captureLogs(async () => {
+    await withProvider(() => { throw Object.assign(new Error("Overloaded"), { status: 529 }); }, async () => {
+      await errorFrom(callAs(fns.analyzePhotoDetail, uid, { prompt: marker + DETAIL_PROMPT, planId }));
+    });
+  });
+  assert.match(failLines.join("\n"), /outcome=released-provider-failure/);
+  assert.ok(!failLines.join("\n").includes(marker), "prompt content must never be logged");
+
+  const okLines = await captureLogs(async () => {
+    await withProvider(() => ({ content: [{ type: "text", text: "{}" }], stop_reason: "end_turn", usage: {} }), async () => {
+      await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    });
+  });
+  assert.match(okLines.join("\n"), /outcome=counted-success/);
+
+  const truncLines = await captureLogs(async () => {
+    await withProvider(() => ({ content: [{ type: "text", text: "{" }], stop_reason: "max_tokens", usage: {} }), async () => {
+      await callAs(fns.analyzePhotoDetail, uid, { prompt: DETAIL_PROMPT, planId });
+    });
+  });
+  assert.match(truncLines.join("\n"), /outcome=counted-parse-failure/);
 });

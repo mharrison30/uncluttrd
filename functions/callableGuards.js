@@ -266,6 +266,43 @@ async function consumeDetailPlanLimit(db, uid, planId, max = MAX_DETAIL_CALLS_PE
 }
 
 /**
+ * Gives back a per-plan count when the provider never billed us for it.
+ *
+ * Anthropic does not charge for error responses, so a count consumed by a
+ * 429, a 529 overloaded, a connection failure or a timeout protects no spend -
+ * it only burns a plan's lifetime budget. That matters because the launch
+ * sweep and the auto-resume effect retry summary-ready plans automatically:
+ * a provider outage plus a handful of app launches could exhaust a plan's six
+ * calls and leave its details permanently unreachable, with every shipped
+ * client rendering the refusal as "Tap to retry" - a button that can never
+ * succeed.
+ *
+ * Deliberately NOT applied to the daily cap: that one is the abuse bound, and
+ * a caller who burns our capacity with failing requests has still consumed it.
+ *
+ * Clamped at zero, so a double release or a release racing a concurrent
+ * consume can never hand back more than was taken.
+ */
+async function releaseDetailPlanLimit(db, uid, planId) {
+  const ref = guardsCollection(db, uid).doc(`detail_${planId}`);
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const used = typeof snap.data().calls === "number" ? snap.data().calls : 0;
+      tx.set(ref, {
+        calls: Math.max(0, used - 1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+  } catch (err) {
+    // A failed release costs the user one of six attempts on this plan. It
+    // must never turn a provider failure into a request failure.
+    console.warn(`[aiCallGuards] per-plan release failed: ${err.message}`);
+  }
+}
+
+/**
  * Per-user ceiling across every plan, reset on the UTC day boundary - the same
  * calendar basis analyzePhoto's monthly counter uses, so the two agree about
  * when a day starts.
@@ -312,6 +349,7 @@ module.exports = {
   storeReplay,
   consumeSafetyLimit,
   consumeDetailPlanLimit,
+  releaseDetailPlanLimit,
   consumeDetailDailyLimit,
   logPromptSize,
   utcDayKey,

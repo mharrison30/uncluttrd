@@ -635,10 +635,28 @@ exports.analyzePhotoDetail = onCall(
     console.log(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} accepted entitled=${entitled} dailyCap=${dailyCap}`);
 
     const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY.value() });
+
+    // Three outcomes, and they are not the same thing:
+    //
+    //   counted-success        a billed response we could use
+    //   counted-parse-failure  a billed response that came back truncated or
+    //                          otherwise unusable - Anthropic charged for it,
+    //                          so the attempt stands
+    //   released-provider-failure  no usable response and no bill: the
+    //                          per-plan count is handed back
+    //
+    // The daily cap is never released in any of the three: it is the abuse
+    // bound, and capacity we spent is spent.
+    let released = false;
+    const releaseOnce = async () => {
+      if (released) return;
+      released = true;
+      await guards.releaseDetailPlanLimit(db, uid, String(planId));
+    };
+
+    let message;
     try {
-      // Text only. No image content block - that absence IS the guarantee
-      // that Call 2 cannot re-analyze the photograph.
-      const message = await anthropic.messages.create({
+      message = await anthropic.messages.create({
         model: "claude-sonnet-4-5",
         // Same ceiling as analyzePhoto. Call 2's response is the larger
         // half of the old single response (three approaches' guidance,
@@ -647,13 +665,21 @@ exports.analyzePhotoDetail = onCall(
         max_tokens: 6000,
         messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
       });
-      const text = message.content.find((b) => b.type === "text")?.text || "";
-      console.log(`analyzePhotoDetail response: planId=${planId} stop_reason=${message.stop_reason} | textLength=${text.length} | outputTokens=${message.usage?.output_tokens}`);
-      return { text, stopReason: message.stop_reason, outputTokens: message.usage?.output_tokens ?? null };
     } catch (err) {
-      console.error(`[analyzePhotoDetail] uid=${uid} planId=${planId} failed: ${err.message}`);
+      // Everything that lands here - an error status including 429 and 529,
+      // a connection failure, or a timeout - means no billed response reached
+      // us. A timeout can in principle follow a request Anthropic did bill;
+      // releasing anyway is the accepted trade, because the daily cap still
+      // bounds a caller who manufactures timeouts.
+      await releaseOnce();
+      console.warn(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} outcome=released-provider-failure status=${err.status ?? "none"} error=${err.message}`);
       throw new HttpsError("internal", err.message || "Detail generation failed.");
     }
+
+    const text = message.content.find((b) => b.type === "text")?.text || "";
+    const truncated = message.stop_reason === "max_tokens";
+    console.log(`[analyzePhotoDetail] uid=${guards.uidTag(uid)} outcome=${truncated ? "counted-parse-failure" : "counted-success"} stop_reason=${message.stop_reason} textLength=${text.length} outputTokens=${message.usage?.output_tokens ?? "?"}`);
+    return { text, stopReason: message.stop_reason, outputTokens: message.usage?.output_tokens ?? null };
   }
 );
 
