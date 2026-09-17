@@ -302,8 +302,9 @@ test("the second-launch and after-first-plan ATT logic no longer exists", () => 
   ]) {
     assert.ok(!SRC.includes(gone), `${gone} must be gone from App.js`);
   }
-  // And the prompt is driven from the launch screen finishing.
-  assert.match(SRC, /onExited=\{\(\) => \{[\s\S]{0,400}resolveTrackingThenStartMeta\(\);/);
+  // And the prompt is driven by the authenticated gate, not by the launch
+  // screen finishing - see the AppRoot gate tests below.
+  assert.match(SRC, /if \(!user \|\| metaGateStartedRef\.current\) return;[\s\S]{0,300}resolveTrackingThenStartMeta\(\)/);
 });
 
 test("Meta is only ever reached through the two sanctioned functions", () => {
@@ -366,4 +367,159 @@ test("staging carries no Meta identity and no ATT prompt text", () => {
   assert.ok(!names.includes("react-native-fbsdk-next"));
   assert.ok(!names.includes("expo-tracking-transparency"));
   process.env.APP_ENV = "production";
+});
+
+// ---- the authenticated gate in AppRoot -------------------------------------
+
+// Build 42 triggered ATT from the launch screen finishing. That is
+// startupReady, which onAuthStateChanged sets for BOTH outcomes, so a fresh
+// install with no saved session saw the prompt before the sign-in screen.
+// These run AppRoot's real gate - the useState/useRef/useEffect block and the
+// holdForTracking line, lifted from App.js - on a miniature React.
+function gateSource() {
+  const start = SRC.indexOf("  const [metaGateReady, setMetaGateReady]");
+  const end = SRC.indexOf("const holdForTracking = !!user && !metaGateReady;", start);
+  assert.ok(start > 0 && end > start, "AppRoot tracking gate located in App.js");
+  return SRC.slice(start, end) + "const holdForTracking = !!user && !metaGateReady;";
+}
+
+function mountGate({ requestsAtt = true, flow } = {}) {
+  const src = gateSource();
+  const states = [];
+  const refs = [];
+  const prevDeps = [];
+  let user = null;
+  let out = null;
+  let renders = 0;
+
+  function render() {
+    renders++;
+    let si = 0;
+    let ri = 0;
+    let ei = 0;
+    const pending = [];
+    const useState = (init) => {
+      const i = si++;
+      if (states.length <= i) states[i] = init;
+      return [states[i], (v) => {
+        const next = typeof v === "function" ? v(states[i]) : v;
+        if (next !== states[i]) { states[i] = next; render(); }
+      }];
+    };
+    const useRef = (init) => {
+      const i = ri++;
+      if (refs.length <= i) refs[i] = { current: init };
+      return refs[i];
+    };
+    const useEffect = (fn, deps) => {
+      const i = ei++;
+      const before = prevDeps[i];
+      const changed = !before || deps.some((d, n) => d !== before[n]);
+      prevDeps[i] = deps;
+      if (changed) pending.push(fn);
+    };
+    out = new Function(
+      "useState", "useRef", "useEffect", "user", "REQUESTS_ATT", "resolveTrackingThenStartMeta",
+      src + "; return { holdForTracking, metaGateReady };",
+    )(useState, useRef, useEffect, user, requestsAtt, flow);
+    pending.forEach((fn) => fn());
+  }
+
+  render();
+  return {
+    hold: () => out.holdForTracking,
+    renders: () => renders,
+    signIn: (u = { uid: "u1" }) => { user = u; render(); },
+    signOut: () => { user = null; render(); },
+  };
+}
+
+// A stand-in for resolveTrackingThenStartMeta that reports when it ran and
+// stays pending until released, so ordering is observable.
+function deferredFlow() {
+  let release;
+  const calls = [];
+  const fn = () => {
+    calls.push(Date.now());
+    return new Promise((r) => { release = r; });
+  };
+  fn.calls = calls;
+  fn.release = async () => { release(); await new Promise((r) => setImmediate(r)); };
+  return fn;
+}
+
+test("fresh install, signed out: no ATT and no Meta, and the sign-in screen is not held back", () => {
+  const flow = deferredFlow();
+  const gate = mountGate({ flow });
+
+  assert.equal(flow.calls.length, 0, "auth resolving to no user must not start ATT");
+  assert.equal(gate.hold(), false, "the sign-in screen renders immediately");
+});
+
+test("closing the app without signing in never initialises Meta", () => {
+  const flow = deferredFlow();
+  const gate = mountGate({ flow });
+  gate.signOut();
+  assert.equal(flow.calls.length, 0);
+  assert.equal(gate.hold(), false);
+});
+
+test("signing in starts ATT and holds authenticated content until it is answered", async () => {
+  const flow = deferredFlow();
+  const gate = mountGate({ flow });
+
+  gate.signIn();
+  assert.equal(flow.calls.length, 1, "ATT starts on the first authenticated moment");
+  assert.equal(gate.hold(), true, "Home waits behind the prompt");
+
+  await flow.release();
+  assert.equal(gate.hold(), false, "and continues once answered");
+});
+
+test("a restored session behaves the same way on launch", async () => {
+  const flow = deferredFlow();
+  const gate = mountGate({ flow });
+  // Firebase resolves straight to a signed-in user, with no sign-in screen.
+  gate.signIn({ uid: "restored" });
+  assert.equal(flow.calls.length, 1);
+  assert.equal(gate.hold(), true);
+  await flow.release();
+  assert.equal(gate.hold(), false);
+});
+
+test("signing out does not prompt again or re-initialise Meta", async () => {
+  const flow = deferredFlow();
+  const gate = mountGate({ flow });
+  gate.signIn();
+  await flow.release();
+  assert.equal(flow.calls.length, 1);
+
+  gate.signOut();
+  gate.signIn({ uid: "second-account" });
+  assert.equal(flow.calls.length, 1, "once per runtime, whoever signs in");
+  assert.equal(gate.hold(), false, "and nothing is held back the second time");
+});
+
+test("where no prompt is ever shown, nothing is held back", () => {
+  // Android production and both staging environments: REQUESTS_ATT is false.
+  const flow = deferredFlow();
+  const gate = mountGate({ requestsAtt: false, flow });
+  assert.equal(gate.hold(), false);
+  gate.signIn();
+  assert.equal(flow.calls.length, 1, "Meta still initialises after authentication");
+  assert.equal(gate.hold(), false, "but Home is never delayed");
+});
+
+test("the launch screen and the render gate both wait on the tracking hold", () => {
+  // A restored session keeps the launch screen up across the prompt; a
+  // sign-in completed later falls back to the plain startup screen. Either
+  // way no authenticated content is drawn underneath the prompt.
+  assert.match(SRC, /ready=\{startupReady && !holdForTracking\}/);
+  assert.match(SRC, /if \(!startupReady \|\| holdForTracking\) \{/);
+  // And the prompt is no longer driven by the launch screen finishing.
+  assert.match(SRC, /onExited=\{\(\) => setShowLaunch\(false\)\}/);
+  const exited = SRC.slice(SRC.indexOf("onExited="), SRC.indexOf("onExited=") + 120);
+  assert.ok(!exited.includes("resolveTrackingThenStartMeta"), "ATT must not hang off the launch screen");
+  // The gate keys on the user, not on auth merely having resolved.
+  assert.match(SRC, /if \(!user \|\| metaGateStartedRef\.current\) return;/);
 });

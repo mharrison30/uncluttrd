@@ -14008,9 +14008,10 @@ function whenAppIsActive() {
   });
 }
 
-// Single entry point, called when the launch screen has finished. Every path
-// ends with Meta either started with a definite tracking answer, or (staging)
-// never started at all.
+// Single entry point, called once a real authenticated user exists - never
+// merely because Firebase finished deciding there is no saved session. Every
+// path ends with Meta either started with a definite tracking answer, or
+// (staging) never started at all.
 let trackingResolutionStarted = false;
 async function resolveTrackingThenStartMeta() {
   if (!IS_PRODUCTION || trackingResolutionStarted) return;
@@ -14489,14 +14490,39 @@ function AppRoot() {
   // Startup gate: unchanged conditions - Inter loaded, and the first
   // onAuthStateChanged resolved (signed out, or signed in with the user
   // reloaded and RevenueCat linked or its 8s bound reached).
+  // AUTH RESOLVED IS NOT SIGNED IN. onAuthStateChanged clears `loading` for
+  // both outcomes, so startupReady only means Firebase has decided; `user`
+  // is what says somebody is actually signed in. Build 42 drove ATT from the
+  // launch screen finishing, which is startupReady, so a fresh install with
+  // no saved session saw the prompt ahead of the sign-in screen.
   const startupReady = !loading && fontsLoaded;
   // Cold launch only: AppRoot mounts once per JS runtime.
   const [showLaunch, setShowLaunch] = useState(true);
 
+  // ATT, then Meta, on the first authenticated moment of this runtime -
+  // whether that is a restored session or a sign-in the user just completed.
+  // Starts satisfied where no prompt is ever shown (Android, staging), so
+  // nothing is held back there.
+  const [metaGateReady, setMetaGateReady] = useState(!REQUESTS_ATT);
+  const metaGateStartedRef = useRef(false);
+  useEffect(() => {
+    if (!user || metaGateStartedRef.current) return;
+    metaGateStartedRef.current = true;
+    // Signing out later never re-runs this: the ref, and the one-shot guards
+    // inside resolveTrackingThenStartMeta and startMetaOnce, all hold for the
+    // life of the runtime.
+    resolveTrackingThenStartMeta().finally(() => setMetaGateReady(true));
+  }, [user]);
+
+  // Authenticated content waits behind the prompt rather than flashing up
+  // underneath it. Signed out, this is always false - the sign-in screen is
+  // never held back, and no prompt is pending.
+  const holdForTracking = !!user && !metaGateReady;
+
   let screen;
-  if (!startupReady) {
-    // Only ever visible if LaunchScreen is gone before startup resolves,
-    // which it never is - kept as the plain fallback it always was.
+  if (!startupReady || holdForTracking) {
+    // The plain fallback it always was, now also what sits behind the ATT
+    // prompt for a user who signed in with the launch screen already gone.
     screen = (
       <SafeAreaView style={[s.safe, { alignItems: "center", justifyContent: "center" }]}>
         <View style={s.hdrMark}><DrawerIcon size={54} dark={true} /></View>
@@ -14534,14 +14560,11 @@ function AppRoot() {
       {screen}
       {showLaunch ? (
         <LaunchScreen
-          ready={startupReady}
-          onExited={() => {
-            setShowLaunch(false);
-            // The launch screen only exits once startup has resolved, so this
-            // is the first moment the app is on screen with auth settled -
-            // where Apple expects the prompt on a fresh install.
-            resolveTrackingThenStartMeta();
-          }}
+          // A restored session keeps the launch screen up across the prompt,
+          // so ATT is answered before any authenticated content is drawn.
+          // Signed out, holdForTracking is false and this is unchanged.
+          ready={startupReady && !holdForTracking}
+          onExited={() => setShowLaunch(false)}
         />
       ) : null}
     </View>

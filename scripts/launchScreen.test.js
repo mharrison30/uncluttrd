@@ -133,11 +133,13 @@ test("the dismissal gate is the existing startup gate, and the screen is shown o
   assert.match(APP, /const startupReady = !loading && fontsLoaded;/);
   assert.match(APP, /const \[showLaunch, setShowLaunch\] = useState\(true\);/);
   assert.equal((APP.match(/setShowLaunch\(/g) || []).length, 1, "only ever set false, by onExited");
-  // The gate is still <LaunchScreen ready={startupReady}>, dismissed by its
-  // own onExited. That handler now also starts the ATT flow (covered by
-  // scripts/attMetaFlow.test.js), so the element spans several lines.
-  assert.match(APP, /\{showLaunch \? \(\s*<LaunchScreen\s+ready=\{startupReady\}\s+onExited=\{\(\) => \{/);
-  assert.match(APP, /onExited=\{\(\) => \{\s*setShowLaunch\(false\);/);
+  // The gate is <LaunchScreen ready={...}>, dismissed by its own onExited.
+  // `ready` now also waits on holdForTracking, so a restored session keeps
+  // the launch screen up until ATT is answered (scripts/attMetaFlow.test.js
+  // covers that); startupReady is still the startup half of the condition.
+  assert.match(APP, /\{showLaunch \? \(\s*<LaunchScreen/);
+  assert.match(APP, /ready=\{startupReady && !holdForTracking\}/);
+  assert.match(APP, /onExited=\{\(\) => setShowLaunch\(false\)\}/);
   assert.match(APP, /\/>\s*\) : null\}/);
   // The only timer is the controller's minimum; LaunchScreen adds no maximum
   // and no timer of its own.
