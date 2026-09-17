@@ -856,6 +856,15 @@ exports.analyzePhotoCanary = onSchedule(
 // re-engagement scheduler must not let one user's failure abort the batch,
 // and the canary alert itself must not mask the original failure it's
 // reporting) - a send failure just logs a distinctly-tagged line instead.
+// One-way, stable, and short enough to group by in a log search without
+// being reversible.
+const recipientTag = (to) =>
+  crypto.createHash("sha256").update(Array.isArray(to) ? to.join(",") : String(to)).digest("hex").slice(0, 8);
+
+// Returns TRUE only when Resend accepted the message. Callers that record a
+// "we sent this" marker must gate on it - writing that marker after a failed
+// send suppresses the retry permanently, which is exactly what happened to the
+// re-engagement nudge before this returned anything at all.
 async function sendEmail({ from, to, subject, text, html, headers }) {
   try {
     const resp = await fetch("https://api.resend.com/emails", {
@@ -880,10 +889,15 @@ async function sendEmail({ from, to, subject, text, html, headers }) {
       }),
     });
     if (!resp.ok) {
-      console.error(`[sendEmail] Resend send failed (to=${JSON.stringify(to)}, subject="${subject}"): HTTP ${resp.status} - ${await resp.text()}`);
+      // The recipient is hashed, never logged raw: these lines land in Cloud
+      // Logging, which is not a place for customer email addresses.
+      console.error(`[sendEmail] Resend send failed (to=${recipientTag(to)}, subject="${subject}"): HTTP ${resp.status} - ${await resp.text()}`);
+      return false;
     }
+    return true;
   } catch (err) {
-    console.error(`[sendEmail] Resend send threw (to=${JSON.stringify(to)}, subject="${subject}"): ${err.message}`);
+    console.error(`[sendEmail] Resend send threw (to=${recipientTag(to)}, subject="${subject}"): ${err.message}`);
+    return false;
   }
 }
 
@@ -1181,18 +1195,37 @@ Welcome to the next level of organizing.
 Michael & Chantelle
 Co-Founders, Uncluttrd`;
 
-const reengagementEmailText = (displayName) => `Hi ${firstNameFrom(displayName)},
+// The site, not a store listing: uncluttrd.app carries both store buttons, so
+// one URL serves iPhone and Android readers and survives a forwarded email.
+// The UTM tags are what make this campaign attributable at all - GA4 on the
+// site attributes the session, and nothing else in the pipeline can.
+const REENGAGEMENT_CTA_URL =
+  "https://uncluttrd.app/?utm_source=email&utm_medium=nudge&utm_campaign=reengagement";
+const unsubscribeUrl = (token) =>
+  `https://us-central1-cluttrd-3e335.cloudfunctions.net/handleUnsubscribe?token=${encodeURIComponent(token)}`;
+
+// Plain text, so the URLs are written out in full on their own lines: every
+// mail client linkifies a bare https:// URL, and a reader who does not get a
+// tappable link can still copy it.
+const reengagementEmailText = (displayName, token) => `Hi ${firstNameFrom(displayName)},
 
 We noticed you haven't created your first organizing space yet, and that's perfectly okay.
 
 Whenever you're ready, just open the app, snap a photo of the space you'd like to organize, and let Uncluttrd build a personalized space to help you get started.
+
+Start here:
+${REENGAGEMENT_CTA_URL}
 
 If you ran into a problem or have a question, just reply to this email. It comes directly to us, and we're always happy to help.
 
 We can't wait to see what you organize first.
 
 Michael & Chantelle
-Co-Founders, Uncluttrd`;
+Co-Founders, Uncluttrd
+
+--
+Don't want these emails? Unsubscribe here:
+${unsubscribeUrl(token)}`;
 
 // Fires once, on genuine new-signup doc creation only - gated on the
 // isNewSignup marker App.js's real signup call site sets explicitly
@@ -1244,24 +1277,75 @@ exports.reengagementNudge = onSchedule(
       .where("createdAt", "<=", windowEnd)
       .get();
 
+    // Counted for every run, so a future audit can answer "did this do
+    // anything?" from Cloud Logging alone. Before this, a run that matched
+    // nobody and a run that emailed everybody produced identical output: none.
+    const tally = {
+      considered: snap.size,
+      skippedAlreadySent: 0,
+      skippedOptedOut: 0,
+      skippedHasPlan: 0,
+      skippedNoEmail: 0,
+      skippedTestAccount: 0,
+      attempted: 0,
+      sent: 0,
+      failed: 0,
+    };
+
     for (const doc of snap.docs) {
       try {
         const data = doc.data();
-        if (data.reengagementEmailSentAt) continue;
+        if (data.reengagementEmailSentAt) { tally.skippedAlreadySent++; continue; }
+        // Test accounts are ours; a nudge to one is noise in both the mailbox
+        // and the metrics.
+        if (data.isTestAccount === true) { tally.skippedTestAccount++; continue; }
+        // This is a win-back email, not a receipt. It honours the opt-out,
+        // which is what the helper was written for and never called for.
+        if (await isOptedOutOfMarketing(doc.id)) { tally.skippedOptedOut++; continue; }
         const plansSnap = await doc.ref.collection("plans").limit(1).get();
-        if (!plansSnap.empty) continue;
-        if (!data.email) continue;
-        await sendEmail({
+        if (!plansSnap.empty) { tally.skippedHasPlan++; continue; }
+        if (!data.email) { tally.skippedNoEmail++; continue; }
+
+        // Every recipient needs a token, because the unsubscribe endpoint
+        // resolves a user by it. Written BEFORE the send: a token in the mail
+        // that is not in Firestore would make unsubscribe silently fail.
+        let token = data.unsubscribeToken;
+        if (!token) {
+          token = crypto.randomUUID();
+          await doc.ref.update({ unsubscribeToken: token });
+        }
+
+        tally.attempted++;
+        const accepted = await sendEmail({
           from: TRANSACTIONAL_EMAIL_FROM,
           to: data.email,
           subject: "Ready when you are.",
-          text: reengagementEmailText(data.displayName),
+          text: reengagementEmailText(data.displayName, token),
+          // RFC 8058 one-click: Gmail and Outlook render their own unsubscribe
+          // control from these, and a reader who uses it never reaches for the
+          // spam button instead.
+          headers: {
+            "List-Unsubscribe": `<${unsubscribeUrl(token)}>`,
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+          },
         });
-        await doc.ref.update({ reengagementEmailSentAt: admin.firestore.FieldValue.serverTimestamp() });
+
+        // Only a confirmed send suppresses the retry. A Resend failure used to
+        // write this marker anyway, which meant one bad minute cost that user
+        // their only nudge, forever.
+        if (accepted) {
+          tally.sent++;
+          await doc.ref.update({ reengagementEmailSentAt: admin.firestore.FieldValue.serverTimestamp() });
+        } else {
+          tally.failed++;
+        }
       } catch (err) {
-        console.error(`[reengagementNudge] Failed for uid=${doc.id}: ${err.message}`);
+        tally.failed++;
+        console.error(`[reengagementNudge] Failed for uid=${recipientTag(doc.id)}: ${err.message}`);
       }
     }
+
+    console.log(`[reengagementNudge] ${JSON.stringify(tally)}`);
   }
 );
 
