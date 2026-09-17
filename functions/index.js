@@ -564,7 +564,7 @@ exports.generateNextAction = onCall(
 // legacy App Store build calling it, so there is no compatibility shim to
 // preserve: it was born after the auth-required era.
 exports.analyzePhotoDetail = onCall(
-  { secrets: [ANTHROPIC_KEY], maxInstances: 10, timeoutSeconds: 300 },
+  { secrets: [ANTHROPIC_KEY, REVENUECAT_SECRET_API_KEY], maxInstances: 10, timeoutSeconds: 300 },
   async (request) => {
     const { prompt, planId } = request.data || {};
 
@@ -1014,7 +1014,7 @@ async function verifyProEntitlement(uid) {
       { headers: { Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY.value()}` } }
     );
   } catch (e) {
-    console.error(`[entitlement] network failure for uid=${uid}: ${e.message}`);
+    console.error(`[entitlement] network failure for uid=${guards.uidTag(uid)}: ${e.message}`);
     return null;
   }
   // Unknown customer. Not an outage - an answer.
@@ -1022,18 +1022,18 @@ async function verifyProEntitlement(uid) {
   // 4xx other than 404 means our request was wrong (bad key, bad project),
   // which must not silently grant access either.
   if (resp.status >= 400 && resp.status < 500) {
-    console.error(`[entitlement] client-error response for uid=${uid}: HTTP ${resp.status}`);
+    console.error(`[entitlement] client-error response for uid=${guards.uidTag(uid)}: HTTP ${resp.status}`);
     return false;
   }
   if (!resp.ok) {
-    console.error(`[entitlement] upstream unavailable for uid=${uid}: HTTP ${resp.status}`);
+    console.error(`[entitlement] upstream unavailable for uid=${guards.uidTag(uid)}: HTTP ${resp.status}`);
     return null;
   }
   try {
     const data = await resp.json();
     return (data.items || []).some((item) => item.entitlement_id === PRO_ENTITLEMENT_ID);
   } catch (e) {
-    console.error(`[entitlement] unparseable response for uid=${uid}: ${e.message}`);
+    console.error(`[entitlement] unparseable response for uid=${guards.uidTag(uid)}: ${e.message}`);
     return null;
   }
 }
