@@ -2664,22 +2664,183 @@ const KNOWN_TEST_EMAILS = [
 
 // Creates the users/{uid} profile document if it doesn't exist yet. Covers both
 // brand-new signups and pre-existing users who signed up before this doc existed.
-const ensureUserDocument = async (u, extra = {}) => {
-  const userRef = doc(db, "users", u.uid);
-  const snap = await getDoc(userRef);
-  if (!snap.exists()) {
-    const isTestAccount = KNOWN_TEST_EMAILS.includes((u.email || "").toLowerCase());
-    await setDoc(userRef, {
-      uid: u.uid,
-      email: u.email || "",
-      displayName: u.displayName || "",
-      createdAt: serverTimestamp(),
-      platform: Platform.OS,
-      isPro: false,
-      isTestAccount,
-      ...extra,
-    });
+// ---- NEW-SIGNUP MARKING ---------------------------------------------------
+//
+// users/{uid} has two creators, and only one of them knows it is a signup:
+//
+//   handleAuth signup branch   ensureUserDocument(cred.user, { isNewSignup: true })
+//   onAuthStateChanged         ensureUserDocument(u)
+//
+// createUserWithEmailAndPassword fires the auth observer immediately, so both
+// run concurrently and whichever setDoc lands first decides the document.
+// sendWelcomeEmail is an onDocumentCreated trigger gated on isNewSignup, so
+// when the generic caller won, the field was absent permanently and no welcome
+// email was ever sent. Confirmed on staging: three signups on one build, two
+// lost, one won, on both platforms.
+//
+// Two mechanisms, because neither failure mode covers the other:
+//
+//   pendingSignup        in process. Covers the race. Established BEFORE the
+//                        Auth account exists, so there is no window for the
+//                        observer to slip through.
+//   pendingSignup:<uid>  on disk. Covers process death. An app killed after
+//                        Auth creation but before the document is written
+//                        still knows, on its next launch, that this account
+//                        was a signup.
+//
+// Neither is a time threshold, deliberately. Auth's own metadata cannot carry
+// this distinction: restoring a persisted session does not move
+// lastSignInTime, so an old account that signed in once and later lost its
+// document is indistinguishable from a fresh one by creationTime alone.
+// Marking that account new would send it a duplicate welcome email.
+const SIGNUP_COORDINATION_TIMEOUT_MS = 5000;
+
+// KEYED BY UID, the same shape as tutorialCacheKey. Onboarding used to hang
+// off one unkeyed device-wide key and leaked between accounts on a shared
+// device; this is the same class of bug, so a marker written by one signup
+// must never be readable by the next account to sign in here.
+const signupMarkerKey = (uid) => `pendingSignup:${uid}`;
+
+// KNOWN GAP, and a deliberate one. The marker lives on a single device. A
+// signup interrupted after Auth creation and resumed after a reinstall, or on
+// a different device, finds no marker, creates the document without
+// isNewSignup, and the welcome email is missed.
+//
+// That is the direction to fail in. welcomeEmailSentAt does not exist on any
+// users/{uid} document and the emailLedger collection is still empty, so a
+// duplicate welcome email can be neither detected nor undone, while a missed
+// one can always be sent later once a sent-marker exists. emailLedger is the
+// eventual fix for both this gap and delete-then-signup-again. Until it
+// exists, do not close this gap with a creationTime or lastSignInTime
+// heuristic: every threshold that catches a delayed relaunch also catches a
+// user signing in on a second device shortly after signing up on the first.
+const writeSignupMarker = async (uid) => {
+  try { await AsyncStorage.setItem(signupMarkerKey(uid), "true"); return true; }
+  catch (e) { console.log("Signup marker write error:", e.message); return false; }
+};
+const hasSignupMarker = async (uid) => {
+  try { return (await AsyncStorage.getItem(signupMarkerKey(uid))) === "true"; }
+  catch (e) { return false; }
+};
+const clearSignupMarker = async (uid) => {
+  try { await AsyncStorage.removeItem(signupMarkerKey(uid)); }
+  catch (e) { /* best effort - a stale marker is cleared again on sign-out */ }
+};
+
+// The uid whose document decision is already COMPLETE in this process, and the
+// creation currently running for a uid. Both exist so that a signup operation
+// which settles after a waiter has already given up cannot reopen a decision
+// that was made without it. That protection is this explicit record, NOT a
+// re-read of the document: snap.exists() is precisely the no-op that produced
+// the original race, and it is only ever the backstop after a restart.
+const userDocumentResolved = new Set();
+const userDocumentCreations = new Map();
+
+let pendingSignup = null;
+
+/** Called BEFORE createUserWithEmailAndPassword, so no window exists. */
+const beginPendingSignup = () => {
+  let settle;
+  const settled = new Promise((resolve) => { settle = resolve; });
+  const entry = { settled, settle, done: false };
+  pendingSignup = entry;
+  return entry;
+};
+
+/** Called once the marker is written, or once the signup has failed. */
+const resolvePendingSignup = (entry) => {
+  if (!entry) return;
+  entry.done = true;
+  if (pendingSignup === entry) pendingSignup = null;
+  entry.settle();
+};
+
+// BOUNDED, and the bound is the point. By the time a waiter reaches here the
+// auth observer has already fired, which means Auth account creation has
+// already succeeded; all that can still be outstanding is local coordination
+// and one AsyncStorage write. If that somehow does not settle, proceeding
+// without the marker costs a welcome email, while waiting forever costs the
+// user a Firestore document and leaves them in the missing-parent shape that
+// two production accounts are already in.
+const awaitPendingSignup = async () => {
+  const entry = pendingSignup;
+  if (!entry || entry.done) return;
+  let timer;
+  const timedOut = await Promise.race([
+    entry.settled.then(() => false),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(true), SIGNUP_COORDINATION_TIMEOUT_MS); }),
+  ]);
+  clearTimeout(timer);
+  if (timedOut) {
+    // Metadata only. No uid, no email address.
+    console.log(`[signup] coordination unresolved after ${SIGNUP_COORDINATION_TIMEOUT_MS}ms; creating the user document without a new-signup marker`);
+    // Drop the stale coordination so an ordinary sign-in afterwards is never
+    // made to wait on it, and so a late settle cannot revive it.
+    entry.done = true;
+    if (pendingSignup === entry) pendingSignup = null;
   }
+};
+
+const ensureUserDocument = async (u, extra = {}) => {
+  // An explicit caller states the answer; everyone else has to look it up.
+  const explicitSignup = Object.prototype.hasOwnProperty.call(extra, "isNewSignup");
+
+  // Already decided in this process. This is what stops a signup that settles
+  // after the timeout from reopening a completed decision.
+  if (userDocumentResolved.has(u.uid)) return;
+
+  // A generic resolution must never get to decide "not a signup" while a
+  // signup for this account is still in flight.
+  if (!explicitSignup) await awaitPendingSignup();
+  if (userDocumentResolved.has(u.uid)) return;
+
+  // One creation per uid per process. Without this, two callers that both read
+  // a missing document would both setDoc, and the later write would overwrite
+  // the earlier one rather than merely losing a field.
+  const running = userDocumentCreations.get(u.uid);
+  if (running) { await running.catch(() => {}); return; }
+
+  const work = (async () => {
+    const userRef = doc(db, "users", u.uid);
+    const snap = await getDoc(userRef);
+    if (!snap.exists()) {
+      // The marker is consulted only when the caller did not state it.
+      const markNewSignup = explicitSignup
+        ? extra.isNewSignup === true
+        : await hasSignupMarker(u.uid);
+      // isNewSignup is rebuilt below rather than spread, so a false or absent
+      // value never reaches the document and widens the create rule's
+      // allowlist check by one unexpected key.
+      const { isNewSignup: statedSignup, ...carried } = extra;
+      const isTestAccount = KNOWN_TEST_EMAILS.includes((u.email || "").toLowerCase());
+      await setDoc(userRef, {
+        uid: u.uid,
+        email: u.email || "",
+        displayName: u.displayName || "",
+        createdAt: serverTimestamp(),
+        platform: Platform.OS,
+        isPro: false,
+        isTestAccount,
+        ...carried,
+        ...(markNewSignup ? { isNewSignup: true } : {}),
+      });
+    }
+    // Only after the document is genuinely there. A failed write leaves both
+    // the marker and the undecided state in place, so the next resolution
+    // retries instead of silently accepting a missing document.
+    userDocumentResolved.add(u.uid);
+    await clearSignupMarker(u.uid);
+  })();
+
+  userDocumentCreations.set(u.uid, work);
+  try { await work; } finally { userDocumentCreations.delete(u.uid); }
+};
+
+/** Signing out ends this device's claim on that account's signup state. */
+const forgetSignupState = async (uid) => {
+  if (!uid) return;
+  userDocumentResolved.delete(uid);
+  await clearSignupMarker(uid);
 };
 
 
@@ -3732,7 +3893,24 @@ function AuthScreen() {
     try {
       if (mode === "signup") {
         const fullName = [firstName, lastName, suffix].filter(Boolean).join(" ");
-        const cred = await createUserWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+        // BEFORE the Auth account exists, not after. createUserWithEmailAndPassword
+        // fires onAuthStateChanged the moment it resolves, and that observer
+        // calls ensureUserDocument too. Claiming the coordination first is what
+        // removes the window in which the observer could create this document
+        // before anyone knows a signup is what produced it.
+        const coordination = beginPendingSignup();
+        let cred;
+        try {
+          cred = await createUserWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+          // Durable, and written before the coordination is released, so an
+          // observer released by the line below always finds it. Only written
+          // once the account genuinely exists: a failed signup must leave
+          // nothing behind that a later sign-in here could read as a signup.
+          await writeSignupMarker(cred.user.uid);
+        } finally {
+          // Success or failure, nothing is left waiting on this signup.
+          resolvePendingSignup(coordination);
+        }
         await updateProfile(cred.user, { displayName: fullName });
         // isNewSignup: true marks this doc as a genuine new signup, not just
         // a first-ever doc materialization - ensureUserDocument also runs on
@@ -14694,6 +14872,9 @@ function AppRoot() {
       // for an account that never ticked the box.
       if (!u || sessionDismissedUidRef.current !== u.uid) sessionDismissedUidRef.current = null;
       revenueCatLinkedRef.current = false;
+      // Read before it is overwritten - the sign-out branch below needs to know
+      // which account just left, and by then this ref no longer says.
+      const previousUid = currentUidRef.current;
       currentUidRef.current = u ? u.uid : null;
       if (u) {
         // Fast path, before the network work below: if THIS account has been
@@ -14746,6 +14927,12 @@ function AppRoot() {
         // for whoever signs in next before their own data loads.
         await AsyncStorage.removeItem("analysisCount");
         await AsyncStorage.removeItem("isPro");
+        // And the signup marker. A signup interrupted before its document was
+        // written leaves one behind; signing out ends this device's claim on
+        // that account, so the marker must not still be here for whoever signs
+        // in next. It is keyed by uid, so this is belt and braces rather than
+        // the only thing standing between two accounts.
+        await forgetSignupState(previousUid);
         return;
       }
 
