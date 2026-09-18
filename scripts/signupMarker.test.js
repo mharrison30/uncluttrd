@@ -120,7 +120,7 @@ function load({ storage = makeStorage(), fsdb = makeFirestore(), clock = makeClo
      return {
        ensureUserDocument, forgetSignupState, setAuthenticatedUid,
        beginPendingSignup, resolvePendingSignup, awaitPendingSignup,
-       writeSignupMarker, hasSignupMarker, clearSignupMarker, signupMarkerKey,
+       writeSignupMarker, readSignupMarker, clearSignupMarker, signupMarkerKey,
        SIGNUP_COORDINATION_TIMEOUT_MS,
        peek: () => ({
          pendingSignup, authenticatedUid,
@@ -489,6 +489,232 @@ test("handleAuth's signup sequence is unchanged, with coordination claimed befor
   ]);
 });
 
+// ---- the marker payload: referralSource and displayName -------------------
+//
+// The marker used to be the literal "true". That was enough while isNewSignup
+// was the only thing the observer could not reconstruct, and it stopped being
+// enough the moment the observer started winning: referralSource is collected
+// on the signup form and passed only by handleAuth, so documents arrived with
+// isNewSignup: true and no referral answer at all. Confirmed on two staging
+// iOS accounts, against a pre-fix Android control that still has the field.
+
+const SIGNUP = { referralSource: "instagram", displayName: "Alpha Person" };
+const keysOf = (d) => Object.keys(d).sort();
+
+test("the observer winning now persists isNewSignup, referralSource AND the submitted name", async () => {
+  const m = load();
+  const coordination = m.beginPendingSignup();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  m.resolvePendingSignup(coordination);
+
+  await m.ensureUserDocument({ ...USER_A, displayName: "" });   // observer, no extra
+
+  const d = docOf(m, USER_A);
+  assert.equal(d.isNewSignup, true);
+  assert.equal(d.referralSource, "instagram");
+  assert.equal(d.displayName, "Alpha Person");
+});
+
+test("handleAuth winning persists the same three values", async () => {
+  const m = load();
+  const coordination = m.beginPendingSignup();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  m.resolvePendingSignup(coordination);
+
+  await m.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" },
+    { referralSource: "instagram", isNewSignup: true });
+
+  const d = docOf(m, USER_A);
+  assert.equal(d.isNewSignup, true);
+  assert.equal(d.referralSource, "instagram");
+  assert.equal(d.displayName, "Alpha Person");
+});
+
+test("both writers produce an identical document key set and identical values", async () => {
+  const viaObserver = load();
+  let c = viaObserver.beginPendingSignup();
+  await viaObserver.writeSignupMarker(USER_A.uid, SIGNUP);
+  viaObserver.resolvePendingSignup(c);
+  await viaObserver.ensureUserDocument({ ...USER_A, displayName: "" });
+
+  const viaHandleAuth = load();
+  c = viaHandleAuth.beginPendingSignup();
+  await viaHandleAuth.writeSignupMarker(USER_A.uid, SIGNUP);
+  viaHandleAuth.resolvePendingSignup(c);
+  await viaHandleAuth.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" },
+    { referralSource: "instagram", isNewSignup: true });
+
+  assert.deepEqual(keysOf(docOf(viaObserver, USER_A)), keysOf(docOf(viaHandleAuth, USER_A)));
+  assert.deepEqual(docOf(viaObserver, USER_A), docOf(viaHandleAuth, USER_A));
+});
+
+test("no referral selection stores referralSource: null on both new-marker paths", async () => {
+  for (const extra of [undefined, { referralSource: null, isNewSignup: true }]) {
+    const m = load();
+    const c = m.beginPendingSignup();
+    await m.writeSignupMarker(USER_A.uid, { referralSource: null, displayName: "Alpha Person" });
+    m.resolvePendingSignup(c);
+
+    await m.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" }, extra);
+
+    const d = docOf(m, USER_A);
+    assert.equal(Object.prototype.hasOwnProperty.call(d, "referralSource"), true,
+      "the key must be present, because null is a real answer");
+    assert.equal(d.referralSource, null);
+    assert.equal(d.isNewSignup, true);
+  }
+});
+
+test("an interrupted signup recovers referralSource and the name after a process restart", async () => {
+  const storage = makeStorage();
+
+  const dying = load({ storage });
+  const c = dying.beginPendingSignup();
+  await dying.writeSignupMarker(USER_A.uid, SIGNUP);
+  dying.resolvePendingSignup(c);
+  assert.equal(dying.fsdb.sets(), 0, "no document was written before the process ended");
+
+  const relaunched = load({ storage });
+  await relaunched.ensureUserDocument({ ...USER_A, displayName: "" });
+
+  const d = docOf(relaunched, USER_A);
+  assert.equal(d.isNewSignup, true);
+  assert.equal(d.referralSource, "instagram");
+  assert.equal(d.displayName, "Alpha Person");
+});
+
+test("the observer winning before updateProfile propagates still writes the submitted name", async () => {
+  const m = load();
+  const c = m.beginPendingSignup();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  m.resolvePendingSignup(c);
+
+  // u.displayName is still empty: updateProfile has not landed yet. This is the
+  // window that would otherwise leave an empty name on the document forever.
+  await m.ensureUserDocument({ uid: USER_A.uid, email: USER_A.email, displayName: "" });
+
+  assert.equal(docOf(m, USER_A).displayName, "Alpha Person",
+    "the marker's submitted name must win over an unpropagated u.displayName");
+});
+
+// ---- legacy and corrupt markers ------------------------------------------
+
+test("a legacy \"true\" marker still means isNewSignup, and invents nothing", async () => {
+  const m = load({ storage: makeStorage({ "pendingSignup:uid-alpha": "true" }) });
+  await m.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" });
+
+  const d = docOf(m, USER_A);
+  assert.equal(d.isNewSignup, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(d, "referralSource"), false,
+    "a legacy marker must not invent a referral answer");
+  assert.equal(d.displayName, "Alpha Person", "and falls back to u.displayName unchanged");
+});
+
+test("a legacy \"true\" marker with no u.displayName keeps the original empty-string fallback", async () => {
+  const m = load({ storage: makeStorage({ "pendingSignup:uid-alpha": "true" }) });
+  await m.ensureUserDocument({ uid: USER_A.uid, email: USER_A.email });   // no displayName at all
+
+  assert.equal(docOf(m, USER_A).displayName, "", "unchanged from the pre-payload behaviour");
+  assert.equal(docOf(m, USER_A).isNewSignup, true);
+});
+
+test("a corrupt marker does not throw, does not block creation, and yields no signup fields", async () => {
+  for (const junk of ["{not json", "[]", "null", '{"isNewSignup":false}', '{"referralSource":"x"}', "42", '{"isNewSignup":true,"evil":1}']) {
+    const m = load({ storage: makeStorage({ "pendingSignup:uid-alpha": junk }) });
+    await m.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" });
+
+    const d = docOf(m, USER_A);
+    assert.ok(d, `the document must still be created for ${junk}`);
+    if (junk === '{"isNewSignup":true,"evil":1}') {
+      // A well-formed marker with an extra property: usable, but only the
+      // three allowed keys may ever be drawn from it.
+      assert.equal(d.isNewSignup, true);
+      assert.equal(Object.prototype.hasOwnProperty.call(d, "evil"), false, "no marker metadata may reach Firestore");
+    } else {
+      assert.equal(Object.prototype.hasOwnProperty.call(d, "isNewSignup"), false, `isNewSignup invented from ${junk}`);
+      assert.equal(Object.prototype.hasOwnProperty.call(d, "referralSource"), false, `referralSource invented from ${junk}`);
+      assert.equal(d.displayName, "Alpha Person", `displayName invented from ${junk}`);
+    }
+  }
+});
+
+test("a returning user with no marker gets no signup-only fields and no welcome-email eligibility", async () => {
+  const m = load();
+  await m.ensureUserDocument({ ...USER_A, displayName: "Alpha Person" });
+
+  const d = docOf(m, USER_A);
+  assert.equal(Object.prototype.hasOwnProperty.call(d, "isNewSignup"), false,
+    "sendWelcomeEmail is gated on isNewSignup === true, so its absence is the protection");
+  assert.equal(Object.prototype.hasOwnProperty.call(d, "referralSource"), false);
+});
+
+test("sign-out clears the whole payload, through the real lifted branch", async () => {
+  const m = load();
+  const { resolve } = makeAuthResolution(m);
+
+  const c = m.beginPendingSignup();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  m.resolvePendingSignup(c);
+  assert.ok(m.storage.map.get(m.signupMarkerKey(USER_A.uid)).includes("instagram"), "payload is on disk");
+
+  await resolve(USER_A);
+  await resolve(null);                       // THE REAL SIGN-OUT BRANCH
+
+  assert.equal(m.storage.map.has(m.signupMarkerKey(USER_A.uid)), false,
+    "the whole payload goes, not just an isNewSignup flag");
+});
+
+test("the stored payload contains only the three permitted keys", async () => {
+  const m = load();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  const stored = JSON.parse(m.storage.map.get(m.signupMarkerKey(USER_A.uid)));
+  assert.deepEqual(Object.keys(stored).sort(), ["displayName", "isNewSignup", "referralSource"]);
+  assert.deepEqual(stored, { isNewSignup: true, referralSource: "instagram", displayName: "Alpha Person" });
+});
+
+test("a marker-driven document also satisfies the real firestore.rules create allowlist", async () => {
+  const listed = RULES.match(/keys\(\)\.hasOnly\(\[([\s\S]*?)\]\)/);
+  assert.ok(listed, "could not find the create rule's allowlist in firestore.rules");
+  const allowed = new Set(listed[1].split(",").map((s) => s.trim().replace(/^'|'$/g, "")).filter(Boolean));
+
+  for (const payload of [SIGNUP, { referralSource: null, displayName: "Alpha Person" }, {}]) {
+    const m = load();
+    const c = m.beginPendingSignup();
+    await m.writeSignupMarker(USER_A.uid, payload);
+    m.resolvePendingSignup(c);
+    await m.ensureUserDocument({ ...USER_A, displayName: "" });
+
+    const d = docOf(m, USER_A);
+    for (const k of Object.keys(d)) assert.ok(allowed.has(k), `field outside the allowlist: ${k}`);
+    assert.equal(d.uid, USER_A.uid);
+    assert.equal(d.email, USER_A.email);
+    assert.deepEqual(d.createdAt, { __serverTimestamp: true });
+    assert.equal(d.isPro, false);
+    assert.equal(Object.prototype.hasOwnProperty.call(d, "analysisCountMonth"), false);
+    assert.equal(d.isNewSignup === false, false);
+  }
+});
+
+test("readSignupMarker normalizes every shape without throwing", async () => {
+  const m = load();
+  const read = async (value) => {
+    m.storage.map.set(m.signupMarkerKey(USER_A.uid), value);
+    return m.readSignupMarker(USER_A.uid);
+  };
+  assert.deepEqual(await read("true"), { isNewSignup: true });
+  assert.deepEqual(await read(JSON.stringify({ isNewSignup: true, referralSource: "tiktok", displayName: "N" })),
+    { isNewSignup: true, referralSource: "tiktok", displayName: "N" });
+  assert.deepEqual(await read(JSON.stringify({ isNewSignup: true, referralSource: null, displayName: "" })),
+    { isNewSignup: true, referralSource: null }, "an empty name is dropped, so the u.displayName fallback applies");
+  assert.deepEqual(await read(JSON.stringify({ isNewSignup: true, referralSource: 7, displayName: 9 })),
+    { isNewSignup: true, referralSource: null }, "non-string values are coerced to the safe answer, never passed through");
+  for (const junk of ["{not json", "[]", "null", "42", '{"isNewSignup":false}']) {
+    assert.equal(await read(junk), null, `must normalize to absent: ${junk}`);
+  }
+  m.storage.map.delete(m.signupMarkerKey(USER_A.uid));
+  assert.equal(await m.readSignupMarker(USER_A.uid), null);
+});
+
 // ---- the real sign-out branch --------------------------------------------
 
 test("a signed-out resolution runs the real branch and forgets the PREVIOUS uid", async () => {
@@ -624,7 +850,9 @@ test("MUTATION: ignoring the durable marker loses an interrupted signup", async 
   await dying.writeSignupMarker(USER_A.uid);
   dying.resolvePendingSignup(coordination);
 
-  const relaunched = load({ storage, transform: mutate(": await hasSignupMarker(u.uid);", ": false;") });
+  // Target literal follows the reader's rename to readSignupMarker; the
+  // assertion below is unchanged.
+  const relaunched = load({ storage, transform: mutate(": await readSignupMarker(u.uid);", ": null;") });
   await relaunched.ensureUserDocument(USER_A);
 
   assert.equal(Object.prototype.hasOwnProperty.call(docOf(relaunched, USER_A), "isNewSignup"), false,
@@ -653,6 +881,22 @@ test("MUTATION: dropping the recorded decision makes the late-settle guard fall 
   assert.ok(m.fsdb.ops.length > reads,
     "the late signup went back to Firestore to re-decide, rather than being stopped outright");
   assert.equal(Object.prototype.hasOwnProperty.call(docOf(m, USER_A), "isNewSignup"), false);
+});
+
+test("MUTATION: a bare \"true\" marker loses the referral answer and the submitted name", async () => {
+  // The pre-fix marker, restored: a payload write that stores only "true".
+  const m = load({ transform: mutate("const payload = JSON.stringify({", "const payload = \"true\" || JSON.stringify({") });
+  const c = m.beginPendingSignup();
+  await m.writeSignupMarker(USER_A.uid, SIGNUP);
+  m.resolvePendingSignup(c);
+
+  await m.ensureUserDocument({ ...USER_A, displayName: "" });
+
+  const d = docOf(m, USER_A);
+  assert.equal(d.isNewSignup, true, "the welcome email still works, which is what made this quiet");
+  assert.equal(Object.prototype.hasOwnProperty.call(d, "referralSource"), false,
+    "and this is the defect: the referral answer is gone");
+  assert.equal(d.displayName, "", "along with the submitted name");
 });
 
 test("MUTATION: deleting the sign-out branch's forgetSignupState call strands the record", async () => {

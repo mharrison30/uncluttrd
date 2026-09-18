@@ -2714,13 +2714,73 @@ const signupMarkerKey = (uid) => `pendingSignup:${uid}`;
 // exists, do not close this gap with a creationTime or lastSignInTime
 // heuristic: every threshold that catches a delayed relaunch also catches a
 // user signing in on a second device shortly after signing up on the first.
-const writeSignupMarker = async (uid) => {
-  try { await AsyncStorage.setItem(signupMarkerKey(uid), "true"); return true; }
+//
+// WHAT THE MARKER CARRIES. It began as the literal "true", which was enough
+// while isNewSignup was the only thing the observer could not reconstruct.
+// It was not: referralSource is collected on the signup form and passed only
+// by handleAuth's own call, so once the observer started winning the creation,
+// documents arrived with isNewSignup: true and no referralSource at all. The
+// welcome email was fixed and the referral answer was still being dropped.
+// Anything the observer cannot otherwise know has to travel in here.
+//
+// displayName travels with it for a related reason. It is read from
+// u.displayName at write time, and the observer has no ordering guarantee
+// against updateProfile; if it writes first, the document keeps an empty name
+// permanently, because nothing rewrites it afterwards. The marker holds the
+// name the user actually submitted, which does not depend on that timing.
+const writeSignupMarker = async (uid, { referralSource = null, displayName = "" } = {}) => {
+  const payload = JSON.stringify({
+    isNewSignup: true,
+    referralSource: typeof referralSource === "string" ? referralSource : null,
+    displayName: typeof displayName === "string" ? displayName : "",
+  });
+  try { await AsyncStorage.setItem(signupMarkerKey(uid), payload); return true; }
   catch (e) { console.log("Signup marker write error:", e.message); return false; }
 };
-const hasSignupMarker = async (uid) => {
-  try { return (await AsyncStorage.getItem(signupMarkerKey(uid))) === "true"; }
-  catch (e) { return false; }
+
+// Returns a NORMALIZED payload, or null for "no signup evidence here".
+//
+// Three shapes have to be survivable. The JSON payload above; the legacy
+// literal "true" already sitting on the devices running the current build,
+// which means isNewSignup and nothing more; and a value that is neither,
+// which is treated exactly like no marker at all.
+//
+// The result is rebuilt field by field rather than handed back as parsed
+// JSON. Whatever is on disk is not trusted to be the shape this function
+// wrote, and it is one step away from a Firestore document whose create rule
+// rejects any key outside its allowlist. Only these three keys can ever come
+// out of here, and a key is present only when the stored value was usable.
+const readSignupMarker = async (uid) => {
+  let raw;
+  try { raw = await AsyncStorage.getItem(signupMarkerKey(uid)); }
+  catch (e) { return null; }
+  if (raw === null || raw === undefined) return null;
+  if (raw === "true") return { isNewSignup: true };          // legacy, pre-payload
+
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (e) {
+    // Metadata only. Not removed here: the ordinary cleanup already runs
+    // clearSignupMarker once the document is resolved, and sign-out clears it
+    // again, so this needs no removal path of its own.
+    console.log("[signup] unreadable signup marker ignored; treating it as absent");
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.isNewSignup !== true) {
+    console.log("[signup] signup marker had an unexpected shape; treating it as absent");
+    return null;
+  }
+
+  const normalized = { isNewSignup: true };
+  if (Object.prototype.hasOwnProperty.call(parsed, "referralSource")) {
+    // null is a real answer here - "the question was shown and skipped" - so
+    // it is kept as a present key rather than dropped.
+    normalized.referralSource = typeof parsed.referralSource === "string" ? parsed.referralSource : null;
+  }
+  if (typeof parsed.displayName === "string" && parsed.displayName !== "") {
+    normalized.displayName = parsed.displayName;
+  }
+  return normalized;
 };
 const clearSignupMarker = async (uid) => {
   try { await AsyncStorage.removeItem(signupMarkerKey(uid)); }
@@ -2820,23 +2880,43 @@ const ensureUserDocument = async (u, extra = {}) => {
     const snap = await getDoc(userRef);
     if (!snap.exists()) {
       // The marker is consulted only when the caller did not state it.
-      const markNewSignup = explicitSignup
-        ? extra.isNewSignup === true
-        : await hasSignupMarker(u.uid);
-      // isNewSignup is rebuilt below rather than spread, so a false or absent
-      // value never reaches the document and widens the create rule's
-      // allowlist check by one unexpected key.
-      const { isNewSignup: statedSignup, ...carried } = extra;
+      const marker = explicitSignup
+        ? null
+        : await readSignupMarker(u.uid);
+
+      // PRESENCE, never truthiness. referralSource: null is a real answer -
+      // the question was shown and skipped - and has to stay distinguishable
+      // from a caller that said nothing about it at all.
+      const stated = (key) => Object.prototype.hasOwnProperty.call(extra, key);
+      const marked = (key) => !!marker && Object.prototype.hasOwnProperty.call(marker, key);
+
+      const markNewSignup = stated("isNewSignup") ? extra.isNewSignup === true : marked("isNewSignup");
+      const hasReferral = stated("referralSource") || marked("referralSource");
+      const referral = stated("referralSource")
+        ? extra.referralSource
+        : (marked("referralSource") ? marker.referralSource : null);
+      // The marker's name is preferred over u.displayName during a new signup.
+      // It is the name the user actually submitted, and unlike u.displayName it
+      // does not depend on updateProfile having propagated by the time this
+      // write happens. A legacy marker carries no name, and the original
+      // fallback then applies unchanged.
+      const name = marked("displayName") ? marker.displayName : (u.displayName || "");
+
+      // Both signup-only fields are rebuilt below rather than spread, so a
+      // false or absent value never reaches the document and widens the create
+      // rule's allowlist check by one unexpected key.
+      const { isNewSignup: statedSignup, referralSource: statedReferral, ...carried } = extra;
       const isTestAccount = KNOWN_TEST_EMAILS.includes((u.email || "").toLowerCase());
       await setDoc(userRef, {
         uid: u.uid,
         email: u.email || "",
-        displayName: u.displayName || "",
+        displayName: name,
         createdAt: serverTimestamp(),
         platform: Platform.OS,
         isPro: false,
         isTestAccount,
         ...carried,
+        ...(hasReferral ? { referralSource: referral } : {}),
         ...(markNewSignup ? { isNewSignup: true } : {}),
       });
     }
@@ -3931,7 +4011,12 @@ function AuthScreen() {
           // observer released by the line below always finds it. Only written
           // once the account genuinely exists: a failed signup must leave
           // nothing behind that a later sign-in here could read as a signup.
-          await writeSignupMarker(cred.user.uid);
+          //
+          // It carries the two answers the observer has no other way to know:
+          // the referral choice, which lives only in this screen's state, and
+          // the submitted name, which otherwise depends on updateProfile below
+          // having propagated before whichever caller writes the document.
+          await writeSignupMarker(cred.user.uid, { referralSource: referralSource || null, displayName: fullName });
         } finally {
           // Success or failure, nothing is left waiting on this signup.
           resolvePendingSignup(coordination);
