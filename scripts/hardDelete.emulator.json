@@ -1,0 +1,10 @@
+{
+  "//": "Emulator config for scripts/accountHardDelete.test.js ONLY. Separate from the repo's firebase.json on purpose: that file is deploy configuration and this suite needs an auth emulator, which deploy config has no reason to declare. No rules files are referenced because the suite drives hardDeleteAccountAdmin through the Admin SDK, which bypasses Firestore and Storage rules entirely - rules coverage lives in scripts/firestoreRules.test.js, not here.",
+  "emulators": {
+    "firestore": { "port": 8080 },
+    "auth": { "port": 9099 },
+    "storage": { "port": 9199 },
+    "ui": { "enabled": false },
+    "singleProjectMode": true
+  }
+}

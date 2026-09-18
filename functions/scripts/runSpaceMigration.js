@@ -1331,19 +1331,41 @@ async function hardDeleteAccountAdmin(db, uid) {
   // one. "plans" and "spaces" are excluded here - already handled above
   // with their own real recursive cleanup; a flat per-document delete
   // here would leave a Space's own projects/areas/sessions/batches behind.
+  //
+  // RECURSIVE, not flat. Firestore does not delete a document's
+  // subcollections when the document goes, so the previous
+  // `doc.ref.delete()` left every nested descendant behind while this
+  // function still returned "hard-deleted". mergeCandidates/{id}/history is
+  // the case that exists in real data today, but the point of discovering
+  // these collections with listCollections() was never to enumerate them -
+  // it was so an unknown future one is handled too, and a flat delete broke
+  // exactly that guarantee for anything that nests.
+  //
+  // recursiveDelete is scoped to the reference it is given (verified: it
+  // leaves every other user's tree untouched), and it REJECTS if any delete
+  // fails, so a partial failure still lands in the catch below and counts as
+  // a content failure - which is what keeps the gate, and the retry, honest.
+  //
+  // listDocuments(), not get(). A recursive delete that fails partway can
+  // remove the parent document while descendants survive - the API documents
+  // this ("the provided reference is deleted regardless of whether all
+  // deletes succeeded"). get() only returns documents that exist, so a retry
+  // would be blind to exactly the wreckage the first attempt left.
+  // listDocuments() returns the reference anyway, so the retry finds it and
+  // finishes the job.
   try {
     const allCollections = await userRef.listCollections();
     for (const coll of allCollections) {
       if (coll.id === "plans" || coll.id === "spaces") continue;
       summary.otherSubcollections.collectionsProcessed++;
-      const snap = await coll.get();
-      for (const doc of snap.docs) {
+      const docRefs = await coll.listDocuments();
+      for (const docRef of docRefs) {
         try {
-          await doc.ref.delete();
+          await db.recursiveDelete(docRef);
           summary.otherSubcollections.documentsDeleted++;
         } catch (e) {
           summary.otherSubcollections.failed++;
-          console.error(`[hardDeleteAccountAdmin] ${coll.id}/${doc.id} (uid=${uid}) failed: ${e.message}`);
+          console.error(`[hardDeleteAccountAdmin] ${coll.id}/${docRef.id} (uid=${uid}) failed: ${e.message}`);
         }
       }
     }
