@@ -14479,6 +14479,94 @@ function LaunchScreen({ ready, onExited }) {
 // offline fallback and the fast path on relaunch.
 const tutorialCacheKey = (uid) => `hasSeenTutorial:${uid}`;
 
+// THE MIGRATION BOUNDARY. hasSeenTutorial was introduced by f189c5e at
+// 2026-07-18T12:47:50Z, so no build in a user's hands before that instant
+// could carry the field. Midnight UTC that day is therefore provably earlier
+// than any possible store availability, without depending on review or
+// rollout dates we cannot establish.
+//
+// Accounts created BEFORE it never had access to the field, so an absent
+// field there really can mean "predates the feature" and the legacy signals
+// are trustworthy. Accounts created ON OR AFTER it are treated as new-model
+// whatever else they look like.
+//
+// The failure directions are not symmetric, which is why the boundary sits
+// where it does. Too late, and a genuinely new account is read as legacy:
+// one analysis later it is permanently suppressed against a choice the user
+// never made. Too early, and a real legacy account simply sees the tutorial
+// once more until they tick the box. Only the first is a harm.
+const TUTORIAL_ACCOUNT_SCOPING_CUTOFF = Date.parse("2026-07-18T00:00:00.000Z");
+
+/** createdAt as epoch ms, or null when it cannot be trusted. */
+function tutorialCreatedAtMs(createdAt) {
+  if (createdAt === null || createdAt === undefined) return null;
+  // Firestore Timestamp, the shape every account created through
+  // ensureUserDocument has (serverTimestamp, enforced by the create rule).
+  if (typeof createdAt.toMillis === "function") return createdAt.toMillis();
+  if (createdAt instanceof Date) return Number.isNaN(createdAt.getTime()) ? null : createdAt.getTime();
+  if (typeof createdAt === "string") {
+    const parsed = Date.parse(createdAt);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+/**
+ * Decides, for ONE account, whether to show the tutorial and what to write.
+ *
+ * hasSeenTutorial is three-state on purpose:
+ *   true    the user ticked "Don't show this again". Permanent.
+ *   false   this account is on the account-scoped model and has NOT made that
+ *           choice. Dismissing without the checkbox leaves it false, so the
+ *           tutorial returns on the next cold launch or sign-in.
+ *   absent  unclassified. createdAt decides which side of the boundary it
+ *           falls on, and the account is classified on this pass.
+ *
+ * The rule that makes the checkbox mean something: once a false is on the
+ * record, running analyses or subscribing can never turn it into a true. The
+ * legacy signals only ever apply to an account that has no record at all AND
+ * predates the field.
+ *
+ * Returns { show, write, state }. `write` is the value to persist to
+ * Firestore, or null for nothing. Pure: all I/O is the caller's.
+ */
+function resolveTutorialDecision({
+  hasSeenTutorial, analysisCount, isPro, createdAtMs, localPermanentChoice, sessionDismissed,
+}) {
+  // A permanent choice wins from either source. Holding it locally means an
+  // earlier true write failed, so this pass retries it - and until it lands,
+  // the legacy signals below are never consulted for this account.
+  if (hasSeenTutorial === true) return { show: false, write: null, state: "permanent" };
+  if (localPermanentChoice) return { show: false, write: true, state: "permanent-retry" };
+
+  // Already on the new model. No legacy migration, ever, whatever this
+  // account does afterwards.
+  if (hasSeenTutorial === false) {
+    return { show: !sessionDismissed, write: null, state: "new-model" };
+  }
+
+  // Unclassified from here down.
+  if (createdAtMs === null) {
+    // Nothing to classify against. Show the tutorial and write nothing: a
+    // backfill on a guess is the one outcome that cannot be undone.
+    return { show: !sessionDismissed, write: null, state: "unclassifiable" };
+  }
+  if (createdAtMs >= TUTORIAL_ACCOUNT_SCOPING_CUTOFF) {
+    // Created after the field existed, so an absent field means "never
+    // classified", not "legacy". Classify it and show the tutorial. If the
+    // write fails the account stays post-cutoff by its createdAt, so a later
+    // analysis or subscription still cannot reclassify it as legacy.
+    return { show: !sessionDismissed, write: false, state: "post-cutoff" };
+  }
+  // Predates the field. These are the accounts the migration exists for.
+  if ((analysisCount || 0) > 0 || isPro === true) {
+    return { show: false, write: true, state: "legacy-migrated" };
+  }
+  // Legacy, but with no signal either way: show it once and bring the account
+  // onto the new model so the checkbox governs it from now on.
+  return { show: !sessionDismissed, write: false, state: "legacy-unclassified" };
+}
+
 // ── ROOT ─────────────────────────────────────────────────────
 function AppRoot() {
   const [user, setUser] = useState(null);
@@ -14499,6 +14587,13 @@ function AppRoot() {
   // a moment later.
   const [onboardingUid, setOnboardingUid] = useState(null);
   const [needsOnboarding, setNeedsOnboarding] = useState(null);
+  // "This uid closed the tutorial without ticking the box." Session-scoped by
+  // construction: a ref, holding a uid, cleared whenever the signed-in account
+  // is not that uid - including on sign-out. So the dismissal survives a
+  // re-resolution of the same session (a token refresh re-fires
+  // onAuthStateChanged) and does not survive signing out and back in, which is
+  // exactly what "session-only" has to mean.
+  const sessionDismissedUidRef = useRef(null);
   const [isPro, setIsPro] = useState(false);
   const [analyses, setAnalyses] = useState(null); // null = not loaded yet
   // Lets the RevenueCat listener (registered once, [] deps) attribute later
@@ -14594,6 +14689,10 @@ function AppRoot() {
       // fallback instead of rendering a tutorial it may be about to dismiss.
       setOnboardingUid(null);
       setNeedsOnboarding(null);
+      // The session-only dismissal belongs to one uid and one session. Signing
+      // out clears it, so signing straight back in shows the tutorial again
+      // for an account that never ticked the box.
+      if (!u || sessionDismissedUidRef.current !== u.uid) sessionDismissedUidRef.current = null;
       revenueCatLinkedRef.current = false;
       currentUidRef.current = u ? u.uid : null;
       if (u) {
@@ -14663,52 +14762,70 @@ function AppRoot() {
         const effectiveCount = data.analysisCountMonth === currentMonth ? (data.analysisCount || 0) : 0;
         setAnalyses(effectiveCount);
         await AsyncStorage.setItem("analysisCount", effectiveCount.toString());
-        // hasSeenTutorial: Firestore is the source of truth (DecisionLog.md
-        // 2026-07-18 - reverses the earlier "intentionally device-scoped"
-        // decision now that reinstalls/new devices for an existing account
-        // are a real scenario), AsyncStorage stays a fast local cache.
-        // One-time backfill (DecisionLog.md 2026-07-18): accounts that
-        // existed before hasSeenTutorial was introduced never had the field
-        // written at all, so the field-based check alone would wrongly
-        // treat them as never onboarded. analysisCount/isPro are both
-        // already loaded right here, no extra read - and both are
-        // structurally impossible for a genuinely new user to have at their
-        // very first onAuthStateChanged, since reaching MainApp (where an
-        // analysis or a purchase could happen) requires completing
-        // onboarding first. Known, accepted gap: an existing user who never
-        // ran an analysis and isn't Pro still sees onboarding once more -
-        // narrow and low-stakes enough not to solve.
-        const looksLikeExistingUser = (data.analysisCount || 0) > 0 || data.isPro === true;
-        const hasSeen = data.hasSeenTutorial === true || looksLikeExistingUser;
-        if (hasSeen) {
-          // The local cache is keyed BY UID now. The old unkeyed
-          // "skipOnboarding" was the cross-account leak itself: one device
-          // answer suppressing the tutorial for every account after it.
-          await AsyncStorage.setItem(tutorialCacheKey(u.uid), "true");
+        // THE TUTORIAL DECISION, for this account alone. resolveTutorialDecision
+        // is pure and lives at module scope; everything it needs is read here
+        // and everything it asks for is written here.
+        //
+        // The local permanent record is consulted as an INPUT, not just a
+        // cache: it is where a checkbox choice survives a failed Firestore
+        // write, and while it is set the legacy signals are never applied.
+        let localPermanentChoice = false;
+        try {
+          localPermanentChoice = (await AsyncStorage.getItem(tutorialCacheKey(u.uid))) === "true";
+        } catch (cacheErr) { /* absent cache is not an error */ }
+
+        const createdAtMs = tutorialCreatedAtMs(data.createdAt);
+        const decision = resolveTutorialDecision({
+          hasSeenTutorial: data.hasSeenTutorial,
+          analysisCount: data.analysisCount,
+          isPro: data.isPro,
+          createdAtMs,
+          localPermanentChoice,
+          sessionDismissed: sessionDismissedUidRef.current === u.uid,
+        });
+
+        if (decision.state === "unclassifiable") {
+          // Non-sensitive metadata only: enough to tell a missing field from
+          // an unparseable one, with nothing about who the account is.
+          console.log(`[onboarding] unclassified account: createdAt present=${data.createdAt !== undefined} type=${typeof data.createdAt}`);
+        }
+
+        if (decision.write === true) {
+          // Permanent from here: record it locally too, so the fast path at
+          // the top of this callback can answer without a read next time.
+          try { await AsyncStorage.setItem(tutorialCacheKey(u.uid), "true"); } catch (cacheErr) { /* best effort */ }
           if (data.hasSeenTutorial !== true) {
             updateDoc(doc(db, "users", u.uid), { hasSeenTutorial: true })
-              .catch(e => console.log("Backfill hasSeenTutorial error:", e.message));
+              .catch(e => console.log("Write hasSeenTutorial true error:", e.message));
           }
+        } else if (decision.write === false && data.hasSeenTutorial !== false) {
+          // Classification only. Deliberately NOT cached locally: false means
+          // "still asking", and caching it would give the device an answer it
+          // is not entitled to hold. A failure here leaves the field absent,
+          // and the next resolution classifies again from createdAt - which
+          // is why a failed write can never turn a post-cutoff account legacy.
+          updateDoc(doc(db, "users", u.uid), { hasSeenTutorial: false })
+            .catch(e => console.log("Classify hasSeenTutorial false error:", e.message));
         }
+
         // Resolve LAST, and only for the uid this callback is about. A
         // callback for a previous account that lands late cannot overwrite a
         // newer one's answer, because the gate compares onboardingUid to the
         // signed-in user before trusting needsOnboarding.
         setOnboardingUid(u.uid);
-        setNeedsOnboarding(!hasSeen);
+        setNeedsOnboarding(decision.show);
       } catch (e) {
         console.log("Load analysisCount error:", e.message);
-        // The read failed, so we cannot prove anything about this account.
-        // Fall back to this device's own record for THIS uid; with none,
-        // show the tutorial - the same thing the previous code did on this
-        // path, and the harmless direction to be wrong in.
+        // The read failed, so nothing about this account is known. Honour a
+        // local permanent choice if one exists; otherwise show the tutorial,
+        // which is the harmless direction to be wrong in.
         try {
           const cached = await AsyncStorage.getItem(tutorialCacheKey(u.uid));
           setOnboardingUid(u.uid);
-          setNeedsOnboarding(cached !== "true");
+          setNeedsOnboarding(cached !== "true" && sessionDismissedUidRef.current !== u.uid);
         } catch (cacheErr) {
           setOnboardingUid(u.uid);
-          setNeedsOnboarding(true);
+          setNeedsOnboarding(sessionDismissedUidRef.current !== u.uid);
         }
       }
 
@@ -14849,23 +14966,33 @@ function AppRoot() {
   } else if (needsOnboarding) {
     // This account, resolved, has not seen the tutorial.
     screen = <OnboardingScreen onDone={async (skip) => {
-      // BOTH paths persist now. Reaching the end of the tutorial is having
-      // seen it, whether or not the user also ticked "don't show this again"
-      // - and only persisting the ticked case is what let a completed
-      // tutorial come back on the next launch. `skip` is left in the
-      // signature because OnboardingScreen still passes it; it no longer
-      // changes what is written.
+      // `skip` is the "Don't show this again" checkbox, and it is the whole
+      // difference between the two dismissals.
       const uid = user.uid;
+      if (skip) {
+        // PERMANENT. The local record is written FIRST and deliberately: it is
+        // where the choice survives if the Firestore write fails, and the
+        // resolver reads it back as an input, suppressing the tutorial on this
+        // device and blocking legacy migration for this uid until the retry
+        // lands. Until then the account still reads false on another device.
+        try {
+          await AsyncStorage.setItem(tutorialCacheKey(uid), "true");
+        } catch (e) { /* the Firestore write below is the durable one */ }
+        // An update, never part of the create payload: firestore.rules' create
+        // allowlist excludes hasSeenTutorial, and its update rule permits
+        // exactly this field - to false as well as true, confirmed against the
+        // emulator. Written whether the field is currently false or still
+        // absent because an earlier classification write failed.
+        updateDoc(doc(db, "users", uid), { hasSeenTutorial: true })
+          .catch(e => console.log("Save hasSeenTutorial error:", e.message));
+      } else {
+        // SESSION ONLY. Nothing is persisted anywhere - not Firestore, not the
+        // local record - so the field stays false and the tutorial returns on
+        // the next cold launch or sign-in. That is what the unticked checkbox
+        // is asking for.
+        sessionDismissedUidRef.current = uid;
+      }
       setNeedsOnboarding(false);
-      try {
-        await AsyncStorage.setItem(tutorialCacheKey(uid), "true");
-      } catch (e) { /* the Firestore write below is the durable one */ }
-      // Firestore is the source of truth (DecisionLog.md 2026-07-18) so this
-      // syncs to other devices and reinstalls. An update, never part of the
-      // create payload: firestore.rules' create allowlist excludes
-      // hasSeenTutorial, and its update rule permits exactly this field.
-      updateDoc(doc(db, "users", uid), { hasSeenTutorial: true })
-        .catch(e => console.log("Save hasSeenTutorial error:", e.message));
     }} />;
   } else {
     // Logged in and onboarding done, show main app

@@ -230,6 +230,24 @@ test("j. hasSeenTutorial only: ALLOW", async () => {
   await assertSucceeds(updateDoc(aliceDoc(as(ALICE)), { hasSeenTutorial: true }));
 });
 
+test("j2. hasSeenTutorial accepts FALSE as well as true, and moves between them", async () => {
+  // The account-scoped model needs all three states, and false is the one that
+  // carries meaning: it says this account is classified and has NOT chosen
+  // permanent dismissal. The rule constrains which key may change, never its
+  // value, so both directions must be writable by the owner.
+  // Seeded with the field ABSENT, the state an unclassified account is in.
+  const { hasSeenTutorial, ...withoutField } = existingProfile;
+  await seed(withoutField);
+  await assertSucceeds(updateDoc(aliceDoc(as(ALICE)), { hasSeenTutorial: false }));
+  await assertSucceeds(updateDoc(aliceDoc(as(ALICE)), { hasSeenTutorial: true }));
+  await assertSucceeds(updateDoc(aliceDoc(as(ALICE)), { hasSeenTutorial: false }));
+
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const snap = await getDoc(doc(ctx.firestore(), "users", ALICE));
+    assert.equal(snap.data().hasSeenTutorial, false);
+  });
+});
+
 test("k. isPro true: DENY", async () => {
   await seed(existingProfile);
   await assertFails(updateDoc(aliceDoc(as(ALICE)), { isPro: true }));

@@ -1,22 +1,30 @@
 /**
- * Two defects reproduced on staging builds 30 (iOS) and 6 (Android).
+ * Two defects reproduced on staging builds 30 (iOS) and 6 (Android), plus the
+ * account-scoped onboarding model they led to.
  *
  *   node --test scripts/onboardingExpansion.test.js
  *
- * ONBOARDING was decided per DEVICE, not per account: one unkeyed
- * "skipOnboarding" AsyncStorage flag plus two state values that were never
- * reset when the signed-in account changed. Sign out, create a brand-new
- * account on the same device, and the tutorial was already "done" for someone
- * who had never seen it. Confirmed on iOS. Separately, only the "don't show
- * this again" path persisted anything, so simply finishing the tutorial left
- * nothing written.
+ * ONBOARDING is decided per ACCOUNT, and hasSeenTutorial is three-state:
  *
- * CALL 2 collapsed an expanded approach: the seeding effect re-ran on every
- * `results` object replacement, and `results` is replaced (not mutated) when
- * Call 2 lands. The user opened a card, read "Finishing the details...", and
- * watched it collapse at the moment the content arrived.
+ *   true    the user ticked "Don't show this again". Permanent.
+ *   false   on the account-scoped model, and has NOT made that choice.
+ *           Dismissing without the checkbox leaves it false, so the tutorial
+ *           returns on the next cold launch or sign-in.
+ *   absent  unclassified. createdAt decides which side of
+ *           TUTORIAL_ACCOUNT_SCOPING_CUTOFF the account falls on.
  *
- * The decision logic is LIFTED OUT OF App.js AND EXECUTED here with its I/O
+ * The cutoff is 2026-07-18T00:00:00Z, hours before f189c5e introduced the
+ * field, so no build in anyone's hands could have carried it earlier. Accounts
+ * created before it may still be legacy-migrated from analysisCount/isPro;
+ * accounts created after it never can be. That asymmetry is the point: reading
+ * a genuinely new account as legacy would suppress its tutorial permanently
+ * from one analysis onwards, against a choice the user never made.
+ *
+ * CALL 2 collapsed an expanded approach because the seeding effect re-ran on
+ * every `results` replacement, and Call 2 landing replaces `results`.
+ *
+ * The decision function, the dismissal handler, the gate expression and the
+ * seeding guard are all LIFTED OUT OF App.js AND EXECUTED here with their I/O
  * injected, so these test behaviour rather than the shape of the source.
  */
 const test = require("node:test");
@@ -46,106 +54,224 @@ function makeStorage(seed = {}) {
   };
 }
 
-const tutorialCacheKey = new Function(
-  `${region("const tutorialCacheKey = (uid)", "\n")}\nreturn tutorialCacheKey;`,
-)();
+// ---- the real decision logic, lifted and executed -------------------------
 
-// ---- 1. the per-account tutorial decision, executed -----------------------
+const model = new Function(`
+  ${region("const tutorialCacheKey = (uid)", "\n// \u2500\u2500 ROOT")}
+  return { tutorialCacheKey, tutorialCreatedAtMs, resolveTutorialDecision, TUTORIAL_ACCOUNT_SCOPING_CUTOFF };
+`)();
+const { tutorialCacheKey, tutorialCreatedAtMs, resolveTutorialDecision, TUTORIAL_ACCOUNT_SCOPING_CUTOFF } = model;
 
-/** Runs the real resolution block against one account document. */
-async function resolveFor({ uid, data, storage }) {
-  const src = region(
-    "const looksLikeExistingUser = (data.analysisCount || 0) > 0",
-    "setNeedsOnboarding(!hasSeen);",
-  ) + "setNeedsOnboarding(!hasSeen);";
-  const state = { onboardingUid: undefined, needsOnboarding: undefined, backfilled: [] };
-  const fn = new Function("deps", `
-    return async function () {
-      const { data, u, AsyncStorage, tutorialCacheKey, updateDoc, doc, db,
-              setOnboardingUid, setNeedsOnboarding, console } = deps;
-      ${src}
-    };
-  `)({
-    data,
-    u: { uid },
-    AsyncStorage: storage,
-    tutorialCacheKey,
-    updateDoc: async (ref, patch) => { state.backfilled.push([ref, patch]); },
-    doc: (_db, _c, id) => `users/${id}`,
-    db: {},
-    setOnboardingUid: (v) => { state.onboardingUid = v; },
-    setNeedsOnboarding: (v) => { state.needsOnboarding = v; },
-    console: { log: () => {} },
-  });
-  await fn();
-  return state;
-}
-
-test("a brand-new account sees onboarding on a device another account already used", async () => {
-  // THE CONFIRMED CROSS-ACCOUNT DEFECT. The device carries a completed record
-  // for a previous account, and the legacy unkeyed flag too. Neither may
-  // decide anything for this uid.
-  const storage = makeStorage({
-    "skipOnboarding": "true",                     // the legacy device-wide flag
-    [tutorialCacheKey("previous-account")]: "true",
-  });
-  const r = await resolveFor({ uid: "brand-new-uid", data: {}, storage });
-  assert.equal(r.needsOnboarding, true, "a fresh account must see the tutorial");
-  assert.equal(r.onboardingUid, "brand-new-uid");
-  assert.deepEqual(r.backfilled, [], "nothing to backfill for an account with no history");
+const BEFORE_CUTOFF = new Date("2026-07-01T00:00:00.000Z");
+const AFTER_CUTOFF = new Date("2026-08-01T00:00:00.000Z");
+const ts = (d) => ({ toMillis: () => d.getTime() });   // a Firestore Timestamp
+const decide = (over = {}) => resolveTutorialDecision({
+  hasSeenTutorial: undefined, analysisCount: undefined, isPro: undefined,
+  createdAtMs: tutorialCreatedAtMs(ts(AFTER_CUTOFF)),
+  localPermanentChoice: false, sessionDismissed: false, ...over,
 });
 
-test("a returning account with hasSeenTutorial true does not see onboarding", async () => {
-  const storage = makeStorage();
-  const r = await resolveFor({ uid: "returning-uid", data: { hasSeenTutorial: true }, storage });
-  assert.equal(r.needsOnboarding, false);
-  assert.equal(r.onboardingUid, "returning-uid");
-  assert.equal(await storage.getItem(tutorialCacheKey("returning-uid")), "true", "cached for this uid");
-  assert.deepEqual(r.backfilled, [], "already true, nothing to write");
+// ---- 1. the cutoff itself -------------------------------------------------
+
+test("the cutoff is the approved instant, hours before the field could exist", () => {
+  assert.equal(TUTORIAL_ACCOUNT_SCOPING_CUTOFF, Date.parse("2026-07-18T00:00:00.000Z"));
+  assert.ok(SRC.includes('Date.parse("2026-07-18T00:00:00.000Z")'), "stated once, literally");
 });
 
-test("the existing-user migration still applies, and backfills exactly once", async () => {
-  // Accounts that predate hasSeenTutorial have no field. analysisCount and
-  // isPro are the signals that they are established, and both are impossible
-  // for a genuinely new account at its first auth resolution.
-  for (const [label, data] of [
-    ["has run an analysis", { analysisCount: 3 }],
-    ["is Pro", { isPro: true }],
-  ]) {
-    const storage = makeStorage();
-    const r = await resolveFor({ uid: `legacy-${label}`, data, storage });
-    assert.equal(r.needsOnboarding, false, `${label}: must not be forced through onboarding`);
-    assert.equal(r.backfilled.length, 1, `${label}: backfilled`);
-    assert.deepEqual(r.backfilled[0][1], { hasSeenTutorial: true });
+test("createdAt is read from every shape the data actually holds", () => {
+  assert.equal(tutorialCreatedAtMs(ts(AFTER_CUTOFF)), AFTER_CUTOFF.getTime(), "Firestore Timestamp");
+  assert.equal(tutorialCreatedAtMs(AFTER_CUTOFF), AFTER_CUTOFF.getTime(), "Date");
+  assert.equal(tutorialCreatedAtMs("2026-08-01T00:00:00.000Z"), AFTER_CUTOFF.getTime(), "ISO string");
+  for (const bad of [undefined, null, "", "not a date", 12345, {}, NaN]) {
+    assert.equal(tutorialCreatedAtMs(bad), null, `unusable: ${String(bad)}`);
   }
 });
 
-test("zero analyses and not Pro is NOT an existing-user signal", async () => {
-  const storage = makeStorage();
-  const r = await resolveFor({ uid: "fresh", data: { analysisCount: 0, isPro: false }, storage });
-  assert.equal(r.needsOnboarding, true);
+// ---- 2. the three field states -------------------------------------------
+
+test("hasSeenTutorial TRUE: never shown, nothing rewritten", () => {
+  const d = decide({ hasSeenTutorial: true });
+  assert.deepEqual(d, { show: false, write: null, state: "permanent" });
+  // And not even a pile of legacy signals changes it.
+  assert.equal(decide({ hasSeenTutorial: true, analysisCount: 99, isPro: true }).show, false);
 });
 
-test("the local cache is keyed by uid, never shared between accounts", () => {
-  assert.equal(tutorialCacheKey("a"), "hasSeenTutorial:a");
-  assert.notEqual(tutorialCacheKey("a"), tutorialCacheKey("b"));
-  // The unkeyed predecessor must not be read anywhere any more.
-  assert.ok(!/AsyncStorage\.getItem\("skipOnboarding"\)/.test(SRC),
-    "the device-wide flag must no longer be read");
-  assert.ok(!/AsyncStorage\.setItem\("skipOnboarding"/.test(SRC),
-    "the device-wide flag must no longer be written");
+test("hasSeenTutorial FALSE: shown, and nothing is written", () => {
+  const d = decide({ hasSeenTutorial: false });
+  assert.deepEqual(d, { show: true, write: null, state: "new-model" });
 });
 
-// ---- 2. dismissal persists on BOTH paths ---------------------------------
+test("hasSeenTutorial ABSENT after the cutoff: shown, and classified to false", () => {
+  const d = decide({ hasSeenTutorial: undefined });
+  assert.deepEqual(d, { show: true, write: false, state: "post-cutoff" });
+});
 
-/** Runs the real onDone handler. */
-async function runOnDone({ skip, uid, storage }) {
+// ---- 3. an explicit false can never be overridden -------------------------
+
+test("analysisCount and isPro CANNOT turn an explicit false into a true", () => {
+  // The whole point of the checkbox. A user who declined permanence keeps
+  // seeing the tutorial no matter how much they use the app.
+  for (const [label, over] of [
+    ["one analysis", { analysisCount: 1 }],
+    ["many analyses", { analysisCount: 250 }],
+    ["subscribed", { isPro: true }],
+    ["both", { analysisCount: 12, isPro: true }],
+  ]) {
+    const d = decide({ hasSeenTutorial: false, ...over });
+    assert.equal(d.show, true, `${label}: must still be shown`);
+    assert.equal(d.write, null, `${label}: must write nothing`);
+    assert.equal(d.state, "new-model", label);
+  }
+});
+
+test("a post-cutoff account whose classification write FAILED stays new-model", () => {
+  // The write is best effort. Because the branch is chosen by createdAt and
+  // not by the field, a failure cannot leave the account exposed to legacy
+  // migration later.
+  for (const [label, over] of [
+    ["then ran an analysis", { analysisCount: 3 }],
+    ["then subscribed", { isPro: true }],
+    ["then did both", { analysisCount: 3, isPro: true }],
+  ]) {
+    const d = decide({ hasSeenTutorial: undefined, ...over });
+    assert.equal(d.state, "post-cutoff", `${label}: classified by createdAt, not by usage`);
+    assert.equal(d.show, true, label);
+    assert.equal(d.write, false, `${label}: and the classification is retried`);
+  }
+});
+
+test("the retry writes false again on a later resolution", () => {
+  const first = decide({ hasSeenTutorial: undefined });
+  assert.equal(first.write, false);
+  const retry = decide({ hasSeenTutorial: undefined });   // the write failed, field still absent
+  assert.equal(retry.write, false, "retried until it lands");
+  const landed = decide({ hasSeenTutorial: false });
+  assert.equal(landed.write, null, "and stops once it has");
+});
+
+// ---- 4. the legacy migration, bounded by the cutoff -----------------------
+
+test("a pre-cutoff established account is still migrated to true", () => {
+  for (const [label, over] of [
+    ["has run analyses", { analysisCount: 4 }],
+    ["is Pro", { isPro: true }],
+  ]) {
+    const d = resolveTutorialDecision({
+      hasSeenTutorial: undefined, createdAtMs: tutorialCreatedAtMs(ts(BEFORE_CUTOFF)),
+      localPermanentChoice: false, sessionDismissed: false, ...over,
+    });
+    assert.deepEqual(d, { show: false, write: true, state: "legacy-migrated" }, label);
+  }
+});
+
+test("a pre-cutoff account with no legacy signal is shown once and brought onto the new model", () => {
+  const d = resolveTutorialDecision({
+    hasSeenTutorial: undefined, analysisCount: 0, isPro: false,
+    createdAtMs: tutorialCreatedAtMs(ts(BEFORE_CUTOFF)),
+    localPermanentChoice: false, sessionDismissed: false,
+  });
+  assert.deepEqual(d, { show: true, write: false, state: "legacy-unclassified" });
+});
+
+test("the migration does NOT reach an account created after the cutoff", () => {
+  // The conflict this cutoff exists to remove: without it, one analysis would
+  // permanently suppress the tutorial for a brand-new account.
+  const legacy = resolveTutorialDecision({
+    hasSeenTutorial: undefined, analysisCount: 1,
+    createdAtMs: tutorialCreatedAtMs(ts(BEFORE_CUTOFF)),
+    localPermanentChoice: false, sessionDismissed: false,
+  });
+  const modern = decide({ hasSeenTutorial: undefined, analysisCount: 1 });
+  assert.equal(legacy.write, true, "pre-cutoff: migrated");
+  assert.equal(modern.write, false, "post-cutoff: classified, never migrated");
+  assert.equal(modern.show, true);
+});
+
+test("the boundary is inclusive of the cutoff instant itself", () => {
+  const at = resolveTutorialDecision({
+    hasSeenTutorial: undefined, analysisCount: 5, createdAtMs: TUTORIAL_ACCOUNT_SCOPING_CUTOFF,
+    localPermanentChoice: false, sessionDismissed: false,
+  });
+  const justBefore = resolveTutorialDecision({
+    hasSeenTutorial: undefined, analysisCount: 5, createdAtMs: TUTORIAL_ACCOUNT_SCOPING_CUTOFF - 1,
+    localPermanentChoice: false, sessionDismissed: false,
+  });
+  assert.equal(at.state, "post-cutoff", "created AT the cutoff is new-model");
+  assert.equal(justBefore.state, "legacy-migrated", "a millisecond earlier is legacy");
+});
+
+// ---- 5. unclassifiable accounts ------------------------------------------
+
+test("an absent or unparseable createdAt fails toward SHOWING, never toward suppression", () => {
+  // Live in staging today: one account carries no createdAt at all.
+  for (const [label, over] of [
+    ["no signals", {}],
+    ["has analyses", { analysisCount: 9 }],
+    ["is Pro", { isPro: true }],
+  ]) {
+    const d = decide({ hasSeenTutorial: undefined, createdAtMs: null, ...over });
+    assert.equal(d.show, true, `${label}: show it`);
+    assert.equal(d.write, null, `${label}: and never backfill true on a guess`);
+    assert.equal(d.state, "unclassifiable", label);
+  }
+});
+
+test("the unclassifiable log line carries no account data", () => {
+  const line = region("if (decision.state === \"unclassifiable\") {", "}\n\n        if (decision.write");
+  assert.match(line, /createdAt present=/);
+  assert.match(line, /type=\$\{typeof data\.createdAt\}/);
+  assert.ok(!/u\.uid|data\.email|displayName/.test(line), "no identifier may be logged");
+});
+
+// ---- 6. the permanent choice, and a failed true write ---------------------
+
+test("a local permanent choice suppresses the tutorial and retries the write", () => {
+  const d = decide({ hasSeenTutorial: undefined, localPermanentChoice: true });
+  assert.deepEqual(d, { show: false, write: true, state: "permanent-retry" });
+});
+
+test("a local permanent choice BLOCKS legacy migration and outranks every signal", () => {
+  for (const [label, over] of [
+    ["pre-cutoff with analyses", { createdAtMs: tutorialCreatedAtMs(ts(BEFORE_CUTOFF)), analysisCount: 7 }],
+    ["field still false", { hasSeenTutorial: false }],
+    ["unclassifiable", { createdAtMs: null }],
+  ]) {
+    const d = decide({ hasSeenTutorial: undefined, localPermanentChoice: true, ...over });
+    assert.equal(d.show, false, `${label}: the user's choice stands`);
+    assert.equal(d.state, "permanent-retry", label);
+  }
+});
+
+test("once the true write lands, the retry stops", () => {
+  const d = decide({ hasSeenTutorial: true, localPermanentChoice: true });
+  assert.equal(d.write, null);
+  assert.equal(d.state, "permanent");
+});
+
+// ---- 7. session-only dismissal -------------------------------------------
+
+test("a session dismissal suppresses only while the session says so", () => {
+  assert.equal(decide({ hasSeenTutorial: false, sessionDismissed: true }).show, false, "dismissed now");
+  assert.equal(decide({ hasSeenTutorial: false, sessionDismissed: false }).show, true, "back on a later launch");
+  // And it never writes anything, so it cannot outlive the session.
+  assert.equal(decide({ hasSeenTutorial: false, sessionDismissed: true }).write, null);
+});
+
+test("a session dismissal never turns into a permanent one", () => {
+  const d = decide({ hasSeenTutorial: undefined, sessionDismissed: true });
+  assert.equal(d.write, false, "still only classified, never true");
+});
+
+// ---- 8. the dismissal handler, executed -----------------------------------
+
+async function runOnDone({ skip, uid, storage, sessionRef = { current: null } }) {
   const body = region("onDone={async (skip) => {", "\n    }} />;");
   const src = body.slice(body.indexOf("{", body.indexOf("=> ")) + 1);
   const state = { needsOnboarding: undefined, updates: [] };
   const fn = new Function("deps", `
     return async function (skip) {
-      const { user, AsyncStorage, tutorialCacheKey, updateDoc, doc, db, setNeedsOnboarding, console } = deps;
+      const { user, AsyncStorage, tutorialCacheKey, updateDoc, doc, db,
+              setNeedsOnboarding, sessionDismissedUidRef, console } = deps;
       ${src}
     };
   `)({
@@ -156,80 +282,157 @@ async function runOnDone({ skip, uid, storage }) {
     doc: (_db, _c, id) => `users/${id}`,
     db: {},
     setNeedsOnboarding: (v) => { state.needsOnboarding = v; },
+    sessionDismissedUidRef: sessionRef,
     console: { log: () => {} },
   });
   await fn(skip);
-  return state;
+  return { ...state, sessionRef };
 }
 
-test("finishing the tutorial normally persists hasSeenTutorial and dismisses it", async () => {
-  // This is the half that used to persist NOTHING: only the ticked
-  // "don't show this again" path wrote anything, so a completed tutorial
-  // came straight back on the next launch.
-  const storage = makeStorage();
-  const r = await runOnDone({ skip: false, uid: "u1", storage });
-  assert.equal(r.needsOnboarding, false, "dismissed");
-  assert.equal(await storage.getItem(tutorialCacheKey("u1")), "true", "cached for this uid");
-  assert.equal(r.updates.length, 1, "written to Firestore");
-  assert.deepEqual(r.updates[0][1], { hasSeenTutorial: true });
-  assert.equal(r.updates[0][0], "users/u1", "written for the signed-in account");
+test("dismissing WITHOUT the checkbox writes nothing at all", () => {
+  return (async () => {
+    const storage = makeStorage();
+    const r = await runOnDone({ skip: false, uid: "u1", storage });
+    assert.equal(r.needsOnboarding, false, "dismissed for this session");
+    assert.deepEqual(r.updates, [], "no Firestore write");
+    assert.equal(await storage.getItem(tutorialCacheKey("u1")), null, "no local record");
+    assert.equal(storage.map.size, 0, "nothing persisted anywhere");
+    assert.equal(r.sessionRef.current, "u1", "and the session marker is set");
+  })();
 });
 
-test("explicitly skipping the tutorial persists the same thing", async () => {
+test("dismissing WITH the checkbox persists both, for that uid only", async () => {
   const storage = makeStorage();
   const r = await runOnDone({ skip: true, uid: "u2", storage });
   assert.equal(r.needsOnboarding, false);
-  assert.equal(await storage.getItem(tutorialCacheKey("u2")), "true");
+  assert.equal(await storage.getItem(tutorialCacheKey("u2")), "true", "local record");
+  assert.deepEqual(r.updates, [["users/u2", { hasSeenTutorial: true }]], "and Firestore");
+  assert.equal(await storage.getItem(tutorialCacheKey("other-uid")), null, "no other account touched");
+  assert.equal(r.sessionRef.current, null, "no session marker needed - it is permanent");
+});
+
+test("the checkbox writes true even when the field is still ABSENT", async () => {
+  // The classification write may have failed, leaving no field at all. The
+  // checkbox must not depend on it.
+  const storage = makeStorage();
+  const r = await runOnDone({ skip: true, uid: "u3", storage });
   assert.deepEqual(r.updates.map((u) => u[1]), [{ hasSeenTutorial: true }]);
 });
 
-test("a completed account signing back in is not shown the tutorial again", async () => {
-  // End to end across the two halves: dismiss, then resolve the same uid from
-  // the document that dismissal wrote.
+test("the local record is written BEFORE the Firestore call, so a failure cannot lose it", () => {
+  const body = region("onDone={async (skip) => {", "\n    }} />;");
+  const cache = body.indexOf("AsyncStorage.setItem(tutorialCacheKey(uid)");
+  const remote = body.indexOf("updateDoc(doc(db,");
+  assert.ok(cache > 0 && remote > cache, "cache first, then Firestore");
+});
+
+test("a failed true write leaves the choice in the local record, which then suppresses", async () => {
+  // End to end: the checkbox writes the record, the Firestore call fails, and
+  // the next resolution honours the record and retries.
   const storage = makeStorage();
-  await runOnDone({ skip: false, uid: "u3", storage });
-  const r = await resolveFor({ uid: "u3", data: { hasSeenTutorial: true }, storage });
-  assert.equal(r.needsOnboarding, false);
+  const body = region("onDone={async (skip) => {", "\n    }} />;");
+  const src = body.slice(body.indexOf("{", body.indexOf("=> ")) + 1);
+  const fn = new Function("deps", `
+    return async function (skip) {
+      const { user, AsyncStorage, tutorialCacheKey, updateDoc, doc, db,
+              setNeedsOnboarding, sessionDismissedUidRef, console } = deps;
+      ${src}
+    };
+  `)({
+    user: { uid: "u4" }, AsyncStorage: storage, tutorialCacheKey,
+    updateDoc: async () => { throw new Error("offline"); },   // the write fails
+    doc: () => "users/u4", db: {},
+    setNeedsOnboarding: () => {}, sessionDismissedUidRef: { current: null },
+    console: { log: () => {} },
+  });
+  await fn(true);
+
+  assert.equal(await storage.getItem(tutorialCacheKey("u4")), "true", "the choice survived");
+  const next = decide({ hasSeenTutorial: undefined, localPermanentChoice: true, analysisCount: 5 });
+  assert.equal(next.show, false, "suppressed on this device");
+  assert.equal(next.write, true, "and the write is retried");
+  assert.equal(next.state, "permanent-retry");
 });
 
-test("hasSeenTutorial is written by update, never in the create payload", () => {
-  // firestore.rules' create allowlist excludes it; its update rule permits
-  // exactly this one field.
-  const create = region("const ensureUserDocument = async (u, extra = {})", "\n};");
-  assert.ok(!/hasSeenTutorial/.test(create), "must not be part of document creation");
-  const rules = fs.readFileSync(path.join(ROOT, "firestore.rules"), "utf8");
-  assert.match(rules, /affectedKeys\(\)\.hasOnly\(\['hasSeenTutorial'\]\)/,
-    "the update path this relies on must still be permitted");
+// ---- 9. account isolation and the retired device-wide flag ----------------
+
+test("one account's permanent choice does not suppress another account", async () => {
+  const storage = makeStorage();
+  await runOnDone({ skip: true, uid: "account-A", storage });
+  assert.equal(await storage.getItem(tutorialCacheKey("account-A")), "true");
+
+  // account-B, brand new, on the same device.
+  const bHasRecord = (await storage.getItem(tutorialCacheKey("account-B"))) === "true";
+  assert.equal(bHasRecord, false, "no record for the other account");
+  const d = decide({ hasSeenTutorial: undefined, localPermanentChoice: bHasRecord });
+  assert.equal(d.show, true, "so it still sees the tutorial");
 });
 
-// ---- 3. uid change and ordering ------------------------------------------
+test("the cache key is per uid, and the unkeyed device flag is gone for good", () => {
+  assert.equal(tutorialCacheKey("a"), "hasSeenTutorial:a");
+  assert.notEqual(tutorialCacheKey("a"), tutorialCacheKey("b"));
+  assert.ok(!/AsyncStorage\.getItem\("skipOnboarding"\)/.test(SRC), "never read");
+  assert.ok(!/AsyncStorage\.setItem\("skipOnboarding"/.test(SRC), "never written");
+});
+
+// ---- 10. uid change, ordering and the gate --------------------------------
 
 test("a uid change resets the onboarding answer before anything async runs", () => {
   const cb = region("const unsub = onAuthStateChanged(auth, async (u) => {", "setUser(u);");
   const resetUid = cb.indexOf("setOnboardingUid(null)");
   const resetNeeds = cb.indexOf("setNeedsOnboarding(null)");
+  const resetSession = cb.indexOf("sessionDismissedUidRef.current = null");
   const firstAwait = cb.indexOf("await ");
-  assert.ok(resetUid > 0 && resetNeeds > 0, "both must be cleared on every auth change");
-  assert.ok(resetUid < firstAwait, "the reset must precede the first await, or a frame can leak");
-  assert.ok(resetNeeds < firstAwait, "same");
+  assert.ok(resetUid > 0 && resetNeeds > 0 && resetSession > 0, "all three are cleared");
+  assert.ok(resetUid < firstAwait && resetNeeds < firstAwait && resetSession < firstAwait,
+    "before the first await, or a frame can leak");
+});
+
+test("signing out clears the session dismissal; the same session does not", () => {
+  const line = region("if (!u || sessionDismissedUidRef.current !== u.uid)", ";");
+  const clear = new Function("u", "sessionDismissedUidRef", `${line};
+return sessionDismissedUidRef.current;`);
+  assert.equal(clear(null, { current: "A" }), null, "sign-out clears it");
+  assert.equal(clear({ uid: "B" }, { current: "A" }), null, "another account clears it");
+  assert.equal(clear({ uid: "A" }, { current: "A" }), "A", "the same session keeps it");
 });
 
 test("the gate refuses to render a tutorial until this uid's answer is in", () => {
   const line = region("const onboardingResolved =", ";");
   const resolved = new Function("user", "onboardingUid", "needsOnboarding",
-    `${line};\nreturn onboardingResolved;`);
-
+    `${line};
+return onboardingResolved;`);
   assert.equal(resolved({ uid: "a" }, null, null), false, "unresolved");
   assert.equal(resolved({ uid: "a" }, "a", null), false, "uid known but no answer yet");
   assert.equal(resolved({ uid: "a" }, "b", true), false, "answer belongs to a previous account");
   assert.equal(resolved({ uid: "a" }, "a", true), true, "resolved: show");
   assert.equal(resolved({ uid: "a" }, "a", false), true, "resolved: hide");
   assert.equal(resolved(null, "a", true), false, "signed out");
-
-  // And the gate actually uses it, so an unresolved signed-in user gets the
-  // startup fallback rather than a tutorial that may vanish.
   assert.ok(SRC.includes("if (!startupReady || holdForTracking || (!!user && !onboardingResolved)) {"));
   assert.ok(SRC.includes("} else if (needsOnboarding) {"));
+});
+
+test("the tutorial is dismissed only by an explicit control, never by itself", () => {
+  // OnboardingScreen has no effect and no timer: onDone is reachable from the
+  // three onPress handlers and nowhere else.
+  const screen = region("function OnboardingScreen({ onDone }) {", "\n// \u2500\u2500 AUTH SCREEN");
+  assert.ok(!/useEffect|setTimeout|setInterval/.test(screen), "nothing can fire on its own");
+  assert.equal((screen.match(/onDone\(/g) || []).length, 3, "skip, next-at-last-slide, get-started");
+  for (const handler of ["handleSkip", "handleNext", "handleGetStarted"]) {
+    assert.ok(screen.includes(handler), handler);
+  }
+  // And the checkbox is still there, still driving what onDone is given.
+  assert.match(screen, /onPress=\{\(\) => setSkipNext\(!skipNext\)\}/);
+  assert.match(screen, /Don't show this again/);
+});
+
+test("ATT still holds the gate ahead of onboarding and Home", () => {
+  // scripts/attMetaFlow.test.js owns the executing ATT coverage; this is the
+  // one crossover that the onboarding gate could break.
+  assert.match(SRC, /if \(!startupReady \|\| holdForTracking/, "holdForTracking leads the fallback branch");
+  assert.match(SRC, /const holdForTracking = !!user && !metaGateReady;/);
+  assert.ok(SRC.indexOf("holdForTracking") < SRC.indexOf("} else if (needsOnboarding) {"),
+    "the hold is evaluated before the onboarding branch");
 });
 
 // ---- 4. the expanded approach through Call 2 ------------------------------
