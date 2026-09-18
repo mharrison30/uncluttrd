@@ -515,7 +515,10 @@ test("the launch screen and the render gate both wait on the tracking hold", () 
   // sign-in completed later falls back to the plain startup screen. Either
   // way no authenticated content is drawn underneath the prompt.
   assert.match(SRC, /ready=\{startupReady && !holdForTracking\}/);
-  assert.match(SRC, /if \(!startupReady \|\| holdForTracking\) \{/);
+  // The gate may hold for MORE reasons than these two - the onboarding answer
+  // for the current account is another - but holdForTracking must remain one
+  // of them, and must still be part of the same fallback branch.
+  assert.match(SRC, /if \(!startupReady \|\| holdForTracking(\s*\|\|.*)?\) \{/);
   // And the prompt is no longer driven by the launch screen finishing.
   assert.match(SRC, /onExited=\{\(\) => setShowLaunch\(false\)\}/);
   const exited = SRC.slice(SRC.indexOf("onExited="), SRC.indexOf("onExited=") + 120);

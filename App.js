@@ -4709,6 +4709,12 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // browsing between Simple/Polished/Elevated happens entirely here;
   // durable commitment only happens via handleStartThisPlan.
   const [previewApproach, setPreviewApproach] = useState(null);
+  // The plan whose expanded card has already been seeded. `results` is
+  // REPLACED, not mutated, every time anything about the open plan changes -
+  // Call 2 landing, the photo URL arriving, a rename - and re-seeding on each
+  // of those collapsed whatever the user had open. Seeding is a per-plan
+  // event, so it is tracked per plan.
+  const seededPreviewPlanRef = useRef(null);
   const [startingPlan, setStartingPlan] = useState(false);
   // Approach switching (Section 6). switchPickerOpen re-opens the three
   // cards as a chooser; switchingApproach is the id being applied, so only
@@ -5131,7 +5137,9 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
   // batchItems empty and Results renders the approach cards instead;
   // Companion isn't populated until handleStartThisPlan seeds it directly.
   useEffect(() => {
-    if (!results) return;
+    // Leaving Results clears the seed marker, so the next plan opened always
+    // gets its own seeding even if it happens to reuse a null plan id.
+    if (!results) { seededPreviewPlanRef.current = null; return; }
     setUnresolvedReview(null);
     // Approach Card Redesign (ApproachCardRedesign.md item 5): a plan the
     // user has already committed to reopens with ITS OWN approach card
@@ -5141,7 +5149,19 @@ function MainApp({ user, isPro, setIsPro, analyses, setAnalyses, setSkipPref, re
     // comparison state. previewApproach remains ephemeral either way; this
     // seeds the expanded card from already-persisted state, it never
     // writes anything.
-    setPreviewApproach(results.selectedApproach || null);
+    //
+    // Seeded ONLY when the plan changes. Call 2 completing replaces `results`
+    // for the SAME plan, and re-seeding there threw away the card the user
+    // was watching: they opened an approach, read "Finishing the details...",
+    // and the card collapsed to "See full details" at the exact moment the
+    // content arrived. Reading the id from the ref rather than the state
+    // closure because the ref is updated by an effect declared above this
+    // one, so it is already current for this commit.
+    const planForSeeding = currentPlanIdRef.current || null;
+    if (seededPreviewPlanRef.current !== planForSeeding) {
+      seededPreviewPlanRef.current = planForSeeding;
+      setPreviewApproach(results.selectedApproach || null);
+    }
     setStartingPlan(false);
     if (results.currentBatch?.items?.length) {
       setCompanionBatchIndex(results.currentBatch.batchIndex || 1);
@@ -14451,12 +14471,34 @@ function LaunchScreen({ ready, onExited }) {
   );
 }
 
+// Per-account local record of "this device has shown this account the
+// tutorial". Keyed by uid on purpose: the unkeyed predecessor
+// ("skipOnboarding") was a single device-wide answer that suppressed
+// onboarding for whichever account signed in next, including brand-new ones.
+// Firestore's hasSeenTutorial stays the source of truth; this is only the
+// offline fallback and the fast path on relaunch.
+const tutorialCacheKey = (uid) => `hasSeenTutorial:${uid}`;
+
 // ── ROOT ─────────────────────────────────────────────────────
 function AppRoot() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [showOnboard, setShowOnboard] = useState(true);
-  const [skipPref, setSkipPref] = useState(false);
+  // ONBOARDING IS DECIDED PER AUTHENTICATED ACCOUNT.
+  //
+  // It used to be decided per DEVICE: one AsyncStorage key, "skipOnboarding",
+  // plus two state values that were never reset when the account changed. So
+  // whichever answer the device had settled on applied to every account signed
+  // in afterwards - sign out, create a brand-new account, and the tutorial was
+  // already "done" for someone who had never seen it. That is the confirmed
+  // cross-account defect, reproduced on iOS.
+  //
+  // null means UNRESOLVED FOR THE CURRENT UID. The gate below renders the
+  // startup fallback while it is null rather than guessing, which is what
+  // makes the decision deterministic: the tutorial can only appear once this
+  // account's own answer is in, so it can never be shown and then taken away
+  // a moment later.
+  const [onboardingUid, setOnboardingUid] = useState(null);
+  const [needsOnboarding, setNeedsOnboarding] = useState(null);
   const [isPro, setIsPro] = useState(false);
   const [analyses, setAnalyses] = useState(null); // null = not loaded yet
   // Lets the RevenueCat listener (registered once, [] deps) attribute later
@@ -14538,13 +14580,6 @@ function AppRoot() {
   }, []);
 
   useEffect(() => {
-    // skipOnboarding is intentionally device-scoped, not account-scoped - it's
-    // a UI preference ("has this device seen onboarding"), not account data,
-    // so it stays a one-time mount load separate from the auth callback below.
-    AsyncStorage.getItem("skipOnboarding").then(saved => {
-      if (saved === "true") setSkipPref(true);
-    });
-
     const unsub = onAuthStateChanged(auth, async (u) => {
       // Reset account-specific state FIRST, before anything async, so no
       // previous account's isPro/analyses can render even for one frame -
@@ -14553,9 +14588,27 @@ function AppRoot() {
       // accounts signed into the same device.
       setAnalyses(0);
       setIsPro(false);
+      // Onboarding joins that rule. Cleared here, synchronously, before any
+      // await, so the answer for the account that just left can never be
+      // applied to the one arriving - and so the gate holds on the startup
+      // fallback instead of rendering a tutorial it may be about to dismiss.
+      setOnboardingUid(null);
+      setNeedsOnboarding(null);
       revenueCatLinkedRef.current = false;
       currentUidRef.current = u ? u.uid : null;
       if (u) {
+        // Fast path, before the network work below: if THIS account has been
+        // onboarded on THIS device, say so now so a returning user is not
+        // held on the startup fallback for a Firestore round trip. Absent for
+        // an account this device has not onboarded, which correctly leaves
+        // the decision unresolved rather than guessing at it.
+        try {
+          if (await AsyncStorage.getItem(tutorialCacheKey(u.uid)) === "true") {
+            setOnboardingUid(u.uid);
+            setNeedsOnboarding(false);
+          }
+        } catch (e) { /* cache miss is not an error; Firestore decides below */ }
+
         // Right after sign-in (especially the forced signOut/signIn re-auth
         // in handleAuth's signup flow), auth.currentUser can still be a
         // partially-hydrated object - profile fields like displayName can
@@ -14626,16 +14679,37 @@ function AppRoot() {
         // ran an analysis and isn't Pro still sees onboarding once more -
         // narrow and low-stakes enough not to solve.
         const looksLikeExistingUser = (data.analysisCount || 0) > 0 || data.isPro === true;
-        if (data.hasSeenTutorial === true || looksLikeExistingUser) {
-          setSkipPref(true);
-          await AsyncStorage.setItem("skipOnboarding", "true");
+        const hasSeen = data.hasSeenTutorial === true || looksLikeExistingUser;
+        if (hasSeen) {
+          // The local cache is keyed BY UID now. The old unkeyed
+          // "skipOnboarding" was the cross-account leak itself: one device
+          // answer suppressing the tutorial for every account after it.
+          await AsyncStorage.setItem(tutorialCacheKey(u.uid), "true");
           if (data.hasSeenTutorial !== true) {
             updateDoc(doc(db, "users", u.uid), { hasSeenTutorial: true })
               .catch(e => console.log("Backfill hasSeenTutorial error:", e.message));
           }
         }
+        // Resolve LAST, and only for the uid this callback is about. A
+        // callback for a previous account that lands late cannot overwrite a
+        // newer one's answer, because the gate compares onboardingUid to the
+        // signed-in user before trusting needsOnboarding.
+        setOnboardingUid(u.uid);
+        setNeedsOnboarding(!hasSeen);
       } catch (e) {
         console.log("Load analysisCount error:", e.message);
+        // The read failed, so we cannot prove anything about this account.
+        // Fall back to this device's own record for THIS uid; with none,
+        // show the tutorial - the same thing the previous code did on this
+        // path, and the harmless direction to be wrong in.
+        try {
+          const cached = await AsyncStorage.getItem(tutorialCacheKey(u.uid));
+          setOnboardingUid(u.uid);
+          setNeedsOnboarding(cached !== "true");
+        } catch (cacheErr) {
+          setOnboardingUid(u.uid);
+          setNeedsOnboarding(true);
+        }
       }
 
       // Refresh RevenueCat's stored attributes and pull a fresh entitlement
@@ -14751,8 +14825,15 @@ function AppRoot() {
   // never held back, and no prompt is pending.
   const holdForTracking = !!user && !metaGateReady;
 
+  // The tutorial decision, for the account actually signed in. Both halves
+  // matter: needsOnboarding null means "not resolved yet", and a stale
+  // onboardingUid means the answer in hand belongs to a previous account.
+  // Either way the gate waits rather than guessing, which is what stops a
+  // tutorial appearing and then vanishing on its own.
+  const onboardingResolved = !!user && onboardingUid === user.uid && needsOnboarding !== null;
+
   let screen;
-  if (!startupReady || holdForTracking) {
+  if (!startupReady || holdForTracking || (!!user && !onboardingResolved)) {
     // The plain fallback it always was, now also what sits behind the ATT
     // prompt for a user who signed in with the launch screen already gone.
     screen = (
@@ -14765,23 +14846,30 @@ function AppRoot() {
   } else if (!user) {
     // Not logged in, show auth screen
     screen = <AuthScreen />;
-  } else if (showOnboard && !skipPref) {
-    // Logged in but hasn't dismissed onboarding, show it
+  } else if (needsOnboarding) {
+    // This account, resolved, has not seen the tutorial.
     screen = <OnboardingScreen onDone={async (skip) => {
-      if (skip) {
-        setSkipPref(true);
-        await AsyncStorage.setItem("skipOnboarding", "true");
-        // Firestore is the source of truth (DecisionLog.md 2026-07-18) so
-        // this syncs to other devices/reinstalls - AsyncStorage above is
-        // just the fast local cache for this device's next launch.
-        updateDoc(doc(db, "users", user.uid), { hasSeenTutorial: true })
-          .catch(e => console.log("Save hasSeenTutorial error:", e.message));
-      }
-      setShowOnboard(false);
+      // BOTH paths persist now. Reaching the end of the tutorial is having
+      // seen it, whether or not the user also ticked "don't show this again"
+      // - and only persisting the ticked case is what let a completed
+      // tutorial come back on the next launch. `skip` is left in the
+      // signature because OnboardingScreen still passes it; it no longer
+      // changes what is written.
+      const uid = user.uid;
+      setNeedsOnboarding(false);
+      try {
+        await AsyncStorage.setItem(tutorialCacheKey(uid), "true");
+      } catch (e) { /* the Firestore write below is the durable one */ }
+      // Firestore is the source of truth (DecisionLog.md 2026-07-18) so this
+      // syncs to other devices and reinstalls. An update, never part of the
+      // create payload: firestore.rules' create allowlist excludes
+      // hasSeenTutorial, and its update rule permits exactly this field.
+      updateDoc(doc(db, "users", uid), { hasSeenTutorial: true })
+        .catch(e => console.log("Save hasSeenTutorial error:", e.message));
     }} />;
   } else {
     // Logged in and onboarding done, show main app
-    screen = <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={setSkipPref} revenueCatLinkedRef={revenueCatLinkedRef} />;
+    screen = <MainApp user={user} isPro={isPro} setIsPro={setIsPro} analyses={analyses} setAnalyses={setAnalyses} setSkipPref={(v) => setNeedsOnboarding(!v)} revenueCatLinkedRef={revenueCatLinkedRef} />;
   }
 
   // The destination renders underneath from the moment startup is ready, so
@@ -15365,7 +15453,12 @@ const s = StyleSheet.create({
   stagingBannerText: {
     color: "#1F2937", backgroundColor: "#F59E0B",
     fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 1.2,
-    paddingHorizontal: 8, paddingVertical: 2,
+    // Android adds the letter-spacing as trailing advance AFTER the last
+    // glyph and then clips to the measured width, so with overflow hidden the
+    // final G lost its right-hand edge. The extra right padding is that
+    // trailing advance given somewhere to go. iOS lays this out differently
+    // and is unaffected either way.
+    paddingHorizontal: 8, paddingRight: 10, paddingVertical: 2,
     borderRadius: 4, overflow: "hidden",
   },
   safe: { flex: 1, backgroundColor: BRAND.offWhite },
