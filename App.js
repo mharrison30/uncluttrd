@@ -2736,6 +2736,21 @@ const clearSignupMarker = async (uid) => {
 const userDocumentResolved = new Set();
 const userDocumentCreations = new Map();
 
+// WHICH ACCOUNT THE APP CURRENTLY CONSIDERS AUTHENTICATED, at module scope.
+//
+// ensureUserDocument lives out here, and currentUidRef is a useRef inside
+// AppRoot, so the ref itself cannot be read from here without threading it
+// through scopes that have no other reason to hold it. This is not a second
+// opinion about who is signed in: the auth callback assigns it from
+// currentUidRef.current on the line immediately after it sets the ref, from
+// the one place that already owns this fact, so the two cannot disagree.
+//
+// It is a module binding rather than a captured value on purpose. The check
+// that uses it runs after several awaits, and the whole point is to read the
+// state as it is THEN, not as it was when the operation started.
+let authenticatedUid = null;
+const setAuthenticatedUid = (uid) => { authenticatedUid = uid || null; };
+
 let pendingSignup = null;
 
 /** Called BEFORE createUserWithEmailAndPassword, so no window exists. */
@@ -2828,7 +2843,17 @@ const ensureUserDocument = async (u, extra = {}) => {
     // Only after the document is genuinely there. A failed write leaves both
     // the marker and the undecided state in place, so the next resolution
     // retries instead of silently accepting a missing document.
-    userDocumentResolved.add(u.uid);
+    //
+    // And only while this account is still the authenticated one. Everything
+    // above is awaited, so an operation started for one account can land after
+    // the app has signed out or moved to another. Recording a decision for a
+    // uid that is no longer current would make its next sign-in return at the
+    // top of this function with no Firestore read at all, and a document
+    // deleted in the meantime would never be repaired. That self-healing is
+    // the reason the two ambiguous production accounts were left alone, so it
+    // has to survive. Read here rather than captured earlier, because the
+    // answer at the start of the operation is not the question.
+    if (authenticatedUid === u.uid) userDocumentResolved.add(u.uid);
     await clearSignupMarker(u.uid);
   })();
 
@@ -14876,6 +14901,10 @@ function AppRoot() {
       // which account just left, and by then this ref no longer says.
       const previousUid = currentUidRef.current;
       currentUidRef.current = u ? u.uid : null;
+      // Published to module scope, where ensureUserDocument can read it. Same
+      // value, same synchronous instant, assigned from the ref itself so the
+      // two cannot drift apart.
+      setAuthenticatedUid(currentUidRef.current);
       if (u) {
         // Fast path, before the network work below: if THIS account has been
         // onboarded on THIS device, say so now so a returning user is not

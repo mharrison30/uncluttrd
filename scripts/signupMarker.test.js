@@ -29,7 +29,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..");
-const SRC = fs.readFileSync(path.join(ROOT, "App.js"), "utf8").replace(/\r\n/g, "\n");
+// APP_JS=<path> runs this suite against another copy of App.js, the same
+// escape hatch appIntegrity.test.js has. It is how the sign-out wiring and
+// current-auth mutations are proven against a real edited file without ever
+// editing the one in the repository.
+const APP_PATH = process.env.APP_JS || path.join(ROOT, "App.js");
+const SRC = fs.readFileSync(APP_PATH, "utf8").replace(/\r\n/g, "\n");
 const RULES = fs.readFileSync(path.join(ROOT, "firestore.rules"), "utf8").replace(/\r\n/g, "\n");
 
 function region(startMarker, endMarker, { from = 0 } = {}) {
@@ -41,6 +46,13 @@ function region(startMarker, endMarker, { from = 0 } = {}) {
 }
 
 const MARKER_BLOCK = region("// ---- NEW-SIGNUP MARKING", "// Uncluttrd drawer icon");
+
+// The auth callback's own uid bookkeeping and its signed-out branch, lifted
+// and executed rather than described. Calling forgetSignupState directly from
+// a test asserts the wiring in prose only: deleting the call from App.js would
+// leave such a test passing while the defect came back.
+const AUTH_BOOKKEEPING = region("const previousUid = currentUidRef.current;", "if (u) {");
+const AUTH_SIGNED_OUT_BRANCH = region("      if (!u) {", "ensureUserDocument(u).catch(");
 
 // ---- injectable I/O -------------------------------------------------------
 
@@ -60,18 +72,25 @@ function makeStorage(seed = {}) {
 function makeFirestore(seed = {}) {
   const store = new Map(Object.entries(seed));
   const ops = [];
-  return {
+  const f = {
     store, ops,
+    gate: null,   // when set, setDoc suspends on it: lets a test freeze an
+                  // in-flight operation and act while it is suspended
     doc: (_db, collection, id) => ({ path: `${collection}/${id}` }),
     getDoc: async (ref) => {
       ops.push(`get:${ref.path}`);
       const d = store.get(ref.path);
       return { exists: () => d !== undefined, data: () => d };
     },
-    setDoc: async (ref, data) => { ops.push(`set:${ref.path}`); store.set(ref.path, data); },
+    setDoc: async (ref, data) => {
+      if (f.gate) await f.gate;
+      ops.push(`set:${ref.path}`);
+      store.set(ref.path, data);
+    },
     serverTimestamp: () => ({ __serverTimestamp: true }),
     sets: () => ops.filter((o) => o.startsWith("set:")).length,
   };
+  return f;
 }
 
 /** A clock whose pending timers fire only when this test says so. */
@@ -99,12 +118,13 @@ function load({ storage = makeStorage(), fsdb = makeFirestore(), clock = makeClo
     "Platform", "KNOWN_TEST_EMAILS", "console", "setTimeout", "clearTimeout",
     `${transform(MARKER_BLOCK)}
      return {
-       ensureUserDocument, forgetSignupState,
+       ensureUserDocument, forgetSignupState, setAuthenticatedUid,
        beginPendingSignup, resolvePendingSignup, awaitPendingSignup,
        writeSignupMarker, hasSignupMarker, clearSignupMarker, signupMarkerKey,
        SIGNUP_COORDINATION_TIMEOUT_MS,
        peek: () => ({
-         pendingSignup, resolved: [...userDocumentResolved], creating: [...userDocumentCreations.keys()],
+         pendingSignup, authenticatedUid,
+         resolved: [...userDocumentResolved], creating: [...userDocumentCreations.keys()],
        }),
      };`
   )(
@@ -119,6 +139,22 @@ const USER_A = { uid: "uid-alpha", email: "alpha@example.invalid", displayName: 
 const USER_B = { uid: "uid-bravo", email: "bravo@example.invalid", displayName: "Bravo Person" };
 const docOf = (m, u) => m.fsdb.store.get(`users/${u.uid}`);
 const settle = () => new Promise((r) => setImmediate(r));
+
+/**
+ * The REAL auth callback: its uid bookkeeping and its signed-out branch,
+ * lifted out of App.js and executed. resolve(user) is one authenticated
+ * resolution; resolve(null) is one signed-out resolution, running the branch
+ * that actually ships rather than a test's idea of it.
+ */
+function makeAuthResolution(m, { transform = (s) => s, forgetSignupState } = {}) {
+  const currentUidRef = { current: null };
+  const body = transform(`${AUTH_BOOKKEEPING}\n${AUTH_SIGNED_OUT_BRANCH}`);
+  const resolve = new Function(
+    "currentUidRef", "AsyncStorage", "forgetSignupState", "setAuthenticatedUid",
+    `return async (u) => {\n${body}\n  return "authenticated";\n};`
+  )(currentUidRef, m.storage, forgetSignupState || m.forgetSignupState, m.setAuthenticatedUid);
+  return { resolve, currentUidRef };
+}
 
 /** Everything handleAuth does between createUser resolving and the observer being released. */
 async function signupUpTo(m, user) {
@@ -335,8 +371,12 @@ test("the timeout logs metadata only, with no uid and no email address", async (
 
 test("a signup settling AFTER the bound cannot modify the document or re-decide", async () => {
   const m = load();
+  const { resolve } = makeAuthResolution(m);
   const coordination = m.beginPendingSignup();
 
+  // The waiter IS the auth callback, so this account is the authenticated one
+  // by the time it decides - exactly as App.js sequences it.
+  await resolve(USER_A);
   const callback = m.ensureUserDocument(USER_A);
   await settle();
   m.clock.fireAll();
@@ -449,6 +489,112 @@ test("handleAuth's signup sequence is unchanged, with coordination claimed befor
   ]);
 });
 
+// ---- the real sign-out branch --------------------------------------------
+
+test("a signed-out resolution runs the real branch and forgets the PREVIOUS uid", async () => {
+  const m = load();
+  const forgotten = [];
+  const spy = async (uid) => { forgotten.push(uid); await m.forgetSignupState(uid); };
+  const { resolve, currentUidRef } = makeAuthResolution(m, { forgetSignupState: spy });
+
+  await resolve(USER_A);
+  assert.equal(currentUidRef.current, USER_A.uid);
+  assert.equal(m.peek().authenticatedUid, USER_A.uid);
+
+  await resolve(null);
+  assert.deepEqual(forgotten, [USER_A.uid], "the branch must forget the account that just left");
+  assert.equal(currentUidRef.current, null);
+  assert.equal(m.peek().authenticatedUid, null);
+});
+
+test("the real sign-out branch lets a document deleted afterwards be repaired on the next sign-in", async () => {
+  const m = load();
+  const { resolve } = makeAuthResolution(m);
+
+  await resolve(USER_A);
+  await m.ensureUserDocument(USER_A);
+  assert.ok(docOf(m, USER_A), "created on first resolution");
+  assert.ok(m.peek().resolved.includes(USER_A.uid), "and the decision is recorded");
+
+  await resolve(null);                          // THE REAL SIGN-OUT BRANCH
+  assert.equal(m.peek().resolved.includes(USER_A.uid), false, "sign-out must drop the record");
+
+  m.fsdb.store.delete(`users/${USER_A.uid}`);   // deleted by some other means
+
+  await resolve(USER_A);                        // same process, signs back in
+  const readsBefore = m.fsdb.ops.length;
+  await m.ensureUserDocument(USER_A);
+
+  assert.ok(m.fsdb.ops.length > readsBefore, "Firestore must actually be read again");
+  assert.ok(docOf(m, USER_A), "the missing document must be recreated");
+});
+
+test("signing out of A does not disturb B's own resolution", async () => {
+  const m = load();
+  const { resolve } = makeAuthResolution(m);
+
+  await resolve(USER_A);
+  await m.ensureUserDocument(USER_A);
+  await resolve(null);
+  await resolve(USER_B);
+  await m.ensureUserDocument(USER_B);
+
+  assert.ok(docOf(m, USER_B));
+  assert.equal(Object.prototype.hasOwnProperty.call(docOf(m, USER_B), "isNewSignup"), false);
+});
+
+// ---- a late resume must not record a signed-out uid -----------------------
+
+test("an operation resuming after sign-out does not record the uid, so the next sign-in still repairs", async () => {
+  const m = load();
+  const { resolve } = makeAuthResolution(m);
+  await resolve(USER_A);
+
+  let release;
+  m.fsdb.gate = new Promise((r) => { release = r; });   // freeze it mid-write
+  const op = m.ensureUserDocument(USER_A);
+  await settle();
+
+  await resolve(null);        // the real sign-out branch, while the op is suspended
+  m.fsdb.gate = null;
+  release();
+  await op;                   // the write lands for an account that already left
+
+  assert.equal(m.peek().resolved.includes(USER_A.uid), false,
+    "a completed decision must not be cached for a uid that is no longer current");
+
+  m.fsdb.store.delete(`users/${USER_A.uid}`);
+  await resolve(USER_A);
+  const readsBefore = m.fsdb.ops.length;
+  await m.ensureUserDocument(USER_A);
+
+  assert.ok(m.fsdb.ops.length > readsBefore, "Firestore must be read on the next sign-in");
+  assert.ok(docOf(m, USER_A), "and the missing document recreated");
+});
+
+test("the signup sequence's own signOut and signIn still leave the uid recorded", async () => {
+  const m = load();
+  const { resolve } = makeAuthResolution(m);
+
+  // createUserWithEmailAndPassword resolves and fires the observer.
+  const coordination = m.beginPendingSignup();
+  await resolve(USER_A);
+  await m.writeSignupMarker(USER_A.uid);
+  m.resolvePendingSignup(coordination);
+  await m.ensureUserDocument(USER_A, { referralSource: null, isNewSignup: true });
+  assert.ok(m.peek().resolved.includes(USER_A.uid), "recorded while A is the current account");
+
+  // The sequence's own re-auth, which the fix must not mistake for leaving.
+  await resolve(null);
+  await resolve(USER_A);
+  await m.ensureUserDocument(USER_A);
+
+  assert.ok(m.peek().resolved.includes(USER_A.uid),
+    "still recorded after signOut then signIn - otherwise the late-settle guard is silently off");
+  assert.equal(docOf(m, USER_A).isNewSignup, true);
+  assert.equal(m.fsdb.sets(), 1, "and the document was written exactly once");
+});
+
 // ---- mutation proofs -----------------------------------------------------
 //
 // Each one restores a piece of the pre-fix behaviour in a lifted copy and
@@ -487,8 +633,10 @@ test("MUTATION: ignoring the durable marker loses an interrupted signup", async 
 
 test("MUTATION: dropping the recorded decision makes the late-settle guard fall back to snap.exists()", async () => {
   const m = load({ transform: mutate("if (userDocumentResolved.has(u.uid)) return;", "if (false) return;") });
+  const { resolve } = makeAuthResolution(m);
   const coordination = m.beginPendingSignup();
 
+  await resolve(USER_A);
   const callback = m.ensureUserDocument(USER_A);
   await settle();
   m.clock.fireAll();
@@ -505,6 +653,56 @@ test("MUTATION: dropping the recorded decision makes the late-settle guard fall 
   assert.ok(m.fsdb.ops.length > reads,
     "the late signup went back to Firestore to re-decide, rather than being stopped outright");
   assert.equal(Object.prototype.hasOwnProperty.call(docOf(m, USER_A), "isNewSignup"), false);
+});
+
+test("MUTATION: deleting the sign-out branch's forgetSignupState call strands the record", async () => {
+  const dropCall = mutate("await forgetSignupState(previousUid);", "/* removed */");
+  const m = load();
+  const forgotten = [];
+  const spy = async (uid) => { forgotten.push(uid); await m.forgetSignupState(uid); };
+  const { resolve } = makeAuthResolution(m, { transform: dropCall, forgetSignupState: spy });
+
+  await resolve(USER_A);
+  await m.ensureUserDocument(USER_A);
+  await resolve(null);
+
+  assert.deepEqual(forgotten, [], "the wiring is gone, which the previous prose-only tests could not see");
+  assert.ok(m.peek().resolved.includes(USER_A.uid), "and the record survives sign-out");
+
+  // Which is the defect: the next sign-in never looks at Firestore.
+  m.fsdb.store.delete(`users/${USER_A.uid}`);
+  await resolve(USER_A);
+  const readsBefore = m.fsdb.ops.length;
+  await m.ensureUserDocument(USER_A);
+
+  assert.equal(m.fsdb.ops.length, readsBefore, "it returns at the first line with no read");
+  assert.equal(docOf(m, USER_A), undefined, "so the missing document is never repaired");
+});
+
+test("MUTATION: removing the current-auth check re-records a signed-out uid", async () => {
+  const m = load({ transform: mutate("if (authenticatedUid === u.uid) userDocumentResolved.add(u.uid);", "userDocumentResolved.add(u.uid);") });
+  const { resolve } = makeAuthResolution(m);
+  await resolve(USER_A);
+
+  let release;
+  m.fsdb.gate = new Promise((r) => { release = r; });
+  const op = m.ensureUserDocument(USER_A);
+  await settle();
+  await resolve(null);
+  m.fsdb.gate = null;
+  release();
+  await op;
+
+  assert.ok(m.peek().resolved.includes(USER_A.uid),
+    "without the check, the late resume caches a decision for an account that already left");
+
+  m.fsdb.store.delete(`users/${USER_A.uid}`);
+  await resolve(USER_A);
+  const readsBefore = m.fsdb.ops.length;
+  await m.ensureUserDocument(USER_A);
+
+  assert.equal(m.fsdb.ops.length, readsBefore, "and the next sign-in skips Firestore entirely");
+  assert.equal(docOf(m, USER_A), undefined, "leaving the document unrepaired");
 });
 
 test("the createUser to signOut to signIn sequence is still exactly three auth calls in order", () => {
